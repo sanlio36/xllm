@@ -12,10 +12,13 @@ limitations under the License.
 
 #include "qwen3_next_gated_delta_net.h"
 
+#include <cstdlib>
+
 #include <acl/acl.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 #include <torch_npu/torch_npu.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include <tuple>
 #include <unordered_map>
@@ -26,6 +29,41 @@ namespace xllm {
 namespace layer {
 
 namespace {
+bool debug_sync_enabled() {
+  const char* env = std::getenv("XLLM_NPU_DEBUG_SYNC");
+  if (!env) {
+    return false;
+  }
+  return std::string(env) != "0";
+}
+
+std::string tensor_meta(const torch::Tensor& t) {
+  if (!t.defined()) {
+    return "undefined";
+  }
+  std::ostringstream oss;
+  oss << "sizes=" << t.sizes() << ", dtype=" << t.dtype()
+      << ", device=" << t.device() << ", numel=" << t.numel()
+      << ", contiguous=" << t.is_contiguous();
+  return oss.str();
+}
+
+void debug_log_tensor(const char* name, const torch::Tensor& t) {
+  if (!debug_sync_enabled()) {
+    return;
+  }
+  LOG(INFO) << "[qwen3_next_gdn] " << name << ": " << tensor_meta(t);
+}
+
+void debug_sync(const char* tag) {
+  if (!debug_sync_enabled()) {
+    return;
+  }
+  auto stream = c10_npu::getCurrentNPUStream();
+  auto ret = aclrtSynchronizeStream(stream.stream());
+  LOG(INFO) << "[qwen3_next_gdn] sync " << tag << ", ret=" << ret;
+}
+
 torch::Tensor l2norm(const torch::Tensor& x, int64_t dim, double eps = 1e-6) {
   auto norm = torch::sqrt(torch::sum(torch::square(x), dim, true) + eps);
   return x / norm;
@@ -320,12 +358,38 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params) {
+  debug_log_tensor("hidden_states", hidden_states);
+  debug_log_tensor("attn_metadata.q_seq_lens", attn_metadata.q_seq_lens);
+  debug_log_tensor("attn_metadata.kv_seq_lens", attn_metadata.kv_seq_lens);
+  if (debug_sync_enabled()) {
+    LOG(INFO) << "[qwen3_next_gdn] is_prefill=" << attn_metadata.is_prefill
+              << ", max_query_len=" << attn_metadata.max_query_len
+              << ", max_seq_len=" << attn_metadata.max_seq_len;
+  }
+  debug_sync("forward_begin");
+
   auto qkvz = qkvz_proj_->forward(hidden_states);
+  debug_sync("after_qkvz_proj");
+  debug_log_tensor("qkvz", qkvz);
   auto qkvz_reshaped = reshape_qkvz_with_pad(attn_metadata, qkvz);
+  debug_sync("after_reshape_qkvz_with_pad");
+  debug_log_tensor("qkvz_reshaped", qkvz_reshaped);
   auto [q, k, v, z] = process_qkvz_tensor(qkvz_reshaped);
+  debug_sync("after_process_qkvz_tensor");
+  debug_log_tensor("q", q);
+  debug_log_tensor("k", k);
+  debug_log_tensor("v", v);
+  debug_log_tensor("z", z);
   auto ba = ba_proj_->forward(hidden_states);
+  debug_sync("after_ba_proj");
+  debug_log_tensor("ba", ba);
   auto ba_reshaped = reshape_qkvz_with_pad(attn_metadata, ba);
+  debug_sync("after_reshape_ba_with_pad");
+  debug_log_tensor("ba_reshaped", ba_reshaped);
   auto [b, a] = process_ba_tensor(ba_reshaped);
+  debug_sync("after_process_ba_tensor");
+  debug_log_tensor("b", b);
+  debug_log_tensor("a", a);
   auto rearrange_merge = [](const torch::Tensor& t) {
     TORCH_CHECK(
         t.dim() > 2, "Tensor must have at least 2 dims! but got ", t.dim());
@@ -344,12 +408,17 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
 
   torch::Tensor mixed_qkv = torch::cat({q, k, v}, q.dim() - 1);
   mixed_qkv = mixed_qkv.transpose(1, 2);
+  debug_sync("after_mixed_qkv");
+  debug_log_tensor("mixed_qkv", mixed_qkv);
   int64_t seq_len = mixed_qkv.size(2);
   torch::Tensor conv_cache = kv_cache.get_conv_cache();
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+  debug_log_tensor("conv_cache", conv_cache);
+  debug_log_tensor("ssm_cache", ssm_cache);
   torch::Tensor g, beta, core_attn_out, last_recurrent_state;
   auto device = mixed_qkv.device();
   auto conv_weight = conv1d_->weight();
+  debug_log_tensor("conv_weight", conv_weight);
 
   if (attn_metadata.is_prefill) {
     torch::Tensor conv_state =
@@ -371,6 +440,8 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
                       /*dilation=*/std::vector<int64_t>{1},
                       /*groups=*/static_cast<int64_t>(mixed_qkv.size(1)));
     mixed_qkv = torch::silu(conv_output.slice(2, 0, seq_len));
+    debug_sync("after_conv1d_prefill");
+    debug_log_tensor("mixed_qkv_post_conv", mixed_qkv);
 
   } else {
     xllm::kernel::CausalConv1dUpdateParams params;
@@ -379,6 +450,8 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
     params.weight = conv_weight;
     params.conv_state_indices = attn_metadata.block_table.select(1, 0);
     mixed_qkv = xllm::kernel::causal_conv1d_update(params);
+    debug_sync("after_causal_conv1d_update");
+    debug_log_tensor("mixed_qkv_post_conv", mixed_qkv);
   }
 
   if (attn_metadata.is_prefill) {
@@ -391,6 +464,9 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
         torch::nn::functional::SoftplusFuncOptions().beta(1.0).threshold(20.0));
     g = -A_log_exp * softplus_out;
     g = g.to(a.dtype()).contiguous();
+    debug_sync("after_gdn_prefill");
+    debug_log_tensor("g", g);
+    debug_log_tensor("beta", beta);
   } else {
     xllm::kernel::FusedGdnGatingParams gdn_params;
     gdn_params.A_log = A_log_;
@@ -400,9 +476,16 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
     gdn_params.beta = 1.0f;
     gdn_params.threshold = 20.0f;
     std::tie(g, beta) = xllm::kernel::fused_gdn_gating(gdn_params);
+    debug_sync("after_fused_gdn_gating");
+    debug_log_tensor("g", g);
+    debug_log_tensor("beta", beta);
   }
 
   auto [processed_q, processed_k, processed_v] = process_mixed_qkv(mixed_qkv);
+  debug_sync("after_process_mixed_qkv");
+  debug_log_tensor("processed_q", processed_q);
+  debug_log_tensor("processed_k", processed_k);
+  debug_log_tensor("processed_v", processed_v);
   int64_t repeat_times = num_v_heads_ / num_k_heads_;
   if (repeat_times > 1) {
     processed_q = processed_q.repeat_interleave(repeat_times, 2);
@@ -412,6 +495,9 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
     std::tie(core_attn_out, last_recurrent_state) =
         torch_chunk_gated_delta_rule(
             processed_q, processed_k, processed_v, g, beta);
+    debug_sync("after_chunk_gated_delta_rule");
+    debug_log_tensor("core_attn_out", core_attn_out);
+    debug_log_tensor("last_recurrent_state", last_recurrent_state);
     ssm_cache.index_put_({input_params.block_tables.select(1, 0)},
                          last_recurrent_state.to(ssm_cache.dtype()));
   } else {
@@ -420,6 +506,9 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
     std::tie(core_attn_out, last_recurrent_state) =
         torch_recurrent_gated_delta_rule(
             processed_q, processed_k, processed_v, g, beta, ssm_state);
+    debug_sync("after_recurrent_gated_delta_rule");
+    debug_log_tensor("core_attn_out", core_attn_out);
+    debug_log_tensor("last_recurrent_state", last_recurrent_state);
     ssm_cache.index_put_({attn_metadata.block_table.select(1, 0)},
                          last_recurrent_state.to(ssm_cache.dtype()));
   }
@@ -428,13 +517,19 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::forward(
   auto core_attn_out_reshaped =
       core_attn_out.view({-1, core_attn_out.size(-1)});
   auto norm_out = norm_->forward(core_attn_out_reshaped, z_reshaped);
+  debug_sync("after_norm");
+  debug_log_tensor("norm_out", norm_out);
   auto z_shape_og = z.sizes().vec();
   norm_out = norm_out.view(z_shape_og);
   norm_out = norm_out.view({-1, norm_out.size(2), norm_out.size(3)});
 
   auto rearranged_norm = rearrange_merge(norm_out);
   rearranged_norm = reshape_qkvz_unpad(attn_metadata, rearranged_norm);
+  debug_sync("after_reshape_qkvz_unpad");
+  debug_log_tensor("rearranged_norm", rearranged_norm);
   auto attn_output = o_proj_->forward(rearranged_norm);
+  debug_sync("after_o_proj");
+  debug_log_tensor("attn_output", attn_output);
   return attn_output;
 }
 
@@ -463,6 +558,13 @@ torch::Tensor Qwen3NextGatedDeltaNetImpl::reshape_qkvz_with_pad(
   int64_t bs = attn_metadata.q_seq_lens.size(0);
   int64_t max_len = attn_metadata.max_query_len;
   const auto& start_loc = attn_metadata.q_seq_lens;
+  if (debug_sync_enabled() && bs == 0) {
+    LOG(ERROR) << "[qwen3_next_gdn] reshape_qkvz_with_pad got empty batch: "
+               << "q_seq_lens=" << tensor_meta(attn_metadata.q_seq_lens)
+               << ", max_query_len=" << max_len
+               << ", is_prefill=" << attn_metadata.is_prefill;
+  }
+  CHECK_GT(bs, 0) << "reshape_qkvz_with_pad got empty batch";
   if (!attn_metadata.is_prefill) {
     return qkvz.view({bs, -1, qkvz.size(-1)});
   }
