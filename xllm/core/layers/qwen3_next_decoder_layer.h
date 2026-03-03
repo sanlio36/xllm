@@ -47,6 +47,7 @@ class Qwen3NextDecoderLayerImpl : public torch::nn::Module {
                         const ModelInputParams& input_params);
 
  private:
+  int32_t layer_id_ = -1;
   Qwen3NextAttention attention_{nullptr};
   Qwen3NextGatedDeltaNet linear_attention_{nullptr};
 

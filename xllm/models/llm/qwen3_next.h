@@ -16,6 +16,9 @@ limitations under the License.
 #pragma once
 
 #include <boost/algorithm/string.hpp>
+#include <glog/logging.h>
+
+#include <cstdlib>
 #include <filesystem>
 #include <vector>
 
@@ -27,6 +30,43 @@ namespace xllm {
 
 using torch::indexing::None;
 using ISlice = torch::indexing::Slice;
+
+namespace {
+inline bool stage_log_enabled() {
+  const char* env = std::getenv("XLLM_MODEL_STAGE_LOG");
+  if (!env) {
+    return false;
+  }
+  return std::string(env) != "0";
+}
+
+inline void stage_log_tensor(const char* tag,
+                             int64_t layer_id,
+                             const torch::Tensor& t) {
+  if (!stage_log_enabled()) {
+    return;
+  }
+  if (!t.defined()) {
+    LOG(INFO) << "[qwen3_next] " << tag << " layer=" << layer_id
+              << " tensor=undefined";
+    return;
+  }
+  LOG(INFO) << "[qwen3_next] " << tag << " layer=" << layer_id
+            << " sizes=" << t.sizes() << " dtype=" << t.dtype()
+            << " device=" << t.device();
+}
+
+inline void stage_log_meta(const char* tag,
+                           const layer::AttentionMetadata& meta) {
+  if (!stage_log_enabled()) {
+    return;
+  }
+  LOG(INFO) << "[qwen3_next] " << tag << " is_prefill=" << meta.is_prefill
+            << " is_chunked_prefill=" << meta.is_chunked_prefill
+            << " max_query_len=" << meta.max_query_len
+            << " max_seq_len=" << meta.max_seq_len;
+}
+}  // namespace
 
 class Qwen3NextModelImpl : public torch::nn::Module {
  public:
@@ -95,6 +135,8 @@ class Qwen3NextModelImpl : public torch::nn::Module {
 
 #if defined(USE_NPU) && defined(USE_NPU_TORCH)
     // Create attention mask
+    stage_log_tensor("forward_begin.tokens", -1, tokens);
+    stage_log_tensor("forward_begin.positions", -1, positions);
     torch::Tensor attn_mask;
     max_seq_len_ = std::max(input_params.kv_max_seq_len, max_seq_len_);
 
@@ -121,12 +163,17 @@ class Qwen3NextModelImpl : public torch::nn::Module {
 
     layer::AttentionMetadata attn_metadata =
         layer::AttentionMetadataBuilder::build(input_params, attn_mask);
+    stage_log_meta("attn_metadata", attn_metadata);
     torch::Tensor h = embed_tokens_(tokens);
+    stage_log_tensor("after_embed", -1, h);
     for (size_t i = 0; i < layers_.size(); i++) {
       auto& layer = layers_[i];
+      stage_log_tensor("layer_begin", static_cast<int64_t>(i), h);
       h = layer(h, positions, attn_metadata, kv_caches[i], input_params);
+      stage_log_tensor("layer_end", static_cast<int64_t>(i), h);
     }
     h = norm_(h);
+    stage_log_tensor("after_norm", -1, h);
     return ModelOutput(h);
 #endif
   }

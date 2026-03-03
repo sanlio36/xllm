@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "attention.h"
 
+#include <glog/logging.h>
+
 #include "kernels/ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -93,6 +95,21 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
     attention_params.key = key.view({-1, num_kv_heads_, head_size_});
     attention_params.value = value.view({-1, num_kv_heads_, head_size_});
   } else if (attention_params.attn_metadata.is_chunked_prefill) {
+    if (!v_cache.has_value()) {
+      LOG(ERROR) << "AttentionImpl::prefill_forward (NPU): v_cache is missing "
+                 << "for chunked prefill. k_cache=" << k_cache.sizes()
+                 << ", attn_mask="
+                 << (attn_metadata.attn_mask.defined()
+                         ? attn_metadata.attn_mask.sizes()
+                         : torch::IntArrayRef())
+                 << ", kv_seq_lens="
+                 << (attn_metadata.kv_seq_lens.defined()
+                         ? attn_metadata.kv_seq_lens.sizes()
+                         : torch::IntArrayRef());
+    }
+    CHECK(v_cache.has_value())
+        << "AttentionImpl::prefill_forward (NPU): v_cache is required for "
+           "chunked prefill.";
     attention_params.key = k_cache;
     attention_params.value = v_cache.value();
   }

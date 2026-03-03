@@ -31,6 +31,8 @@ limitations under the License.
 
 #include <numeric>
 
+#include <glog/logging.h>
+
 #include "common/macros.h"
 #include "layers/common/attention_metadata.h"
 
@@ -49,6 +51,14 @@ void apply_rotary(RotaryParams& params) {
                     params.dynamic_ntk,
                     params.max_query_len);
 #elif defined(USE_NPU)
+  if (!params.position_ids.has_value()) {
+    LOG(ERROR) << "apply_rotary (NPU): position_ids is required but missing. "
+               << "q=" << params.q.sizes() << " k=" << params.k.sizes()
+               << " cos_sin=" << params.cos_sin.sizes()
+               << " interleaved=" << params.interleaved;
+  }
+  CHECK(params.position_ids.has_value())
+      << "apply_rotary (NPU): position_ids is required but missing.";
   npu::apply_rotary(
       params.q, params.k, params.cos_sin, params.position_ids.value());
 #elif defined(USE_CUDA) || defined(USE_MUSA)

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "qwen3_next_decoder_layer.h"
 
+#include <cstdlib>
+
 #include <glog/logging.h>
 
 namespace xllm {
@@ -23,6 +25,7 @@ namespace layer {
 Qwen3NextDecoderLayerImpl::Qwen3NextDecoderLayerImpl(
     const ModelContext& context,
     int32_t layer_id) {
+  layer_id_ = layer_id;
   const auto& model_args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
@@ -94,22 +97,53 @@ void Qwen3NextDecoderLayerImpl::load_state_dict(const StateDict& state_dict) {
   }
 }
 
+namespace {
+inline bool stage_log_enabled() {
+  const char* env = std::getenv("XLLM_MODEL_STAGE_LOG");
+  if (!env) {
+    return false;
+  }
+  return std::string(env) != "0";
+}
+
+inline void stage_log_tensor(const char* tag,
+                             int64_t layer_id,
+                             const torch::Tensor& t) {
+  if (!stage_log_enabled()) {
+    return;
+  }
+  if (!t.defined()) {
+    LOG(INFO) << "[qwen3_next] " << tag << " layer=" << layer_id
+              << " tensor=undefined";
+    return;
+  }
+  LOG(INFO) << "[qwen3_next] " << tag << " layer=" << layer_id
+            << " sizes=" << t.sizes() << " dtype=" << t.dtype()
+            << " device=" << t.device();
+}
+}  // namespace
+
 torch::Tensor Qwen3NextDecoderLayerImpl::forward(
     torch::Tensor& x,
     torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params) {
+  stage_log_tensor("layer_input", layer_id_, x);
   // Pre-attention norm
   torch::Tensor residual = x;
   x = input_norm_(x);
+  stage_log_tensor("after_input_norm", layer_id_, x);
 
   // Attention
   if (attention_) {
+    stage_log_tensor("before_self_attn", layer_id_, x);
     x = attention_->forward(positions, x, attn_metadata, kv_cache);
+    stage_log_tensor("after_self_attn", layer_id_, x);
   } else {
-    // x = x;
+    stage_log_tensor("before_linear_attn", layer_id_, x);
     x = linear_attention_->forward(x, attn_metadata, kv_cache, input_params);
+    stage_log_tensor("after_linear_attn", layer_id_, x);
   }
 
   auto orig_dtype = x.dtype();
@@ -118,17 +152,23 @@ torch::Tensor Qwen3NextDecoderLayerImpl::forward(
     residual = residual.to(torch::kFloat32);
   }
   x = x + residual;
+  stage_log_tensor("after_attn_residual", layer_id_, x);
 
   // Post-attention norm
   residual = x;
   x = x.to(orig_dtype);
   x = post_norm_(x);
+  stage_log_tensor("after_post_norm", layer_id_, x);
 
   // MLP forward
   if (moe_mlp_) {
+    stage_log_tensor("before_moe_mlp", layer_id_, x);
     x = moe_mlp_(x, input_params);
+    stage_log_tensor("after_moe_mlp", layer_id_, x);
   } else {
+    stage_log_tensor("before_mlp", layer_id_, x);
     x = mlp_(x);
+    stage_log_tensor("after_mlp", layer_id_, x);
   }
 
   orig_dtype = x.dtype();
@@ -138,6 +178,7 @@ torch::Tensor Qwen3NextDecoderLayerImpl::forward(
   }
   x = x + residual;
   x = x.to(orig_dtype);
+  stage_log_tensor("layer_output", layer_id_, x);
   return x;
 }
 
