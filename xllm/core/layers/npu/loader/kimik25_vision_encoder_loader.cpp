@@ -52,10 +52,10 @@ enum VisionEncoderLayerTensorId : int {
 };
 
 static std::vector<std::pair<int, std::string>> WEIGHT_MAPPING = {
-    {IN_INPUT_NORM_WEIGHT, "norm1.weight"},
-    {IN_INPUT_NORM_BIAS, "norm1.bias"},
-    {IN_POST_NORM_WEIGHT, "norm2.weight"},
-    {IN_POST_NORM_BIAS, "norm2.bias"},
+    {IN_INPUT_NORM_WEIGHT, "norm0.weight"},
+    {IN_INPUT_NORM_BIAS, "norm0.bias"},
+    {IN_POST_NORM_WEIGHT, "norm1.weight"},
+    {IN_POST_NORM_BIAS, "norm1.bias"},
     {IN_QKV_WEIGHT, "attn.qkv.weight"},
     {IN_QKV_BIAS, "attn.qkv.bias"},
     {IN_WATTENTION_OUT_WEIGHT, "attn.proj.weight"},
