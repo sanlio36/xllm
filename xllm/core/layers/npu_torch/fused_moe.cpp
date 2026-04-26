@@ -643,7 +643,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
   moe_combine_params.gather_ids = selected_expert_info.combine_idx;
   final_hidden_states = xllm::kernel::moe_combine_result(moe_combine_params);
   if (shared_output.has_value()) {
-    final_hidden_states = final_hidden_states + shared_output.value();
+    final_hidden_states = final_hidden_states * route_scale_ + shared_output.value();
   }
   // reshape the final hidden states to the original shape
   final_hidden_states = final_hidden_states.reshape(hidden_states_shape);
@@ -672,7 +672,7 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   std::optional<torch::Tensor> shared_output = std::nullopt;
   if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
-    if (shared_expert_gate_) {
+    if (shared_expert_gate_->weight.defined()) {
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
@@ -734,7 +734,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   std::optional<torch::Tensor> shared_output = std::nullopt;
   if (n_shared_experts_ > 0) {
     shared_output = shared_experts_(input);
-    if (shared_expert_gate_) {
+    if (shared_expert_gate_->weight.defined()) {
       auto gate = torch::sigmoid(shared_expert_gate_->forward(input));
       if (shared_output.has_value()) {
         torch::Tensor res = gate * shared_output.value();
