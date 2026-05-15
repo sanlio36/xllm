@@ -22,6 +22,10 @@ limitations under the License.
 #include <utility>
 
 namespace xllm {
+namespace runtime {
+struct Options;
+}  // namespace runtime
+
 namespace layer {
 class LmHead;
 class WordEmbedding;
@@ -103,6 +107,15 @@ struct has_reload_model_weights_from_device<
     std::void_t<
         decltype(std::declval<T>()->reload_model_weights_from_device())>>
     : std::true_type {};
+
+template <typename T, typename = void>
+struct has_adjust_runtime_options : std::false_type {};
+
+template <typename T>
+struct has_adjust_runtime_options<
+    T,
+    std::void_t<decltype(std::declval<T>()->adjust_runtime_options(
+        std::declval<runtime::Options*>()))>> : std::true_type {};
 
 template <typename T, typename = void>
 struct has_pooler : std::false_type {};

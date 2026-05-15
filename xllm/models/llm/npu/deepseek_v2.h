@@ -15,6 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+#include <optional>
+#include <vector>
+
+#include "core/common/global_flags.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
@@ -104,6 +109,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     // register submodules
     device_ = options.device();
     dtype_ = options.dtype().toScalarType();
+    hidden_size_ = model_args.hidden_size();
     num_speculative_tokens_ = model_args.num_speculative_tokens();
 
     npu_embed_tokens_ =
@@ -140,11 +146,56 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
     norm_ = register_module("norm", layer::NpuRMSNorm(context));
 
+    if (FLAGS_speculative_algorithm == "Eagle3" &&
+        model_args.num_speculative_tokens() > 0) {
+      const std::vector<int32_t>& layer_ids_from_config =
+          model_args.layers_to_capture();
+      if (!layer_ids_from_config.empty()) {
+        set_eagle3_layers_to_capture(
+            std::make_optional<std::vector<int32_t>>(layer_ids_from_config));
+      } else {
+        set_eagle3_layers_to_capture();
+      }
+
+      const int64_t num_captured =
+          static_cast<int64_t>(layers_to_capture_.size());
+      const int64_t aux_dim = model_args.hidden_size() * num_captured;
+      aux_output_buffer_ =
+          torch::empty({FLAGS_max_tokens_per_batch, aux_dim}, options);
+    }
+
     dp_size_ = parallel_args.dp_size();
     dp_local_tp_size_ = parallel_args.world_size() / dp_size_;
     dp_rank_ = parallel_args.rank() / dp_local_tp_size_;
     rank_ = parallel_args.rank();
     num_experts_per_tok_ = model_args.num_experts_per_tok();
+  }
+
+  void set_eagle3_layers_to_capture(
+      const std::optional<std::vector<int32_t>>& layer_ids = std::nullopt) {
+    capture_aux_hidden_states_ = true;
+    layers_to_capture_.clear();
+    const int32_t num_layers = static_cast<int32_t>(layers_.size());
+    if (!layer_ids.has_value()) {
+      layers_to_capture_.push_back(std::min<int32_t>(2, num_layers - 1));
+      layers_to_capture_.push_back(num_layers / 2);
+      layers_to_capture_.push_back(std::max<int32_t>(0, num_layers - 3));
+    } else {
+      for (const int32_t layer_id : layer_ids.value()) {
+        if (layer_id < 0 || layer_id >= num_layers) {
+          LOG(WARNING) << "Ignore invalid DeepseekV2 Eagle3 capture layer: "
+                       << layer_id << ", num_layers: " << num_layers;
+          continue;
+        }
+        layers_to_capture_.push_back(layer_id);
+      }
+    }
+    CHECK(!layers_to_capture_.empty())
+        << "Eagle3 needs at least one valid aux hidden capture layer.";
+    CHECK_EQ(layers_to_capture_.size(), 3)
+        << "Eagle3 expects exactly 3 aux hidden capture layers.";
+    LOG(INFO) << "DeepseekV2 Eagle3 layers_to_capture count: "
+              << layers_to_capture_.size();
   }
 
   ModelOutput forward(torch::Tensor tokens,
@@ -165,10 +216,28 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     } else {
       h = npu_embed_tokens_(tokens, 0);
     }
+    const int64_t input_length = h.size(0);
+    torch::Tensor expert_array = torch::arange(
+        0,
+        input_length * num_experts_per_tok_,
+        torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
+    ModelInputParams& input_params_new =
+        const_cast<ModelInputParams&>(input_params);
+    input_params_new.expert_array = expert_array;
     auto cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto cos_sin_chunks = cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = cos_sin_chunks[0].contiguous();
     auto sin_pos = cos_sin_chunks[1].contiguous();
+
+    if (capture_aux_hidden_states_) {
+      LOG(INFO) << "DeepseekV2 Eagle3 forward debug:"
+                << " num_tokens=" << h.size(0) << ", hidden_size=" << h.size(-1)
+                << ", input_embedding_shape="
+                << (inputs_embeds.defined() ? inputs_embeds.sizes()
+                                            : c10::IntArrayRef())
+                << ", layers_to_capture_count=" << layers_to_capture_.size()
+                << ", aux_output_buffer_shape=" << aux_output_buffer_.sizes();
+    }
 
     torch::Tensor attn_mask;
     if (FLAGS_enable_prefix_cache &&
@@ -196,18 +265,46 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = i;
+      if (capture_aux_hidden_states_) {
+        const int64_t num_tokens = h.size(0);
+        const int64_t hidden_size = h.size(-1);
+        for (int64_t capture_idx = 0;
+             capture_idx < static_cast<int64_t>(layers_to_capture_.size());
+             ++capture_idx) {
+          if (layers_to_capture_[capture_idx] != layer_index) {
+            continue;
+          }
+          LOG(INFO) << "DeepseekV2 Eagle3 capturing aux hidden states:"
+                    << " layer_index=" << layer_index
+                    << ", capture_idx=" << capture_idx
+                    << ", token_rows=" << num_tokens
+                    << ", hidden_size=" << hidden_size;
+          aux_output_buffer_.slice(0, 0, num_tokens)
+              .slice(
+                  1, capture_idx * hidden_size, (capture_idx + 1) * hidden_size)
+              .copy_(h.reshape({num_tokens, hidden_size}));
+        }
+      }
       rolling_guard.before_layer(layer_index);
       layer(h,
             cos_pos,
             sin_pos,
             attn_mask,
             kv_caches[i],
-            input_params,
+            input_params_new,
             event,
             event_flag);
       rolling_guard.after_layer(layer_index);
     }
     auto hidden_states = norm_(h, 0);
+    if (capture_aux_hidden_states_) {
+      const int64_t num_tokens = h.size(0);
+      torch::Tensor aux_hidden_states =
+          aux_output_buffer_.slice(0, 0, num_tokens);
+      LOG(INFO) << "DeepseekV2 Eagle3 aux_hidden_states output shape: "
+                << aux_hidden_states.sizes();
+      return ModelOutput(hidden_states, torch::Tensor(), aux_hidden_states);
+    }
     return ModelOutput(hidden_states);
   }
 
@@ -319,6 +416,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   int32_t dp_local_tp_size_;
   int32_t num_experts_per_tok_;
   int32_t num_speculative_tokens_ = 0;
+  int64_t hidden_size_ = 0;
   at::Device device_;
   torch::Dtype dtype_;
   layer::NpuWordEmbedding npu_embed_tokens_{nullptr};
@@ -327,6 +425,9 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   layer::AttentionMask attn_mask_;
   layer::NpuRMSNorm norm_{nullptr};
   RollingLoadManager* rolling_mgr_ = nullptr;
+  std::vector<int32_t> layers_to_capture_;
+  bool capture_aux_hidden_states_ = false;
+  torch::Tensor aux_output_buffer_;
 };
 TORCH_MODULE(DeepseekV2Model);
 

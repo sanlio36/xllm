@@ -42,6 +42,7 @@ limitations under the License.
 #include "model_input_params.h"
 #include "model_output.h"
 #include "model_traits.h"
+#include "runtime/options.h"
 
 namespace xllm {
 
@@ -75,6 +76,8 @@ class CausalLM : public torch::nn::Module {
                                const torch::Tensor& seleted_idxes) = 0;
 
   virtual void load_model(std::unique_ptr<ModelLoader> loader) = 0;
+
+  virtual void adjust_runtime_options(runtime::Options* options) const {}
 
   virtual torch::Device device() const = 0;
 
@@ -160,6 +163,14 @@ class CausalLMImpl : public CausalLM {
 
   void load_model(std::unique_ptr<ModelLoader> loader) override {
     model_->load_model(std::move(loader));
+  }
+
+  void adjust_runtime_options(runtime::Options* options) const override {
+    if constexpr (detail::has_adjust_runtime_options<Model>::value) {
+      model_->adjust_runtime_options(options);
+    } else {
+      CausalLM::adjust_runtime_options(options);
+    }
   }
 
   void lazy_load_model(std::unique_ptr<ModelLoader> loader) override {

@@ -179,8 +179,15 @@ bool VLMEngine::init_model() {
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
-  for (const auto& result : results) {
+  for (size_t idx = 0; idx < results.size(); ++idx) {
+    const auto& result = results[idx];
+    if (!result.hasValue()) {
+      LOG(ERROR) << "Failed to initialize VLM worker #" << idx
+                 << ": " << result.exception().what().toStdString();
+      return false;
+    }
     if (!result.value()) {
+      LOG(ERROR) << "VLM worker #" << idx << " returned init failure.";
       return false;
     }
   }

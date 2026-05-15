@@ -33,6 +33,50 @@ namespace layer {
 const uint64_t WEIGHT_COUNT_PER_LAYER = 52;
 const int32_t IN_MLP_W2_WEIGHT = 32;
 
+namespace {
+
+void log_tensor_shape(const std::string& name, const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    LOG(INFO) << name << ": undefined";
+    return;
+  }
+  LOG(INFO) << name << ": shape=" << tensor.sizes()
+            << ", dtype=" << tensor.scalar_type()
+            << ", device=" << tensor.device()
+            << ", contiguous=" << tensor.is_contiguous();
+}
+
+void log_eagle3_inputs(const std::string& phase,
+                       const torch::Tensor& hidden_states,
+                       const torch::Tensor& hidden_states_extra,
+                       const torch::Tensor& cos_pos,
+                       const torch::Tensor& sin_pos,
+                       const torch::Tensor& attn_mask,
+                       const KVCache& kv_cache,
+                       const ModelInputParams& input_params,
+                       const atb_speed::Model::Node& node) {
+  LOG(INFO) << "Eagle3 " << phase << " input debug:"
+            << " num_sequences=" << input_params.num_sequences
+            << ", kv_max_seq_len=" << input_params.kv_max_seq_len
+            << ", q_seq_lens_vec_size=" << input_params.q_seq_lens_vec.size()
+            << ", kv_seq_lens_vec_size=" << input_params.kv_seq_lens_vec.size()
+            << ", variant_in_tensors=" << node.variantPack.inTensors.size();
+  log_tensor_shape("  hidden_states", hidden_states);
+  log_tensor_shape("  hidden_states_extra", hidden_states_extra);
+  log_tensor_shape("  cos_pos", cos_pos);
+  log_tensor_shape("  sin_pos", sin_pos);
+  log_tensor_shape("  attn_mask", attn_mask);
+  log_tensor_shape("  k_cache", kv_cache.get_k_cache());
+  log_tensor_shape("  v_cache", kv_cache.get_v_cache());
+  log_tensor_shape("  kv_seq_lens", input_params.kv_seq_lens);
+  log_tensor_shape("  q_seq_lens", input_params.q_seq_lens);
+  log_tensor_shape("  block_tables", input_params.block_tables);
+  log_tensor_shape("  new_cache_slots", input_params.new_cache_slots);
+  log_tensor_shape("  input_embedding", input_params.input_embedding);
+}
+
+}  // namespace
+
 void NpuEagle3DecoderLayerImpl::param_from_args(
     atb_speed::eagle3::DecoderLayerParam& param,
     const ModelArgs& args,
@@ -226,6 +270,17 @@ torch::Tensor NpuEagle3DecoderLayerImpl::forward(
     std::atomic<bool>* event_flag,
     int node_id) {
   atb::Status st;
+  const char* phase =
+      input_params.batch_forward_type.is_decode() ? "decode" : "prefill";
+  LOG(INFO) << "Eagle3 decoder layer forward:"
+            << " phase=" << phase << ", node_id=" << node_id
+            << ", hidden_states_shape=" << hidden_states.sizes()
+            << ", hidden_states_extra_shape=" << hidden_states_extra.sizes()
+            << ", cos_shape=" << cos_pos.sizes()
+            << ", sin_shape=" << sin_pos.sizes() << ", input_embedding_shape="
+            << (input_params.input_embedding.defined()
+                    ? input_params.input_embedding.sizes()
+                    : c10::IntArrayRef());
   if (!input_params.batch_forward_type.is_decode()) {
     // mstxRangeId id = mstxRangeStartA("prefill build variant", nullptr);
     build_node_variant_pack(prefill_node_,
@@ -239,6 +294,17 @@ torch::Tensor NpuEagle3DecoderLayerImpl::forward(
                             true);
     // mstxRangeEnd(id);
     st = execute_node(prefill_node_, node_id, event, event_flag);
+    if (st != 0) {
+      log_eagle3_inputs("prefill",
+                        hidden_states,
+                        hidden_states_extra,
+                        cos_pos,
+                        sin_pos,
+                        attn_mask,
+                        kv_cache,
+                        input_params,
+                        prefill_node_);
+    }
     LOG_IF(FATAL, st != 0) << model_name_
                            << "excute prefill layer fail, error code: " << st;
   } else {
@@ -252,6 +318,17 @@ torch::Tensor NpuEagle3DecoderLayerImpl::forward(
                             input_params,
                             false);
     st = execute_node(decode_node_, node_id + 1000, event, event_flag);
+    if (st != 0) {
+      log_eagle3_inputs("decode",
+                        hidden_states,
+                        hidden_states_extra,
+                        cos_pos,
+                        sin_pos,
+                        decode_attn_mask_,
+                        kv_cache,
+                        input_params,
+                        decode_node_);
+    }
     LOG_IF(FATAL, st != 0) << model_name_
                            << "excute decode layer fail, error code: " << st;
   }
@@ -272,6 +349,15 @@ void NpuEagle3DecoderLayerImpl::build_node_variant_pack(
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(hidden_states);
   internal_tensors_extra_ =
       atb_speed::Utils::AtTensor2Tensor(hidden_states_extra);
+  LOG(INFO) << "Eagle3 build " << (is_prefill ? "prefill" : "decode")
+            << " variant pack:"
+            << " hidden_states=" << hidden_states.sizes()
+            << ", hidden_states_extra=" << hidden_states_extra.sizes()
+            << ", cos_pos=" << cos_pos.sizes()
+            << ", sin_pos=" << sin_pos.sizes()
+            << ", attn_mask_defined=" << attn_mask.defined()
+            << ", kv_seq_lens_vec_size=" << input_params.kv_seq_lens_vec.size()
+            << ", q_seq_lens_vec_size=" << input_params.q_seq_lens_vec.size();
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensors_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
       atb_speed::Utils::AtTensor2Tensor(cos_pos);

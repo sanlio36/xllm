@@ -79,6 +79,14 @@ class CausalVLMImpl : public CausalVLM {
     model_->load_model(std::move(loader));
   }
 
+  void adjust_runtime_options(runtime::Options* options) const override {
+    if constexpr (detail::has_adjust_runtime_options<Model>::value) {
+      model_->adjust_runtime_options(options);
+    } else {
+      CausalLM::adjust_runtime_options(options);
+    }
+  }
+
   virtual void prepare_expert_weight(int32_t layer_id,
                                      const std::vector<int32_t>& expert_ids) {
     return;

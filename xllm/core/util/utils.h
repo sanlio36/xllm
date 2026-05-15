@@ -117,6 +117,7 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "deepseek_v2",
       "deepseek_v3",
       "deepseek_v32",
+      "deepseek_eagle3",
       "deepseek_v3_mtp",
       "deepseek_v32_mtp",
       "kimi_k2",
@@ -130,6 +131,21 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
 
 inline bool is_mla_model_type(std::string_view model_type) {
   return mla_model_type_set().contains(std::string(model_type));
+}
+
+inline std::optional<std::string> get_model_type_from_architectures(
+    const JsonReader& reader) {
+  auto architectures = reader.value<std::vector<std::string>>("architectures");
+  if (!architectures.has_value() || architectures->empty()) {
+    return std::nullopt;
+  }
+
+  const std::string& architecture = architectures->front();
+  if (architecture == "Eagle3DeepseekV2ForCausalLM" ||
+      architecture == "Eagle3DeepseekV3ForCausalLM") {
+    return "deepseek_eagle3";
+  }
+  return std::nullopt;
 }
 
 inline std::string get_model_name(
@@ -168,8 +184,12 @@ inline std::string get_model_type(const std::filesystem::path& model_path) {
     model_type = reader.value<std::string>("model_name");
   }
   if (!model_type.has_value()) {
+    model_type = get_model_type_from_architectures(reader);
+  }
+  if (!model_type.has_value()) {
     LOG(FATAL) << "Please check config.json file in model path: " << model_path
-               << ", it should contain model_type or model_name key.";
+               << ", it should contain model_type, model_name, or a known "
+                  "architectures key.";
   }
   return model_type.value();
 }

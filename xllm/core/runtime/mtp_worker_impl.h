@@ -50,7 +50,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 const runtime::Options& options,
                 const runtime::Options& target_options,
                 const runtime::Options& draft_options,
-                bool enable_opt_validate_probs = false);
+                bool enable_opt_validate_probs = false,
+                WorkerType target_worker_type = WorkerType::LLM);
 
  public:
   bool init_model(const std::string& model_weights_path,
@@ -69,6 +70,13 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                    ForwardInput& processed_inputs) override;
 
  protected:
+  bool init_draft_model(const std::string& model_weights_path,
+                        int32_t random_seed,
+                        MasterStatus master_status);
+  void share_target_weights_to_draft();
+  KVCacheShape get_draft_kv_cache_shape(
+      const KVCacheShape& target_kv_cache_shape) const;
+
   std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
   std::optional<ForwardOutput> step_decode(const ForwardInput& inputs) override;
   std::optional<ForwardOutput> step_empty(const ForwardInput& inputs) override;

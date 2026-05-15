@@ -50,15 +50,25 @@ class PreprocessChatJsonTest : public ::testing::Test {
 // Basic functionality tests
 // =============================================================================
 
-TEST_F(PreprocessChatJsonTest, PassThroughNonArrayContent) {
-  // String content should pass through unchanged
+TEST_F(PreprocessChatJsonTest, LlmPassThroughStringContent) {
+  // Text-only backend should keep string content unchanged.
   std::string input = R"({
     "messages": [{"role": "user", "content": "Hello"}]
   })";
   LlmChatJsonParser llm_parser;
-  VlmChatJsonParser vlm_parser;
   expect_success(input, llm_parser, input);
-  expect_success(input, vlm_parser, input);
+}
+
+TEST_F(PreprocessChatJsonTest, VlmNormalizeStringContentToTextBlock) {
+  // Multimodal backend normalizes string content into a text block array.
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}]
+  })";
+  std::string expected = R"({
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
+  })";
+  VlmChatJsonParser vlm_parser;
+  expect_success(input, vlm_parser, expected);
 }
 
 TEST_F(PreprocessChatJsonTest, PassThroughNoMessages) {

@@ -63,6 +63,7 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
 
   // Dont find model in causal models
   CHECK(model_ != nullptr) << "Failed to create model.";
+  model_->adjust_runtime_options(&options_);
   model_executor_ = std::make_unique<Executor>(
       model_.get(), context.get_model_args(), device_, options_);
 
@@ -209,11 +210,22 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     } else {
       embeddings = model_output.hidden_states;
     }
+    LOG(INFO) << "LLMWorkerImpl speculative embeddings debug:"
+              << " is_spec_draft=" << is_spec_draft_ << ", batch_forward_type="
+              << (input.input_params.batch_forward_type.is_decode() ? "decode"
+                                                                    : "prefill")
+              << ", selected_token_idxes_defined="
+              << sampling_params.selected_token_idxes.defined()
+              << ", embeddings_shape=" << embeddings.sizes();
     if (!input.input_params.batch_forward_type.is_decode() && !is_spec_draft_) {
       output.sample_output.embeddings = embeddings;
+      LOG(INFO) << "LLMWorkerImpl embeddings forwarded as-is, shape="
+                << output.sample_output.embeddings.sizes();
     } else if (sampling_params.selected_token_idxes.defined()) {
       output.sample_output.embeddings = embeddings.index_select(
           /*dim=*/0, sampling_params.selected_token_idxes);
+      LOG(INFO) << "LLMWorkerImpl embeddings indexed by selected_token_idxes, "
+                << "result shape=" << output.sample_output.embeddings.sizes();
     }
   }
 

@@ -49,6 +49,7 @@ bool VLMWorkerImpl::init_model(ModelContext& context) {
   context.set_image_embedding_mode(false);
   model_ = create_vlm_model(context);
   CHECK(model_ != nullptr) << "Failed to create model.";
+  model_->adjust_runtime_options(&options_);
   model_executor_ = std::make_unique<Executor>(
       model_.get(), context.get_model_args(), device_, options_);
   return true;
@@ -95,6 +96,20 @@ std::optional<ForwardOutput> VLMWorkerImpl::step(const ForwardInput& input) {
     output.do_sample = sampling_params.do_sample;
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
+  }
+  if (options_.enable_speculative_decode()) {
+    torch::Tensor embeddings;
+    if (model_output.aux_hidden_states.defined()) {
+      embeddings = model_output.aux_hidden_states;
+    } else {
+      embeddings = model_output.hidden_states;
+    }
+    if (!input.input_params.batch_forward_type.is_decode() && !is_spec_draft_) {
+      output.sample_output.embeddings = embeddings;
+    } else if (sampling_params.selected_token_idxes.defined()) {
+      output.sample_output.embeddings = embeddings.index_select(
+          /*dim=*/0, sampling_params.selected_token_idxes);
+    }
   }
   auto ret = device_.synchronize_default_stream();
   return output;

@@ -24,11 +24,13 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
  public:
   Eagle3WorkerImpl(const ParallelArgs& parallel_args,
                    const torch::Device& device,
-                   const runtime::Options& options);
+                   const runtime::Options& options,
+                   WorkerType target_worker_type = WorkerType::LLM);
 
   ~Eagle3WorkerImpl() override = default;
 
-  // Override init_model to load hot_token_id_ for EAGLE-3
+  // Override init_model to load hot_token_id_ for EAGLE-3 when the draft
+  // model provides d2t/t2d mapping.
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
@@ -36,17 +38,16 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
   // EAGLE-3 draft input_embedding is 3 * target_hidden_size
   int64_t get_embedding_placeholder_size() override;
 
-  // Get hot_token_id for draft-to-target token mapping
+  // Get hot_token_id for draft-to-target token mapping.
   torch::Tensor get_hot_token_id() const { return hot_token_id_; }
 
  protected:
-  // EAGLE-3 specific draft output post-processing during decode:
-  // selected prob extraction + draft->target token id mapping.
+  // EAGLE-3 specific draft output post-processing during decode.
   void process_draft_sample_output(SampleOutput& sample_output) override;
 
-  // EAGLE-3 specific: hot_token_id for draft-to-target token mapping
-  // hot_token_id = d2t + arange(d2t.size(0))
+  // EAGLE-3 specific: hot_token_id for draft-to-target token mapping.
   torch::Tensor hot_token_id_;
+  bool enable_token_remap_ = false;
 };
 
 }  // namespace xllm

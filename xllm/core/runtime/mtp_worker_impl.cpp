@@ -15,11 +15,15 @@ limitations under the License.
 
 #include "mtp_worker_impl.h"
 
+#include <utility>
+#include <vector>
+
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #if defined(USE_MLU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
+
 #include "framework/request/mm_data.h"
 #include "spec_input_builder.h"
 #include "util/env_var.h"
@@ -47,6 +51,67 @@ runtime::Options MTPDraftOptions(const runtime::Options& options) {
   return opts;
 }
 
+int64_t get_local_head_count(int64_t total_head_count, int64_t world_size) {
+  CHECK_GT(world_size, 0) << "world_size must be positive";
+  return std::max<int64_t>(1, total_head_count / world_size);
+}
+
+int64_t get_kv_cache_slot_size(const ModelArgs& args,
+                               int64_t dtype_size,
+                               int64_t world_size) {
+  if (args.enable_mla()) {
+    return dtype_size * (args.kv_lora_rank() + args.qk_rope_head_dim());
+  }
+
+  const int64_t total_kv_head_count =
+      args.n_kv_heads().value_or(args.n_heads());
+  const int64_t local_kv_head_count =
+      get_local_head_count(total_kv_head_count, world_size);
+  return 2 * dtype_size * args.head_dim() * local_kv_head_count;
+}
+
+int64_t get_kv_cache_block_size(const ModelArgs& args,
+                                int64_t dtype_size,
+                                int64_t world_size,
+                                int64_t block_size) {
+  return args.n_layers() * block_size *
+         get_kv_cache_slot_size(args, dtype_size, world_size);
+}
+
+KVCacheShape build_kv_cache_shape(const ModelArgs& args,
+                                  int64_t n_blocks,
+                                  int64_t block_size,
+                                  int64_t world_size) {
+  KVCacheCapacity kv_cache_cap;
+  kv_cache_cap.n_blocks(n_blocks).block_size(block_size);
+  return KVCacheShape(kv_cache_cap, args, world_size);
+}
+
+std::pair<KVCacheShape, KVCacheShape> build_shared_kv_cache_shapes(
+    const ModelArgs& target_args,
+    const ModelArgs& draft_args,
+    const KVCacheShape& target_kv_cache_shape,
+    int64_t dtype_size,
+    int64_t world_size,
+    int64_t block_size) {
+  const int64_t target_n_blocks = target_kv_cache_shape.key_cache_shape()[0];
+  const int64_t target_block_bytes =
+      get_kv_cache_block_size(target_args, dtype_size, world_size, block_size);
+  const int64_t draft_block_bytes =
+      get_kv_cache_block_size(draft_args, dtype_size, world_size, block_size);
+  const int64_t combined_block_bytes = target_block_bytes + draft_block_bytes;
+  CHECK_GT(combined_block_bytes, 0) << "invalid speculative kv cache size";
+
+  const int64_t shared_n_blocks = std::max<int64_t>(
+      1, (target_n_blocks * target_block_bytes) / combined_block_bytes);
+  CHECK_GE(target_n_blocks, shared_n_blocks)
+      << "shared kv cache blocks should not exceed target blocks";
+  return {build_kv_cache_shape(
+              target_args, shared_n_blocks, block_size, world_size),
+          build_kv_cache_shape(
+              draft_args, shared_n_blocks, block_size, world_size)};
+}
+
 }  // namespace
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
@@ -64,8 +129,13 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const runtime::Options& options,
                              const runtime::Options& target_options,
                              const runtime::Options& draft_options,
-                             bool enable_opt_validate_probs)
-    : SpeculativeWorkerImpl(parallel_args, device, options, target_options),
+                             bool enable_opt_validate_probs,
+                             WorkerType target_worker_type)
+    : SpeculativeWorkerImpl(parallel_args,
+                            device,
+                            options,
+                            target_options,
+                            target_worker_type),
       enable_opt_validate_probs_(enable_opt_validate_probs) {
   draft_impl_ =
       std::make_unique<LLMWorkerImpl>(parallel_args, device, draft_options);
@@ -80,11 +150,36 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
     result = SpeculativeWorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
   } else {
-    CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
-    result = draft_impl_->WorkerImpl::init_model(
-        model_weights_path, random_seed, master_status);
+    result = init_draft_model(model_weights_path, random_seed, master_status);
   }
 
+  if (result && draft_impl_ != nullptr &&
+      draft_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED &&
+      !options_.draft_model_path().value_or("").empty()) {
+    result = init_draft_model(model_weights_path, random_seed, master_status);
+  }
+
+  if (draft_impl_ != nullptr &&
+      draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    share_target_weights_to_draft();
+  }
+  return result;
+}
+
+bool MTPWorkerImpl::init_draft_model(const std::string& model_weights_path,
+                                     int32_t random_seed,
+                                     MasterStatus master_status) {
+  if (draft_impl_ != nullptr) {
+    CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
+    const std::string& draft_model_path =
+        options_.draft_model_path().value_or(model_weights_path);
+    return draft_impl_->WorkerImpl::init_model(
+        draft_model_path, random_seed, master_status);
+  }
+  return true;
+}
+
+void MTPWorkerImpl::share_target_weights_to_draft() {
   if (draft_impl_ != nullptr &&
       draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
     // Share lm_head and word_embedding between target and draft models
@@ -109,7 +204,29 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
     // Sync context_ from impl_ for WorkerImpl::prepare_work_before_execute
     context_ = impl_->context_;
   }
-  return result;
+}
+
+KVCacheShape MTPWorkerImpl::get_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape) const {
+  CHECK(draft_impl_ != nullptr);
+  const ModelArgs& target_args = context_.get_model_args();
+  const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
+  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
+  auto shared_shapes =
+      build_shared_kv_cache_shapes(target_args,
+                                   draft_args,
+                                   target_kv_cache_shape,
+                                   dtype_size,
+                                   context_.get_parallel_args().world_size(),
+                                   options_.block_size());
+  const KVCacheShape& draft_kv_cache_shape = shared_shapes.second;
+  LOG(INFO) << "MTP draft KV cache shape rebuilt:"
+            << " target_model_type=" << target_args.model_type()
+            << ", draft_model_type=" << draft_args.model_type()
+            << ", target_enable_mla=" << target_args.enable_mla()
+            << ", draft_enable_mla=" << draft_args.enable_mla();
+  draft_kv_cache_shape.print_shapes();
+  return draft_kv_cache_shape;
 }
 
 int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
@@ -117,9 +234,9 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
 }
 
 bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   // init_model() must run first so dtype_/embedding_size_ are initialized.
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
+  embedding_cache_ =
+      std::make_shared<EmbeddingCache>(kv_cache_shape.key_cache_shape()[0]);
   if (embedding_cache_) {
     int64_t size = get_embedding_placeholder_size();
     if (size > 0) {
@@ -130,10 +247,23 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
+  const ModelArgs& target_args = context_.get_model_args();
+  const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
+  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
+  auto shared_shapes =
+      build_shared_kv_cache_shapes(target_args,
+                                   draft_args,
+                                   kv_cache_shape,
+                                   dtype_size,
+                                   context_.get_parallel_args().world_size(),
+                                   options_.block_size());
+  const KVCacheShape& target_kv_cache_shape = shared_shapes.first;
+  const KVCacheShape& draft_kv_cache_shape = shared_shapes.second;
+
   bool target_allocated = true;
   const auto target_status = impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache(kv_cache_shape);
+    target_allocated = impl_->allocate_kv_cache(target_kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
   }
@@ -141,7 +271,7 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool draft_allocated = true;
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache(kv_cache_shape);
+    draft_allocated = draft_impl_->allocate_kv_cache(draft_kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -152,7 +282,6 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 #if defined(USE_NPU) || defined(USE_MLU)
 bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
 
@@ -177,11 +306,24 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
     kv_cache_transfer_->initialize(device_id);
   }
 
+  const ModelArgs& target_args = context_.get_model_args();
+  const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
+  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
+  auto shared_shapes =
+      build_shared_kv_cache_shapes(target_args,
+                                   draft_args,
+                                   kv_cache_shape,
+                                   dtype_size,
+                                   context_.get_parallel_args().world_size(),
+                                   options_.block_size());
+  const KVCacheShape& target_kv_cache_shape = shared_shapes.first;
+  const KVCacheShape& draft_kv_cache_shape = shared_shapes.second;
+
   bool target_allocated = true;
   const auto target_status = impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
     target_allocated = impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_, target_kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
   }
@@ -190,12 +332,13 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
     draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_, draft_kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
 
-  embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
+  embedding_cache_ = std::make_shared<EmbeddingCache>(
+      target_kv_cache_shape.key_cache_shape()[0]);
   if (embedding_cache_) {
     int64_t size = get_embedding_placeholder_size();
     if (size > 0) {
@@ -268,9 +411,19 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   // prepare input for draft model
   auto& embeddings = output.sample_output.embeddings;
   auto next_tokens = safe_to(output.sample_output.next_tokens, torch::kInt);
+  LOG(INFO) << "MTPWorkerImpl prefill target output debug:"
+            << " embeddings_defined=" << embeddings.defined()
+            << ", embeddings_shape="
+            << (embeddings.defined() ? embeddings.sizes() : c10::IntArrayRef())
+            << ", next_tokens_defined=" << next_tokens.defined()
+            << ", next_tokens_shape="
+            << (next_tokens.defined() ? next_tokens.sizes()
+                                      : c10::IntArrayRef());
 
   if (embeddings.defined()) {
     prefill_input.input_params.input_embedding = embeddings.clone();
+    LOG(INFO) << "MTPWorkerImpl prefill input_embedding cloned, shape="
+              << prefill_input.input_params.input_embedding.sizes();
   }
   if (next_tokens.defined()) {
     auto& token_ids = prefill_input.token_ids;
@@ -282,6 +435,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   timer.reset();
   auto draft_future = draft_impl_->step_async(prefill_input);
   ForwardOutput draft_output = std::move(draft_future).get().value();
+  LOG(INFO) << "MTPWorkerImpl prefill draft output embeddings_defined="
+            << draft_output.sample_output.embeddings.defined()
+            << ", embeddings_shape="
+            << (draft_output.sample_output.embeddings.defined()
+                    ? draft_output.sample_output.embeddings.sizes()
+                    : c10::IntArrayRef());
   process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());

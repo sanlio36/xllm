@@ -57,6 +57,7 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
+#include "util/json_reader.h"
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
@@ -118,14 +119,45 @@ class ScopedAtenLoadThreads {
   bool active_ = false;
 };
 
+std::vector<int32_t> load_eagle3_aux_hidden_state_layer_ids(
+    const std::optional<std::string>& draft_model_path) {
+  const std::string path = draft_model_path.value_or("");
+  if (path.empty()) {
+    return {};
+  }
+
+  JsonReader reader;
+  const std::string config_path = path + "/config.json";
+  if (!reader.parse(config_path)) {
+    LOG(WARNING) << "Failed to parse Eagle3 draft config: " << config_path;
+    return {};
+  }
+
+  if (auto layer_ids = reader.value<std::vector<int32_t>>(
+          "eagle_aux_hidden_state_layer_ids");
+      layer_ids.has_value()) {
+    LOG(INFO) << "Loaded Eagle3 aux hidden state layer ids from " << config_path
+              << " key=eagle_aux_hidden_state_layer_ids, count="
+              << layer_ids->size();
+    return layer_ids.value();
+  }
+  if (auto layer_ids = reader.value<std::vector<int32_t>>("layers_to_capture");
+      layer_ids.has_value()) {
+    LOG(INFO) << "Loaded Eagle3 aux hidden state layer ids from " << config_path
+              << " key=layers_to_capture, count=" << layer_ids->size();
+    return layer_ids.value();
+  }
+  LOG(INFO) << "No Eagle3 aux hidden state layer ids found in " << config_path;
+  return {};
+}
+
 }  // namespace
 
 WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
                        const torch::Device& device,
                        const runtime::Options& options)
     : options_(options), device_(device), parallel_args_(parallel_args) {
-  if (options_.enable_speculative_decode() &&
-      options_.num_decoding_tokens() == 1) {
+  if (options_.enable_speculative_decode() && options_.is_draft_engine()) {
     is_spec_draft_ = true;
   }
 
@@ -882,16 +914,23 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 
   auto model_loader = ModelLoader::create(model_weights_path);
   model_weights_path_ = std::move(model_weights_path);
-  auto tokenizer = model_loader->tokenizer();
-  CHECK(tokenizer != nullptr);
 
   auto args = model_loader->model_args();
   auto quant_args = model_loader->quant_args();
   torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
 
-  const int64_t tokenizer_vocab_size = tokenizer->vocab_size();
+  const bool use_parent_tokenizer =
+      options_.is_draft_engine() &&
+      options_.speculative_algorithm() == "Eagle3";
+  const std::string tokenizer_model_path =
+      use_parent_tokenizer ? options_.model_path() : model_weights_path;
+  auto tokenizer_loader = ModelLoader::create(tokenizer_model_path);
+  auto tokenizer = tokenizer_loader->tokenizer();
+  CHECK(tokenizer != nullptr);
+
+  int64_t tokenizer_vocab_size = tokenizer->vocab_size();
   int64_t model_vocab_size = args.vocab_size();
-  // use tokenizer vocab size if model vocab size is not set
+  // Eagle3 draft models share the target model tokenizer.
   if (model_vocab_size <= 0) {
     LOG(WARNING) << "Model vocab size is not set, using tokenizer vocab size: "
                  << tokenizer_vocab_size;
@@ -902,8 +941,49 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   }
 
 #if defined(USE_NPU)
-  if (options_.enable_speculative_decode() && FLAGS_enable_atb_spec_kernel) {
+  if (options_.enable_speculative_decode() &&
+      options_.speculative_algorithm() == "Eagle3" &&
+      !options_.is_draft_engine()) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
+    std::vector<int32_t> draft_layer_ids =
+        load_eagle3_aux_hidden_state_layer_ids(options_.draft_model_path());
+    if (!draft_layer_ids.empty()) {
+      LOG(INFO) << "Using Eagle3 aux hidden state layer ids from draft "
+                   "config, count: "
+                << draft_layer_ids.size();
+      args.layers_to_capture(std::move(draft_layer_ids));
+    }
+  } else if (options_.enable_speculative_decode() &&
+             FLAGS_enable_atb_spec_kernel) {
+    args.num_speculative_tokens(options_.num_speculative_tokens());
+  } else if (options_.is_draft_engine() &&
+             options_.speculative_algorithm() == "Eagle3") {
+    const std::string& current_type = args.model_type();
+    JsonReader parent_model_reader;
+    bool parent_is_kimi_k25 = false;
+    if (parent_model_reader.parse(options_.model_path() + "/config.json")) {
+      auto parent_model_type =
+          parent_model_reader.value<std::string>("model_type");
+      parent_is_kimi_k25 = parent_model_type.has_value() &&
+                           parent_model_type.value() == "kimi_k25";
+    }
+    if (current_type == "kimi_k25" || parent_is_kimi_k25) {
+      LOG(INFO) << "Overriding draft model_type from " << current_type
+                << " to kimi_k25_eagle3 for Eagle3 speculative decoding";
+      args.model_type("kimi_k25_eagle3");
+      args.n_layers(1);
+      args.layer_types(std::vector<std::string>(1, "full_attention"));
+      args.full_attention_interval(1);
+    } else if (current_type == "kimi_k2" || current_type == "deepseek_v2" ||
+               current_type == "deepseek_v3" ||
+               current_type == "deepseek_v32") {
+      LOG(INFO) << "Overriding draft model_type from " << current_type
+                << " to deepseek_eagle3 for Eagle3 speculative decoding";
+      args.model_type("deepseek_eagle3");
+      args.n_layers(1);
+      args.layer_types(std::vector<std::string>(1, "full_attention"));
+      args.full_attention_interval(1);
+    }
   } else if (options_.enable_speculative_decode() &&
              options_.num_speculative_tokens() == 0 &&
              args.num_nextn_predict_layers() != 0) {

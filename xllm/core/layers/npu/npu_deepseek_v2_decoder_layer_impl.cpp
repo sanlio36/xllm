@@ -33,6 +33,17 @@ bool is_kimi_text_model(const ModelArgs& args) {
   return args.model_type() == "kimi_k2" || args.model_type() == "kimi_k25";
 }
 
+void log_tensor_shape(const std::string& name, const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    LOG(INFO) << name << ": undefined";
+    return;
+  }
+  LOG(INFO) << name << ": shape=" << tensor.sizes()
+            << ", dtype=" << tensor.scalar_type()
+            << ", device=" << tensor.device()
+            << ", contiguous=" << tensor.is_contiguous();
+}
+
 }  // namespace
 
 enum DecoderLayerTensorId : int {
@@ -765,6 +776,25 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
   atb::Status st;
   ModelInputParams& input_params_new =
       const_cast<ModelInputParams&>(input_params);
+  const char* phase =
+      input_params_new.batch_forward_type.is_decode()
+          ? "decode"
+          : (input_params_new.batch_forward_type.is_chunked_prefill()
+                 ? "chunked_prefill"
+                 : "prefill");
+  LOG(INFO) << "DeepSeek_V2 decoder layer forward:"
+            << " layer_id=" << layer_id_ << ", phase=" << phase
+            << ", node_id=" << node_id << ", x_shape=" << x.sizes()
+            << ", cos_shape=" << cos_pos.sizes()
+            << ", sin_shape=" << sin_pos.sizes()
+            << ", input_expert_array_shape="
+            << (input_params_new.expert_array.defined()
+                    ? input_params_new.expert_array.sizes()
+                    : c10::IntArrayRef())
+            << ", dp_ep_expert_array_shape="
+            << (input_params_new.dp_ep_padding_data.expert_array().defined()
+                    ? input_params_new.dp_ep_padding_data.expert_array().sizes()
+                    : c10::IntArrayRef());
   // all micro batches are in same prefill/decode stage,
   if (input_params_new.batch_forward_type.is_chunked_prefill()) {
     build_node_variant_pack(prefill_node_prefixcache_,
@@ -839,13 +869,27 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
   // final_hidden_states_ = torch::zeros_like(x);
   int32_t input_idx = 0;
   auto& dp_ep_padding = input_params.dp_ep_padding_data;
+  LOG(INFO) << "DeepSeek_V2 build " << (is_prefill ? "prefill" : "decode")
+            << " variant pack:"
+            << " layer_id=" << layer_id_ << ", x_shape=" << x.sizes()
+            << ", cos_pos_shape=" << cos_pos.sizes()
+            << ", sin_pos_shape=" << sin_pos.sizes()
+            << ", attn_mask_defined=" << attn_mask.defined();
+  log_tensor_shape("  input_embedding", input_params.input_embedding);
+  log_tensor_shape("  expert_array", input_params.expert_array);
+  log_tensor_shape("  dp_ep_padding.expert_array",
+                   dp_ep_padding.expert_array());
+  log_tensor_shape("  kv_seq_lens", input_params.kv_seq_lens);
+  log_tensor_shape("  q_seq_lens", input_params.q_seq_lens);
+  log_tensor_shape("  block_tables", input_params.block_tables);
+  log_tensor_shape("  new_cache_slots", input_params.new_cache_slots);
   if (dp_size_ <= 1 && ep_size_ <= 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
   }
   // set micro batch 0 input part
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensor_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
-      atb_speed::Utils::AtTensor2Tensor(dp_ep_padding.expert_array());
+      atb_speed::Utils::AtTensor2Tensor(input_params.expert_array);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 2) =
       atb_speed::Utils::AtTensor2Tensor(expert_group_);
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 3) =

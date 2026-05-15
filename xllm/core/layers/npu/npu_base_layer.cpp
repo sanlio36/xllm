@@ -98,10 +98,19 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
   //     graph_captured_ = true;
   //   }
   // }
+  const std::string op_name = name_ + std::to_string(node_id);
+  LOG(INFO) << "NPU ATB setup begin:"
+            << " layer_name=" << name_ << ", node_id=" << node_id
+            << ", op_name=" << op_name
+            << ", input_count=" << node.variantPack.inTensors.size()
+            << ", output_count=" << node.variantPack.outTensors.size();
   atb::Status st =
       node.operation->Setup(node.variantPack, node.workspaceSize, context_);
   if (st != 0) {
-    LOG(ERROR) << " setup layer node fail, not call execute";
+    LOG(ERROR) << "NPU ATB setup fail:"
+               << " layer_name=" << name_ << ", node_id=" << node_id
+               << ", op_name=" << op_name << ", error_code=" << st
+               << ", not call execute";
     return st;
   }
 
@@ -109,9 +118,12 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
     node.workspace = work_space_->get_workspace_buffer(node.workspaceSize);
   }
 
-  run_task_func_(name_ + std::to_string(node_id), [=, this]() {
-    return execute_plan(
-        node, name_ + std::to_string(node_id), event, event_flag);
+  LOG(INFO) << "NPU ATB execute begin:"
+            << " layer_name=" << name_ << ", node_id=" << node_id
+            << ", op_name=" << op_name
+            << ", workspace_size=" << node.workspaceSize;
+  run_task_func_(op_name, [=, this]() {
+    return execute_plan(node, op_name, event, event_flag);
   });
 
   return st;

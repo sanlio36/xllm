@@ -744,8 +744,11 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
   std::string model_type;
   if (auto data = reader.value<std::string>("model_type")) {
     model_type = data.value();
+  } else if (auto data = util::get_model_type_from_architectures(reader)) {
+    model_type = data.value();
   } else {
-    LOG(ERROR) << "Failed to find model_type in " << args_file_path;
+    LOG(ERROR) << "Failed to find model_type or known architectures in "
+               << args_file_path;
     return false;
   }
 

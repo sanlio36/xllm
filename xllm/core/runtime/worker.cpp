@@ -50,7 +50,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
     auto algo = options.speculative_algorithm();
     LOG(INFO) << "Speculative decode is enabled, algorithm: " << algo;
     if (algo == "Eagle3") {
-      impl_ = new Eagle3WorkerImpl(parallel_args, device, options);
+      impl_ = new Eagle3WorkerImpl(parallel_args, device, options, worker_type);
     } else if (algo == "Suffix") {
       impl_ = new SuffixWorkerImpl(parallel_args, device, options);
     } else {

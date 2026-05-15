@@ -21,6 +21,7 @@ limitations under the License.
 #include "util/slice.h"
 #include "util/timer.h"
 #include "util/utils.h"
+#include "vlm_worker_impl.h"
 
 namespace xllm {
 
@@ -38,10 +39,16 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
     const ParallelArgs& parallel_args,
     const torch::Device& device,
     const runtime::Options& options,
-    const runtime::Options& target_options)
+    const runtime::Options& target_options,
+    WorkerType target_worker_type)
     : WorkerImpl(parallel_args, device, options) {
-  impl_ =
-      std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+  if (target_worker_type == WorkerType::VLM) {
+    impl_ =
+        std::make_unique<VLMWorkerImpl>(parallel_args, device, target_options);
+  } else {
+    impl_ =
+        std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+  }
 }
 
 bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,

@@ -34,6 +34,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
 #include "processors/kimi25_image_processor.h"
+#include "runtime/options.h"
 #include "xllm_atb_layers/core/include/atb_speed/log.h"
 
 namespace xllm {
@@ -1215,6 +1216,16 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return language_model_->logits(hidden_states, seleted_idxes);
   }
 
+  void adjust_runtime_options(runtime::Options* options) const {
+    if (options == nullptr || options->speculative_algorithm() != "Eagle3" ||
+        !options->enable_speculative_decode() || options->is_draft_engine()) {
+      return;
+    }
+    options->num_decoding_tokens(options->num_speculative_tokens() + 1);
+    LOG(INFO) << "KimiK25 Eagle3 target num_decoding_tokens="
+              << options->num_decoding_tokens();
+  }
+
   void load_model(std::unique_ptr<ModelLoader> loader) {
     LOG(INFO) << "loading vit / projector weight...";
     for (const auto& state_dict : loader->get_state_dicts()) {
@@ -1352,6 +1363,23 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
       rope_scaling_attn_factor, "text_config.rope_scaling.attn_factor", 1.0f);
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
+  LOAD_ARG_OR_FUNC(layers_to_capture, "text_config.layers_to_capture", [&] {
+    if (auto layer_ids = json.value<std::vector<int32_t>>(
+            "text_config.eagle_aux_hidden_state_layer_ids");
+        layer_ids.has_value()) {
+      return layer_ids.value();
+    }
+    if (auto layer_ids = json.value<std::vector<int32_t>>(
+            "eagle_aux_hidden_state_layer_ids");
+        layer_ids.has_value()) {
+      return layer_ids.value();
+    }
+    if (auto layer_ids = json.value<std::vector<int32_t>>("layers_to_capture");
+        layer_ids.has_value()) {
+      return layer_ids.value();
+    }
+    return std::vector<int32_t>{};
+  });
 
   LOAD_ARG_OR(bos_token_id, "text_config.bos_token_id", 163584);
   LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163585);

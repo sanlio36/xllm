@@ -196,6 +196,34 @@ class WorkerImpl {
     return context_.get_optimization_config();
   }
 
+#if defined(USE_NPU)
+  layer::NpuLmHead get_npu_lm_head() { return model_->get_npu_lm_head(); }
+
+  void set_npu_lm_head(layer::NpuLmHead& head) {
+    model_->set_npu_lm_head(head);
+  }
+
+  layer::NpuWordEmbedding get_npu_word_embedding() {
+    return model_->get_npu_word_embedding();
+  }
+
+  void set_npu_word_embedding(layer::NpuWordEmbedding& embedding) {
+    model_->set_npu_word_embedding(embedding);
+  }
+#endif
+
+  layer::LmHead get_lm_head() { return model_->get_lm_head(); }
+
+  void set_lm_head(layer::LmHead& head) { model_->set_lm_head(head); }
+
+  layer::WordEmbedding get_word_embedding() {
+    return model_->get_word_embedding();
+  }
+
+  void set_word_embedding(layer::WordEmbedding& embedding) {
+    model_->set_word_embedding(embedding);
+  }
+
  protected:
   void update_last_step_output(const std::optional<ForwardOutput>& output);
   // Only used for deepseek chunked prefill ops on npu device

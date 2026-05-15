@@ -205,6 +205,7 @@ Master::Master(const Options& options, EngineType type)
   if (type == EngineType::VLM) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
+        .draft_model_path(options_.draft_model_path())
         .devices(devices)
         .backend(options.backend())
         .block_size(options.block_size())
@@ -223,6 +224,11 @@ Master::Master(const Options& options, EngineType type)
         .output_shm_size(options_.output_shm_size() * 1024 * 1024)
         .is_local(options_.is_local())
         .enable_schedule_overlap(options_.enable_schedule_overlap())
+        .enable_speculative_decode(options_.speculative_algorithm() ==
+                                       "Eagle3" &&
+                                   options_.num_speculative_tokens() > 0)
+        .num_speculative_tokens(options_.num_speculative_tokens())
+        .speculative_algorithm(options_.speculative_algorithm())
         .master_node_addr(options.master_node_addr())
         .nnodes(options.nnodes())
         .node_rank(options.node_rank())
