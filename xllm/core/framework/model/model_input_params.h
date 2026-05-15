@@ -694,6 +694,7 @@ struct BlockTransferInfo {
 struct BatchInputMeta {
   BatchForwardType batch_forward_type;
   int32_t num_sequences = 0;
+  int32_t actual_num_sequences = 0;
   int32_t kv_max_seq_len = 0;
   int32_t q_max_seq_len = 0;
   uint64_t batch_id = 0;

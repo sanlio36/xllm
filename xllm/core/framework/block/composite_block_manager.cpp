@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ limitations under the License.
 #include <algorithm>
 
 #include "block_manager_impl.h"
-#include "framework/block/block_utils.h"
 #include "framework/kv_cache/kv_cache_event.h"
 #include "sliding_window_block_manager.h"
 
@@ -28,6 +27,17 @@ namespace {
 
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
+
+uint32_t compute_sliding_window_blocks_per_sequence(
+    uint32_t sliding_window_size,
+    uint32_t block_size) {
+  CHECK_GT(sliding_window_size, 0u) << "sliding_window_size must be positive";
+  CHECK_GT(block_size, 0u) << "block_size must be positive";
+  // Align with vLLM/vllm-ascend sliding-window semantics: keep enough
+  // contiguous KV blocks to cover `sliding_window - 1` history tokens plus
+  // the current block being written.
+  return (sliding_window_size - 1) / block_size + 1;
+}
 
 }  // namespace
 
@@ -53,17 +63,20 @@ CompositeBlockManager::CompositeBlockManager(
                       compress_ratio);
       sub_managers_.push_back(std::make_unique<BlockManagerImpl>(opts));
     } else if (type == kManagerTypeSlidingWindowBlockManager) {
-      const uint32_t swa_blocks_per_seq =
-          static_cast<uint32_t>(get_swa_blocks_per_seq(
-              options_.sliding_window_size(), options_.block_size()));
+      const uint32_t sliding_window_blocks_per_sequence =
+          compute_sliding_window_blocks_per_sequence(
+              options_.window_size(),
+              static_cast<uint32_t>(options_.block_size()));
       const uint32_t max_seqs = std::max(options_.max_seqs_per_batch(), 1u);
-      const uint32_t swa_total_blocks = swa_blocks_per_seq * max_seqs + 2;
-      opts.num_blocks(swa_total_blocks).swa_blocks_per_seq(swa_blocks_per_seq);
+      const uint32_t swa_total_blocks =
+          sliding_window_blocks_per_sequence * max_seqs + 2;
+      opts.num_blocks(swa_total_blocks)
+          .window_size(sliding_window_blocks_per_sequence);
       LOG(INFO)
           << "CompositeBlockManager uses sliding-window "
-             "allocation: swa_blocks_per_seq="
-          << swa_blocks_per_seq
-          << ", sliding_window_size=" << options_.sliding_window_size()
+             "allocation: blocks_per_sequence="
+          << sliding_window_blocks_per_sequence
+          << ", sliding_window_size=" << options_.window_size()
           << ", block_size=" << options_.block_size()
           << ", total_blocks=" << swa_total_blocks << ", max_seqs=" << max_seqs
           << ". This keeps SW block ids within the physical SW cache rows.";
@@ -85,15 +98,16 @@ bool CompositeBlockManager::allocate_for_sequence(Sequence* seq,
   composite->resize(sub_managers_.size());
 
   if (composite->at(0).empty()) {
-    const size_t swa_blocks_per_seq =
-        sub_managers_[0]->options().swa_blocks_per_seq();
+    // slice window manager allocate blocks.
+    const size_t swa_blocks_per_sequence =
+        sub_managers_[0]->options().window_size();
     composite->at(0) =
-        std::move(sub_managers_[0]->allocate(swa_blocks_per_seq));
-    if (composite->at(0).size() != swa_blocks_per_seq) {
+        std::move(sub_managers_[0]->allocate(swa_blocks_per_sequence));
+    if (composite->at(0).size() != swa_blocks_per_sequence) {
       return false;
     }
     seq->kv_state().set_slice_window_size(sub_managers_[0]->block_size() *
-                                          swa_blocks_per_seq);
+                                          swa_blocks_per_sequence);
   } else {
     seq->kv_state().update_slice_window_pos();
   }
@@ -131,19 +145,59 @@ void CompositeBlockManager::deallocate_sequence(Sequence* seq) {
   }
 }
 
-void CompositeBlockManager::deallocate(const Slice<Block>& /*blocks*/) {
-  NOT_IMPLEMENTED();
+void CompositeBlockManager::deallocate(const Slice<Block>& blocks) {
+  if (blocks.empty()) {
+    return;
+  }
+
+  size_t run_start = 0;
+  BlockManager* run_manager = nullptr;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    const auto& block = blocks[i];
+    if (!block.is_valid()) {
+      if (run_manager != nullptr) {
+        run_manager->deallocate(blocks.slice(run_start, i));
+        run_manager = nullptr;
+      }
+      run_start = i + 1;
+      continue;
+    }
+    BlockManager* manager = block.manager();
+    CHECK(manager != nullptr)
+        << "CompositeBlockManager got a valid block without owner manager";
+    const auto it =
+        std::find_if(sub_managers_.begin(),
+                     sub_managers_.end(),
+                     [manager](const std::unique_ptr<BlockManager>& sub_mgr) {
+                       return sub_mgr.get() == manager;
+                     });
+    CHECK(it != sub_managers_.end())
+        << "CompositeBlockManager cannot deallocate block " << block.id()
+        << " from a manager outside this composite manager";
+
+    if (run_manager == nullptr) {
+      run_manager = manager;
+      run_start = i;
+    } else if (run_manager != manager) {
+      run_manager->deallocate(blocks.slice(run_start, i));
+      run_manager = manager;
+      run_start = i;
+    }
+  }
+  if (run_manager != nullptr) {
+    run_manager->deallocate(blocks.slice(run_start, blocks.size()));
+  }
 }
 
-std::vector<Block> CompositeBlockManager::allocate(size_t /*num_blocks*/) {
-  NOT_IMPLEMENTED();
+std::vector<Block> CompositeBlockManager::allocate(size_t num_blocks) {
+  LOG(FATAL) << "CompositeBlockManager::allocate is not implemented";
   return {};
 }
 
 std::vector<Block> CompositeBlockManager::allocate_shared(
-    const Slice<int32_t>& /*tokens_ids*/,
-    const Slice<Block>& /*existed_shared_blocks*/) {
-  NOT_IMPLEMENTED();
+    const Slice<int32_t>& tokens_ids,
+    const Slice<Block>& existed_shared_blocks) {
+  LOG(FATAL) << "CompositeBlockManager::allocate_shared is not implemented";
   return {};
 }
 
