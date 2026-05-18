@@ -140,6 +140,7 @@ class FusedMoEImpl : public torch::nn::Module {
                                        const char* name);
   void preprocess_w4a8_dynamic_weights();
   void clear_w4a8_dynamic_source_weight_cache();
+  bool should_gather_dp_inputs_for_moe() const;
   bool can_use_ep2_dispatch_combine(const ModelInputParams& input_params,
                                     const torch::Tensor& hidden_states) const;
   torch::Tensor forward_with_selected_experts_ep2(
