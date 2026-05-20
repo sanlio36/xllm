@@ -344,6 +344,10 @@ DECLARE_bool(enable_customize_mla_kernel);
 DECLARE_string(npu_kernel_backend);
 
 DECLARE_bool(enable_intralayer_addnorm);
+
+DECLARE_int32(enable_fused_mc2);
+
+DECLARE_bool(enable_fused_moe_gmm_swiglu);
 #endif
 
 // --- chat template config ---
