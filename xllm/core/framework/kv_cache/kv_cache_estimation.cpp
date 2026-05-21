@@ -48,7 +48,8 @@ int64_t kv_slot_size(const ModelArgs& model_args,
                      int64_t cache_dtype_size) {
   if (model_args.enable_mla()) {
 #if defined(USE_NPU)
-    if (model_args.model_type() == "deepseek_v3" &&
+    if ((model_args.model_type() == "deepseek_v3" ||
+         model_args.model_type() == "deepseek_v3_mtp") &&
         options.enable_prefix_cache) {
       return cache_dtype_size *
              ((model_args.kv_lora_rank() + kNzAlignment - 1) / kNzAlignment +

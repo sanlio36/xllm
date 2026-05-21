@@ -1081,6 +1081,14 @@ struct TensorMeta final {
   uint64_t data_bytes = 0;
 };
 
+inline torch::Tensor make_empty_cpu_tensor(
+    const std::vector<int64_t>& shape,
+    torch::ScalarType dtype) {
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+  return torch::empty(shape, options);
+}
+
 struct DeviceBufferSession final {
   torch::Tensor owner_buffer;
   const char* device_cursor = nullptr;
@@ -1226,17 +1234,24 @@ inline void read_tensor(const char*& buffer, torch::Tensor& tensor) {
   // read dtype
   int8_t tensor_dtype;
   read_data(buffer, tensor_dtype);
-  auto dtype = static_cast<torch::ScalarType>(tensor_dtype);
+  const torch::ScalarType dtype =
+      static_cast<torch::ScalarType>(tensor_dtype);
   // read data_bytes
   uint64_t data_bytes;
   read_data(buffer, data_bytes);
 
-  tensor = torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
-                            shape,
-                            torch::TensorOptions()
-                                .dtype(dtype)
-                                .device(torch::kCPU)
-                                .pinned_memory(true));
+  const torch::TensorOptions options = torch::TensorOptions()
+                                           .dtype(dtype)
+                                           .device(torch::kCPU)
+                                           .pinned_memory(true);
+  if (data_bytes == 0) {
+    tensor = make_empty_cpu_tensor(shape, dtype);
+  } else {
+    tensor =
+        torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
+                         shape,
+                         options);
+  }
   buffer += data_bytes;
 }
 
@@ -1275,16 +1290,25 @@ inline torch::Tensor materialize_tensor_from_current_cursor(
   }
   const char* device_buffer = session.device_cursor;
 #if defined(USE_NPU)
+  if (meta.data_bytes == 0) {
+    return torch::empty(
+        meta.shape,
+        torch::TensorOptions().dtype(meta.dtype).device(torch::kPrivateUse1));
+  }
   return get_tensor_from_blob(meta.shape, meta.dtype, device_buffer);
 #elif defined(USE_CUDA)
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(meta.dtype).device(torch::kCUDA);
+  if (meta.data_bytes == 0) {
+    return torch::empty(meta.shape, options);
+  }
   if (session.owner_buffer.defined() &&
       is_aligned_for_cuda_zero_copy(device_buffer)) {
     return get_tensor_from_blob(
         meta.shape, meta.dtype, device_buffer, session.owner_buffer);
   }
 
-  auto options = torch::TensorOptions().dtype(meta.dtype).device(torch::kCUDA);
-  auto tensor = torch::empty(meta.shape, options);
+  torch::Tensor tensor = torch::empty(meta.shape, options);
   cudaError_t err;
   if (stream != nullptr) {
     err = cudaMemcpyAsync(tensor.data_ptr(),
@@ -1302,6 +1326,11 @@ inline torch::Tensor materialize_tensor_from_current_cursor(
       << "CUDA device buffer copy failed: " << cudaGetErrorString(err);
   return tensor;
 #elif defined(USE_MLU)
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(meta.dtype).device(torch::kPrivateUse1);
+  if (meta.data_bytes == 0) {
+    return torch::empty(meta.shape, options);
+  }
   if (session.owner_buffer.defined()) {
     return get_tensor_from_blob(
         meta.shape, meta.dtype, device_buffer, session.owner_buffer);
@@ -1325,13 +1354,18 @@ inline void read_tensor(ReadContext& context,
     tensor = materialize_tensor_from_current_cursor(
         meta, *context.device_session, stream);
   } else {
-    tensor = torch::from_blob(
-        const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
-        meta.shape,
-        torch::TensorOptions()
-            .dtype(meta.dtype)
-            .device(torch::kCPU)
-            .pinned_memory(true));
+    const torch::TensorOptions options = torch::TensorOptions()
+                                             .dtype(meta.dtype)
+                                             .device(torch::kCPU)
+                                             .pinned_memory(true);
+    if (meta.data_bytes == 0) {
+      tensor = make_empty_cpu_tensor(meta.shape, meta.dtype);
+    } else {
+      tensor = torch::from_blob(
+          const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
+          meta.shape,
+          options);
+    }
   }
   advance_tensor_cursors(context,
                          get_aligned_tensor_arena_bytes(meta.data_bytes));
@@ -1346,13 +1380,18 @@ inline void read_tensor_and_host(ReadContext& context,
     return;
   }
 
-  host_tensor = torch::from_blob(
-      const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
-      meta.shape,
-      torch::TensorOptions()
-          .dtype(meta.dtype)
-          .device(torch::kCPU)
-          .pinned_memory(true));
+  const torch::TensorOptions options = torch::TensorOptions()
+                                           .dtype(meta.dtype)
+                                           .device(torch::kCPU)
+                                           .pinned_memory(true);
+  if (meta.data_bytes == 0) {
+    host_tensor = make_empty_cpu_tensor(meta.shape, meta.dtype);
+  } else {
+    host_tensor = torch::from_blob(
+        const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
+        meta.shape,
+        options);
+  }
   if (has_device_buffer(context)) {
     tensor = materialize_tensor_from_current_cursor(
         meta, *context.device_session, stream);
@@ -1394,13 +1433,18 @@ inline void read_tensor(const char*& buffer,
         materialize_tensor_from_current_cursor(meta, device_session, stream);
     safe_advance_buffer(device_buffer, meta.data_bytes);
   } else {
-    tensor =
-        torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
-                         meta.shape,
-                         torch::TensorOptions()
-                             .dtype(meta.dtype)
-                             .device(torch::kCPU)
-                             .pinned_memory(true));
+    const torch::TensorOptions options = torch::TensorOptions()
+                                             .dtype(meta.dtype)
+                                             .device(torch::kCPU)
+                                             .pinned_memory(true);
+    if (meta.data_bytes == 0) {
+      tensor = make_empty_cpu_tensor(meta.shape, meta.dtype);
+    } else {
+      tensor =
+          torch::from_blob(const_cast<void*>(static_cast<const void*>(buffer)),
+                           meta.shape,
+                           options);
+    }
   }
   buffer += meta.data_bytes;
 }
@@ -1459,13 +1503,18 @@ inline void read_tensor_and_vector(ReadContext& context,
     tensor = materialize_tensor_from_current_cursor(
         meta, *context.device_session, stream);
   } else {
-    tensor = torch::from_blob(
-        const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
-        meta.shape,
-        torch::TensorOptions()
-            .dtype(meta.dtype)
-            .device(torch::kCPU)
-            .pinned_memory(true));
+    const torch::TensorOptions options = torch::TensorOptions()
+                                             .dtype(meta.dtype)
+                                             .device(torch::kCPU)
+                                             .pinned_memory(true);
+    if (meta.data_bytes == 0) {
+      tensor = make_empty_cpu_tensor(meta.shape, meta.dtype);
+    } else {
+      tensor = torch::from_blob(
+          const_cast<void*>(static_cast<const void*>(context.tensor_cursor)),
+          meta.shape,
+          options);
+    }
   }
   if (meta.data_bytes > 0) {
     std::memcpy(vec.data(), context.tensor_cursor, meta.data_bytes);
@@ -2028,7 +2077,11 @@ inline void initialize_device_buffer_session(ReadContext& context,
     return;
   }
 
-#if defined(USE_CUDA)
+#if defined(USE_NPU)
+  if (device.type() != torch::kPrivateUse1) {
+    return;
+  }
+#elif defined(USE_CUDA)
   if (device.type() != torch::kCUDA) {
     return;
   }
@@ -2254,7 +2307,10 @@ inline void deserialize_forward_input_payload(
                 manager_table,
                 /*stream=*/nullptr,
                 /*force_host_materialize=*/true);
-    input_params.multi_block_tables.emplace_back(std::move(manager_table));
+    // Clone to decouple from shared memory buffer. With schedule_overlap the
+    // buffer may be overwritten by the next step while the worker is still
+    // reading multi_block_tables (which stay on CPU for DSA metadata).
+    input_params.multi_block_tables.emplace_back(manager_table.clone());
   }
 
   read_dit_forward_input(context, input_params.dit_forward_input);
@@ -2923,7 +2979,7 @@ void ForwardSharedMemoryManager::input_read(ForwardInput& input,
   read_data(data_ptr, total_size);
   bool materialize_device_buffer = false;
 #if defined(USE_NPU)
-  materialize_device_buffer = true;
+  materialize_device_buffer = device.type() == torch::kPrivateUse1;
 #elif defined(USE_CUDA)
   materialize_device_buffer = device.type() == torch::kCUDA;
 #elif defined(USE_MLU)
