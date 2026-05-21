@@ -42,10 +42,14 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
                                            uint32_t block_size,
                                            uint32_t window_size,
                                            uint32_t max_seqs_per_batch) {
+  const uint32_t swa_blocks_per_seq =
+      static_cast<uint32_t>(get_swa_blocks_per_seq(window_size, block_size));
   BlockManager::Options opts;
   opts.num_blocks(base_num_blocks)
       .block_size(block_size)
       .sliding_window_size(window_size)
+      .swa_blocks_per_seq(swa_blocks_per_seq)
+      .max_tokens_per_batch(1280)
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({kManagerTypeSlidingWindowBlockManager,
                       kManagerTypeBlockManagerImpl,

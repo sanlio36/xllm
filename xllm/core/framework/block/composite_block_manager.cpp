@@ -53,17 +53,23 @@ CompositeBlockManager::CompositeBlockManager(
                       compress_ratio);
       sub_managers_.push_back(std::make_unique<BlockManagerImpl>(opts));
     } else if (type == kManagerTypeSlidingWindowBlockManager) {
-      const uint32_t swa_blocks_per_seq =
-          static_cast<uint32_t>(get_swa_blocks_per_seq(
-              options_.sliding_window_size(), options_.block_size()));
+      const uint32_t swa_blocks_per_seq = options_.swa_blocks_per_seq();
+      CHECK_GT(swa_blocks_per_seq, 0u)
+          << "swa_blocks_per_seq must be positive";
+      CHECK_GT(options_.block_size(), 0) << "block_size must be positive";
+      const uint32_t burst_blocks =
+          (std::max(options_.max_tokens_per_batch(), 1u) +
+           static_cast<uint32_t>(options_.block_size()) - 1) /
+          static_cast<uint32_t>(options_.block_size());
       const uint32_t max_seqs = std::max(options_.max_seqs_per_batch(), 1u);
-      const uint32_t swa_total_blocks = swa_blocks_per_seq * max_seqs + 2;
+      const uint32_t swa_total_blocks =
+          swa_blocks_per_seq * max_seqs + burst_blocks + max_seqs + 2;
       opts.num_blocks(swa_total_blocks).swa_blocks_per_seq(swa_blocks_per_seq);
       LOG(INFO)
           << "CompositeBlockManager uses sliding-window "
              "allocation: swa_blocks_per_seq="
           << swa_blocks_per_seq
-          << ", sliding_window_size=" << options_.sliding_window_size()
+          << ", burst_blocks=" << burst_blocks
           << ", block_size=" << options_.block_size()
           << ", total_blocks=" << swa_total_blocks << ", max_seqs=" << max_seqs
           << ". This keeps SW block ids within the physical SW cache rows.";
@@ -85,15 +91,15 @@ bool CompositeBlockManager::allocate_for_sequence(Sequence* seq,
   composite->resize(sub_managers_.size());
 
   if (composite->at(0).empty()) {
-    const size_t swa_blocks_per_seq =
+    // slice window manager allocate blocks.
+    const size_t swa_blocks_per_sequence =
         sub_managers_[0]->options().swa_blocks_per_seq();
     composite->at(0) =
-        std::move(sub_managers_[0]->allocate(swa_blocks_per_seq));
-    if (composite->at(0).size() != swa_blocks_per_seq) {
+        std::move(sub_managers_[0]->allocate(swa_blocks_per_sequence));
+    if (composite->at(0).size() != swa_blocks_per_sequence) {
       return false;
     }
-    seq->kv_state().set_slice_window_size(sub_managers_[0]->block_size() *
-                                          swa_blocks_per_seq);
+    seq->kv_state().set_slice_window_size(options_.sliding_window_size());
   } else {
     seq->kv_state().update_slice_window_pos();
   }
