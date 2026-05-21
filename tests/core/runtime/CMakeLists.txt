@@ -42,6 +42,7 @@ cc_test(
   DEPS
     torch
     glog::glog
+    spdlog::spdlog
     proto::xllm_proto
     GTest::gtest_main
 )
