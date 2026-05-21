@@ -24,11 +24,9 @@ limitations under the License.
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,27 +68,6 @@ inline torch::Tensor deepseek_v4_create_hadamard_matrix(
     matrix = torch::cat({top, bottom}, 0);
   }
   return matrix;
-}
-
-inline std::string deepseek_v4_format_bytes(int64_t bytes) {
-  static constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-  double value = static_cast<double>(bytes);
-  int unit_idx = 0;
-  while (value >= 1024.0 && unit_idx < 4) {
-    value /= 1024.0;
-    ++unit_idx;
-  }
-
-  std::ostringstream os;
-  if (value < 10.0 && unit_idx > 0) {
-    os << std::fixed << std::setprecision(2);
-  } else if (value < 100.0 && unit_idx > 0) {
-    os << std::fixed << std::setprecision(1);
-  } else {
-    os << std::fixed << std::setprecision(0);
-  }
-  os << value << " " << kUnits[unit_idx];
-  return os.str();
 }
 
 inline torch::Tensor maybe_to_device(const torch::Tensor& tensor,
@@ -661,8 +638,6 @@ class DeepseekV4ModelImpl
         << "DeepSeek V4 ACL graph requires DSA metadata";
   }
 
-  void log_weight_mem_stats() const { log_layer_weight_mem_stats(); }
-
   ModelOutput forward(torch::Tensor tokens,
                       torch::Tensor positions,
                       std::vector<KVCache>& kv_caches,
@@ -1028,8 +1003,8 @@ class DeepseekV4ModelImpl
       metadata_batch_size = 1;
     }
 
-    auto trim_lens_vec =
-        [metadata_batch_size, actual_batch_size](std::vector<int32_t>& lens) {
+    auto trim_lens_vec = [metadata_batch_size,
+                          actual_batch_size](std::vector<int32_t>& lens) {
       if (lens.empty()) {
         lens.assign(static_cast<size_t>(metadata_batch_size), 0);
       } else if (static_cast<int64_t>(lens.size()) < metadata_batch_size) {
@@ -1099,16 +1074,14 @@ class DeepseekV4ModelImpl
     params.meta.num_sequences = 1;
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, 1);
-    params.meta.q_max_seq_len =
-        std::max<int32_t>(params.meta.q_max_seq_len, 1);
+    params.meta.q_max_seq_len = std::max<int32_t>(params.meta.q_max_seq_len, 1);
     params.attention.host.kv_seq_lens = {1};
     params.attention.host.q_seq_lens = {1};
     params.attention.device.kv_seq_lens =
         torch::tensor(params.attention.host.kv_seq_lens, cpu_int_options);
     params.attention.device.q_seq_lens =
         torch::tensor(params.attention.host.q_seq_lens, cpu_int_options);
-    params.attention.device.q_cu_seq_lens =
-        torch::tensor({1}, cpu_int_options);
+    params.attention.device.q_cu_seq_lens = torch::tensor({1}, cpu_int_options);
     params.attention.device.kv_cache_tokens_nums =
         torch::tensor({1}, cpu_int_options);
     params.attention.host.kv_cache_tokens_nums = {1};
@@ -1142,8 +1115,7 @@ class DeepseekV4ModelImpl
     params.meta.num_sequences = static_cast<int32_t>(metadata_batch_size);
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, 1);
-    params.meta.q_max_seq_len =
-        std::max<int32_t>(params.meta.q_max_seq_len, 1);
+    params.meta.q_max_seq_len = std::max<int32_t>(params.meta.q_max_seq_len, 1);
 
     auto pad_lens_vec = [metadata_batch_size](std::vector<int32_t>& lens) {
       lens.resize(static_cast<size_t>(metadata_batch_size), 1);
@@ -1357,9 +1329,9 @@ class DeepseekV4ModelImpl
 
     const int64_t batch_size =
         std::max<int64_t>(dsa.actual_seq_lengths_kv.size(0), 1);
-    const int64_t max_seqlen_q = std::max<int64_t>(
-        params.meta.q_max_seq_len,
-        vector_max_or_zero(params.attention.host.q_seq_lens));
+    const int64_t max_seqlen_q =
+        std::max<int64_t>(params.meta.q_max_seq_len,
+                          vector_max_or_zero(params.attention.host.q_seq_lens));
     const int64_t max_seqlen_kv = std::max<int64_t>(
         params.meta.kv_max_seq_len,
         vector_max_or_zero(params.attention.host.kv_seq_lens));
@@ -1484,9 +1456,9 @@ class DeepseekV4ModelImpl
     const int64_t qli_batch_size = std::max<int64_t>(key_lens.size(0), 1);
     const int64_t index_head_dim =
         std::max<int64_t>(index_head_dim_ > 0 ? index_head_dim_ : head_dim_, 1);
-    const int64_t qli_max_seqlen_q = std::max<int64_t>(
-        params.meta.q_max_seq_len,
-        vector_max_or_zero(params.attention.host.q_seq_lens));
+    const int64_t qli_max_seqlen_q =
+        std::max<int64_t>(params.meta.q_max_seq_len,
+                          vector_max_or_zero(params.attention.host.q_seq_lens));
     const int64_t qli_max_seqlen_k = std::max<int64_t>(
         params.meta.kv_max_seq_len,
         vector_max_or_zero(params.attention.host.kv_seq_lens));
@@ -1512,47 +1484,6 @@ class DeepseekV4ModelImpl
     qli_params.device = query_lens.device().str();
     dsa.qli_metadata =
         xllm::kernel::quant_lightning_indexer_metadata(qli_params);
-  }
-
-  void log_layer_weight_mem_stats() const {
-    int64_t total_bytes = 0;
-    int64_t attn_bytes = 0;
-    int64_t expert_bytes = 0;
-    int64_t hc_bytes = 0;
-    int64_t other_bytes = 0;
-
-    for (size_t i = 0; i < layers_.size(); ++i) {
-      const auto stats = layers_[i]->get_weight_mem_stats();
-      total_bytes += stats.total_bytes;
-      attn_bytes += stats.attn_bytes;
-      expert_bytes += stats.expert_bytes;
-      hc_bytes += stats.hc_bytes;
-      other_bytes += stats.other_bytes;
-
-      LOG(INFO) << "[WEIGHT_MEM][DeepseekV4] layer=" << i
-                << " total=" << deepseek_v4_format_bytes(stats.total_bytes)
-                << " (" << stats.total_bytes << " B)"
-                << ", attn=" << deepseek_v4_format_bytes(stats.attn_bytes)
-                << " (" << stats.attn_bytes << " B)"
-                << ", expert=" << deepseek_v4_format_bytes(stats.expert_bytes)
-                << " (" << stats.expert_bytes << " B)"
-                << ", hc_=" << deepseek_v4_format_bytes(stats.hc_bytes) << " ("
-                << stats.hc_bytes << " B)"
-                << ", other=" << deepseek_v4_format_bytes(stats.other_bytes)
-                << " (" << stats.other_bytes << " B)";
-    }
-
-    LOG(INFO) << "[WEIGHT_MEM][DeepseekV4][Summary] layers=" << layers_.size()
-              << ", total=" << deepseek_v4_format_bytes(total_bytes) << " ("
-              << total_bytes << " B)"
-              << ", attn=" << deepseek_v4_format_bytes(attn_bytes) << " ("
-              << attn_bytes << " B)"
-              << ", expert=" << deepseek_v4_format_bytes(expert_bytes) << " ("
-              << expert_bytes << " B)"
-              << ", hc_=" << deepseek_v4_format_bytes(hc_bytes) << " ("
-              << hc_bytes << " B)"
-              << ", other=" << deepseek_v4_format_bytes(other_bytes) << " ("
-              << other_bytes << " B)";
   }
 
   torch::Tensor hc_head(const torch::Tensor& x) {
@@ -1607,7 +1538,6 @@ class DeepseekV4ForCausalLMImpl
                   std::string prefix = "model.") override {
     LlmForCausalLMImplBase<DeepseekV4Model>::load_model(std::move(loader),
                                                         std::move(prefix));
-    this->model_->log_weight_mem_stats();
   }
 
   bool requires_graph_forward_metadata() {
