@@ -36,8 +36,8 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
-#include "util/utils.h"
 #include "platform/device.h"
+#include "util/utils.h"
 
 namespace xllm {
 namespace layer {
