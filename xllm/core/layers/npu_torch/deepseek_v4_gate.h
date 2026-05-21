@@ -52,6 +52,7 @@ class DeepseekV4GateImpl : public torch::nn::Module {
   int64_t score_func_to_norm_type(const std::string& score_func) const;
 
   int64_t hidden_size_ = 0;
+  int64_t layer_id_ = 0;
   int64_t topk_ = 1;
   int64_t n_routed_experts_ = 0;
   int64_t n_hash_layers_ = 0;

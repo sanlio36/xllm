@@ -31,6 +31,7 @@ limitations under the License.
 #endif
 
 #include "kernels/ops_api.h"
+#include "util/tensor_debug.h"
 
 DECLARE_bool(enable_chunked_prefill);
 namespace xllm {
@@ -124,6 +125,15 @@ torch::Tensor CompressorImpl::forward(
 
   auto [kv_state, score_state] = kv_states;
   auto [kv_block_table, score_block_table] = block_tables;
+  const int64_t debug_layer_id = attn_metadata.layer_id;
+  xllm::debug::log_tensor_summary(
+      "compressor", debug_layer_id, "input_hidden_states", hidden_states);
+  xllm::debug::log_tensor_summary("compressor",
+                                  debug_layer_id,
+                                  "actual_seq_lengths_query",
+                                  actual_seq_lengths_query);
+  xllm::debug::log_tensor_summary(
+      "compressor", debug_layer_id, "start_pos", attn_metadata.start_pos);
 
   const int64_t sin_last_dim = compressed_sin.size(compressed_sin.dim() - 1);
   const int64_t cos_last_dim = compressed_cos.size(compressed_cos.dim() - 1);
@@ -154,6 +164,8 @@ torch::Tensor CompressorImpl::forward(
 
   std::tie(compressed_kv, std::ignore, std::ignore, std::ignore, std::ignore) =
       xllm::kernel::compressor(params);
+  xllm::debug::log_tensor_summary(
+      "compressor", debug_layer_id, "compressed_kv", compressed_kv);
   return compressed_kv;
 }
 

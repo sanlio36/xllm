@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 #include "layers/common/dp_utils.h"
+#include "util/tensor_debug.h"
 
 namespace xllm {
 namespace layer {
@@ -1253,6 +1254,12 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids,
     const ModelInputParams& input_params) {
+  constexpr int64_t debug_layer_id = -1;
+  xllm::debug::log_tensor_summary(
+      "moe", debug_layer_id, "hidden_states", hidden_states);
+  xllm::debug::log_tensor_summary(
+      "moe", debug_layer_id, "topk_weights", topk_weights);
+  xllm::debug::log_tensor_summary("moe", debug_layer_id, "topk_ids", topk_ids);
   torch::Tensor input = hidden_states;
   torch::Tensor selected_topk_weights = topk_weights;
   torch::Tensor selected_topk_ids = topk_ids;
@@ -1275,6 +1282,7 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
     if (shared_output.has_value()) {
       output = output + shared_output.value();
     }
+    xllm::debug::log_tensor_summary("moe", debug_layer_id, "ep2_output", output);
     return output;
   }
 
@@ -1325,6 +1333,8 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
   router_shape.back() = num_total_experts_;
   torch::Tensor router_logits = torch::empty(router_shape, input.options());
   torch::Tensor output = forward_expert(input, router_logits, shared_output);
+  xllm::debug::log_tensor_summary(
+      "moe", debug_layer_id, "forward_expert_output", output);
   preselected_experts_ = std::nullopt;
 
   if (need_slice) {

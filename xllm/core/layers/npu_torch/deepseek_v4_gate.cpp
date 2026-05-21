@@ -26,6 +26,7 @@ limitations under the License.
 #endif
 
 #include "kernels/ops_api.h"
+#include "util/tensor_debug.h"
 
 namespace xllm {
 namespace layer {
@@ -80,6 +81,7 @@ DeepseekV4GateImpl::DeepseekV4GateImpl(const ModelContext& context,
 DeepseekV4GateImpl::DeepseekV4GateImpl(const ModelArgs& args,
                                        int32_t layer_id,
                                        const torch::TensorOptions& options) {
+  layer_id_ = layer_id;
   hidden_size_ = args.hidden_size();
   n_routed_experts_ = args.n_routed_experts();
   topk_ = args.n_activated_experts();
@@ -136,8 +138,11 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
   CHECK_EQ(hidden_states.size(-1), hidden_size_)
       << "DeepseekV4Gate::forward hidden_states last dim mismatch, expected "
       << hidden_size_ << " got " << hidden_states.size(-1);
+  xllm::debug::log_tensor_summary(
+      "gate", layer_id_, "hidden_states", hidden_states);
 
   auto logits = torch::matmul(hidden_states, weight_.transpose(0, 1));
+  xllm::debug::log_tensor_summary("gate", layer_id_, "logits", logits);
 
   constexpr bool renormalize = true;
   const int64_t norm_type = score_func_to_norm_type(score_func_);
@@ -190,6 +195,9 @@ std::tuple<torch::Tensor, torch::Tensor> DeepseekV4GateImpl::forward(
     topk_weights = renormalize_topk_weights(topk_weights);
   }
 
+  xllm::debug::log_tensor_summary(
+      "gate", layer_id_, "topk_weights", topk_weights);
+  xllm::debug::log_tensor_summary("gate", layer_id_, "topk_idx", topk_idx);
   return std::make_tuple(topk_weights, topk_idx.to(torch::kInt32));
 }
 
@@ -232,6 +240,10 @@ DeepseekV4GateImpl::select_experts_native(
   topk_weights = topk_weights / denom;
   topk_weights = topk_weights * route_scale_;
 
+  xllm::debug::log_tensor_summary(
+      "gate_native", layer_id_, "topk_weights", topk_weights);
+  xllm::debug::log_tensor_summary(
+      "gate_native", layer_id_, "topk_idx", gather_idx);
   return std::make_tuple(topk_weights, gather_idx.to(torch::kInt32));
 }
 

@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_debug.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -526,13 +527,18 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                                           torch::Tensor,
                                           torch::Tensor>& compress_metadata) {
   (void)layer_name;
+  const int64_t debug_layer_id = attn_metadata.layer_id;
+  xllm::debug::log_tensor_summary(
+      "attn", debug_layer_id, "hidden_states", hidden_states);
 
   auto [c1_metadata, c4_metadata, c128_metadata, qli_metadata] =
       compress_metadata;
 
   // 1) q projection + q rmsnorm
   auto q_down = q_a_proj_->forward(hidden_states);
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "q_down", q_down);
   auto qr = std::get<0>(q_layernorm_->forward(q_down));
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "qr", qr);
   auto q = q_b_proj_->forward(qr).view({-1, n_local_heads_, head_dim_});
 
   xllm::kernel::FusedLayerNormParams q_rmsnorm_params;
@@ -542,17 +548,22 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   q_rmsnorm_params.eps = eps_;
   xllm::kernel::fused_layernorm(q_rmsnorm_params);
   q = q_rmsnorm_params.output;
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "q_normed", q);
 
   // 2) kv projection
   auto kv_down = kv_proj_->forward(hidden_states);
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "kv_down", kv_down);
   auto kv = std::get<0>(kv_layernorm_->forward(kv_down));
   kv = kv.view({-1, 1, qk_head_dim_});
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "kv_normed", kv);
 
   // 3) RoPE (q and kv)
   auto cos = attn_metadata.cos;
   auto sin = attn_metadata.sin;
   apply_partial_rope(q, nope_head_dim_, rope_head_dim_, cos, sin);
   apply_partial_rope(kv, nope_head_dim_, rope_head_dim_, cos, sin);
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "q_rope", q);
+  xllm::debug::log_tensor_summary("attn", debug_layer_id, "kv_rope", kv);
 
   // 4) resolve per-layer cache mapping
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
@@ -640,6 +651,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     scatter_by_slot(ori_kv, ori_slot, kv);
     ori_kv_for_attn = ori_kv;
   }
+  xllm::debug::log_tensor_summary(
+      "attn", debug_layer_id, "ori_kv_for_attn", ori_kv_for_attn);
 
   // 6) optional compressor for cmp cache
   // Token compressed cache is PA_ND for both prefill and decode.
@@ -673,6 +686,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              attn_metadata.actual_seq_lengths_query);
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
     cmp_kv_for_attn = cmp_kv;
+    xllm::debug::log_tensor_summary(
+        "attn", debug_layer_id, "compressed_kv", compressed_kv);
   }
 
   torch::Tensor compress_topk_idxs;
@@ -713,6 +728,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";
+    xllm::debug::log_tensor_summary(
+        "attn", debug_layer_id, "compress_topk_idxs", compress_topk_idxs);
   }
 
   // 7) sparse shared-kv attention
@@ -764,6 +781,8 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_q=*/"TND",
       /*layout_kv=*/ori_kv_layout,
       /*return_softmax_lse=*/false);
+  xllm::debug::log_tensor_summary(
+      "attn", debug_layer_id, "sparse_attn_output", attn_output);
 
   // 8) Deferred cache write for prefill.
   // In prefill mode the cache write was intentionally skipped above to
@@ -782,6 +801,10 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
   auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
   auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  xllm::debug::log_tensor_summary(
+      "attn", debug_layer_id, "o_low_rank", o_low_rank);
+  xllm::debug::log_tensor_summary(
+      "attn", debug_layer_id, "attn_final_output", output);
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 

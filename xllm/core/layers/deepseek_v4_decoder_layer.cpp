@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_debug.h"
 
 namespace xllm {
 namespace layer {
@@ -203,6 +204,9 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
   attn_input = std::get<0>(attn_norm_->forward(attn_input));
 
   auto& dsa = *(attn_metadata.dsa_metadata);
+  const int64_t debug_layer_id = dsa.layer_id;
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "layer_input_x", x);
   const auto compress_metadata = std::make_tuple(
       dsa.c1_metadata, dsa.c4_metadata, dsa.c128_metadata, dsa.qli_metadata);
   KVState kv_state{kv_cache.get_swa_cache(),
@@ -219,8 +223,12 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
       std::to_string(dsa.layer_id),
       compress_metadata);
   (void)attn_lse;
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "attn_output", attn_output);
   attn_input = attn_output;
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "post_attn_x", x);
 
   auto residual_ffn = x;
   auto [ffn_input, post_ffn, comb_ffn] =
@@ -248,9 +256,17 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
         << "DeepseekV4 hash gate requires input_ids for routing";
   }
   auto [topk_weights, topk_ids] = gate_->forward(ffn_input_2d, gate_input_ids);
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "topk_weights", topk_weights);
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "topk_ids", topk_ids);
   ffn_input = moe_mlp_->forward_with_selected_experts(
       ffn_input, topk_weights, topk_ids, input_params);
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "moe_output", ffn_input);
   x = hc_post(ffn_input, residual_ffn, post_ffn, comb_ffn);
+  xllm::debug::log_tensor_summary(
+      "decoder", debug_layer_id, "layer_output_x", x);
 
   return x;
 }
