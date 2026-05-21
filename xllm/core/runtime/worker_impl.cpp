@@ -441,8 +441,6 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
     lock_guard.emplace(capture_lock);
   }
 #endif
-  const bool use_default_stream =
-      !enable_schedule_overlap() && options_.backend() == "llm";
   auto prepare_input_on_current_stream = [&]() {
     processed_input = input.to(device_, dtype_);
     auto& input_params = processed_input.input_params;
@@ -503,16 +501,9 @@ void WorkerImpl::prepare_work_before_execute(const ForwardInput& input,
 #endif
   };
 
-  if (use_default_stream) {
-    prepare_input_on_current_stream();
-  } else {
-    c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
-    prepare_input_on_current_stream();
-  }
-
-  if (!use_default_stream) {
-    prepare_stream_->synchronize();
-  }
+  c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
+  prepare_input_on_current_stream();
+  prepare_stream_->synchronize();
 }
 
 void WorkerImpl::apply_kv_block_swaps(const ModelInputParams& input_params) {
