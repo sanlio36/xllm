@@ -343,7 +343,10 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
     param.enableSpeculate = true;
   }
   param.maskfree = true;  // TODO
-  param.enableSwiGLUQuantForSharedExperts = false;
+  const bool is_shared_expert_layer =
+      layer_id_ >= args.first_k_dense_replace() && args.n_shared_experts() > 0;
+  param.enableSwiGLUQuantForSharedExperts =
+      quantize_type_ == "w8a8_dynamic" && is_shared_expert_layer;
   if ((::xllm::KVCacheConfig::get_instance().enable_prefix_cache() ||
        ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) &&
       ::xllm::ParallelConfig::get_instance().cp_size() > 1 && is_prefill) {
