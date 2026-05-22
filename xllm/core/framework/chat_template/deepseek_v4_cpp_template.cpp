@@ -210,6 +210,7 @@ std::vector<nlohmann::ordered_json> tool_calls_from_openai_format(
       }
     }
     nlohmann::ordered_json item;
+    item["id"] = tc.id;
     item["name"] = tc.function.name;
     item["arguments"] = args;
     out.emplace_back(std::move(item));
