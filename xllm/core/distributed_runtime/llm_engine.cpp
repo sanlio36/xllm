@@ -1086,9 +1086,11 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
           static_cast<int64_t>(options_.max_tokens_per_batch());
       CHECK_LE(actual_scheduled_tokens, max_tokens_per_batch)
           << "DSV4 actual scheduled tokens exceed max_tokens_per_batch used "
-             "for SWA cache allocation. Please increase "
-             "--max_tokens_per_batch, reduce scheduler token load, or check "
-             "chunked-prefill padding. Details: dp_rank="
+             "for SWA cache allocation. This can make the shared SWA burst "
+             "pool smaller than the block/table consumer needs and may cause "
+             "SWA KV rows to be overwritten or read from the wrong position. "
+             "Please increase --max_tokens_per_batch, reduce scheduler token "
+             "load, or check chunked-prefill padding. Details: dp_rank="
           << dp_rank << ", actual_scheduled_tokens=" << actual_scheduled_tokens
           << ", max_tokens_per_batch=" << max_tokens_per_batch
           << ", q_max_seq_len="
