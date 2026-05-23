@@ -107,7 +107,7 @@ TEST_F(DeepseekV4IndexerTest, DsaTokenSlotsTrackCurrentDecodeStep) {
          "slots";
 }
 
-TEST_F(DeepseekV4IndexerTest, DsaSwaBlockTableWrapsWithLogicalPosition) {
+TEST_F(DeepseekV4IndexerTest, DsaSwaBlockTableUsesLogicalColumnsWithoutWrap) {
   ModelInputParams params;
   params.meta.batch_forward_type = BatchForwardType::DECODE;
   params.meta.num_sequences = 1;
