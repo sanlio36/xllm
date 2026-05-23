@@ -22,6 +22,7 @@ limitations under the License.
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
 
@@ -302,14 +303,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           .copy_(positions, /*non_blocking=*/true);
     }
   }
-  if (q_seq_lens_default_.defined() &&
-      q_seq_lens_default_.sizes() == q_seq_lens_.sizes()) {
-    q_seq_lens_.copy_(q_seq_lens_default_, /*non_blocking=*/true);
-  }
+  int64_t q_copy_len = 0;
   if (actual_batch_size > 0 && params.attention.device.q_seq_lens.defined() &&
       params.attention.device.q_seq_lens.dim() >= 1 &&
       params.attention.device.q_seq_lens.numel() > 0) {
-    const int64_t q_copy_len = std::min<int64_t>(
+    q_copy_len = std::min<int64_t>(
         actual_batch_size, params.attention.device.q_seq_lens.size(0));
     if (q_copy_len > 0) {
       q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_copy_len)
@@ -319,14 +317,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                  /*non_blocking=*/true);
     }
   }
-  if (kv_seq_lens_default_.defined() &&
-      kv_seq_lens_default_.sizes() == kv_seq_lens_.sizes()) {
-    kv_seq_lens_.copy_(kv_seq_lens_default_, /*non_blocking=*/true);
-  }
+  int64_t kv_copy_len = 0;
   if (actual_batch_size > 0 && params.attention.device.kv_seq_lens.defined() &&
       params.attention.device.kv_seq_lens.dim() >= 1 &&
       params.attention.device.kv_seq_lens.numel() > 0) {
-    const int64_t kv_copy_len = std::min<int64_t>(
+    kv_copy_len = std::min<int64_t>(
         actual_batch_size, params.attention.device.kv_seq_lens.size(0));
     if (kv_copy_len > 0) {
       kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/kv_copy_len)
@@ -337,13 +332,17 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     }
   }
   const int64_t padded_batch_size = static_cast<int64_t>(padded_num_tokens);
-
-  if (persistent_new_cache_slots_default_.defined() &&
-      persistent_new_cache_slots_default_.sizes() ==
-          persistent_new_cache_slots_.sizes()) {
-    persistent_new_cache_slots_.copy_(persistent_new_cache_slots_default_,
-                                      /*non_blocking=*/true);
+  if (q_copy_len < padded_batch_size) {
+    q_seq_lens_
+        .slice(/*dim=*/0, /*start=*/q_copy_len, /*end=*/padded_batch_size)
+        .fill_(1);
   }
+  if (kv_copy_len < padded_batch_size) {
+    kv_seq_lens_
+        .slice(/*dim=*/0, /*start=*/kv_copy_len, /*end=*/padded_batch_size)
+        .fill_(1);
+  }
+
   if (actual_num_tokens > 0 &&
       params.attention.device.new_cache_slots.defined() &&
       params.attention.device.new_cache_slots.dim() >= 1 &&
@@ -389,21 +388,18 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     }
   }
 
-  // Copy block table data
-  if (persistent_block_tables_default_.defined() &&
-      persistent_block_tables_default_.sizes() ==
-          persistent_block_tables_.sizes()) {
-    persistent_block_tables_.copy_(persistent_block_tables_default_,
-                                   /*non_blocking=*/true);
-  }
+  // Copy block table data. Do not reset the full persistent tensor each step:
+  // rows/columns observed by the graph are overwritten below or explicitly
+  // zeroed in the active bucket slice.
+  int64_t block_rows_to_copy = 0;
+  int64_t actual_block_table_len = 0;
   if (actual_batch_size > 0 &&
       params.attention.device.block_tables.defined() &&
       params.attention.device.block_tables.dim() >= 2 &&
       params.attention.device.block_tables.numel() > 0) {
-    const int64_t block_rows_to_copy = std::min<int64_t>(
+    block_rows_to_copy = std::min<int64_t>(
         actual_batch_size, params.attention.device.block_tables.size(0));
-    const int64_t actual_block_table_len =
-        params.attention.device.block_tables.size(1);
+    actual_block_table_len = params.attention.device.block_tables.size(1);
     if (block_rows_to_copy > 0 && actual_block_table_len > 0) {
       auto slice_persistent_block_tables =
           persistent_block_tables_
@@ -414,6 +410,15 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
               /*dim=*/0, /*start=*/0, /*end=*/block_rows_to_copy),
           /*non_blocking=*/true);
     }
+  }
+  if (block_rows_to_copy > 0 &&
+      actual_block_table_len < persistent_block_tables_.size(1)) {
+    persistent_block_tables_
+        .slice(/*dim=*/0, /*start=*/0, /*end=*/block_rows_to_copy)
+        .slice(/*dim=*/1,
+               /*start=*/actual_block_table_len,
+               /*end=*/persistent_block_tables_.size(1))
+        .zero_();
   }
   if (actual_batch_size < padded_batch_size) {
     zero_tensor_tail(
@@ -478,11 +483,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     update_attention_mask(params);
   }
 
-  if (tiling_data_.numel() > 0) {
+  if (uses_paged_attention_tiling()) {
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-    if (need_update_attention_plan_ && k_cache.defined() && v_cache.defined() &&
-        k_cache.numel() > 0 && v_cache.numel() > 0) {
+    if (k_cache.defined() && v_cache.defined() && k_cache.numel() > 0 &&
+        v_cache.numel() > 0) {
       plan_paged_attention_tiling(
           tokens, k_cache, v_cache, persistent_block_tables_, params, stream);
     }
@@ -541,7 +546,11 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     if (need_update_attn_mask_) {
       params_for_capture->graph.attn_mask = persistent_mask(padded_num_tokens);
     }
-    params_for_capture->graph.tiling_data = tiling_data();
+    if (uses_paged_attention_tiling()) {
+      params_for_capture->graph.tiling_data = tiling_data();
+    } else {
+      params_for_capture->graph.tiling_data = torch::Tensor();
+    }
     // Set persistent embedding if available
     if (params.embedding.input_embedding.defined()) {
       params_for_capture->embedding.input_embedding =

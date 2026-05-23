@@ -85,12 +85,14 @@ AttentionMetadata build_attention_metadata(
   // Determine if we should use ACL graph mode:
   // - --enable_graph=true
   // - Must be decode phase (not prefill)
+  // - Graph executor marked this input as graph mode
   // - tiling_data must be available
   bool is_decode = !params.meta.batch_forward_type.is_prefill() &&
                    !params.meta.batch_forward_type.is_mixed() &&
                    !params.meta.batch_forward_type.is_chunked_prefill();
   bool use_acl_graph = ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-                       is_decode && params.graph.tiling_data.defined();
+                       is_decode && params.enable_cuda_graph &&
+                       params.graph.tiling_data.defined();
   if (use_acl_graph) {
     // ACL graph mode: use CustomPagedAttention with tiling_data on device
     attn_metadata.paged_attention_tiling_data = params.graph.tiling_data;
@@ -146,7 +148,7 @@ AttentionMetadata build_attention_metadata(
 
   // Copy graph mode flag from params. AttentionMetadata keeps the historical
   // CUDA-oriented name for CUDA/MUSA attention plan handling.
-  attn_metadata.enable_cuda_graph = params.enable_graph;
+  attn_metadata.enable_cuda_graph = params.enable_cuda_graph;
 
 #if defined(USE_CUDA) || defined(USE_MUSA)
   if (attn_metadata.is_causal && !attn_metadata.enable_cuda_graph) {
