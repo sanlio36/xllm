@@ -19,8 +19,8 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "framework/sampling/rejection_sampler.h"
-#include "runtime/llm_worker_impl.h"
 #include "runtime/options.h"
+#include "runtime/worker_impl.h"
 
 namespace xllm {
 
@@ -138,7 +138,7 @@ class SpeculativeWorkerImpl : public WorkerImpl {
 
  protected:
   // Target model worker
-  std::unique_ptr<LLMWorkerImpl> impl_;
+  std::unique_ptr<WorkerImpl> impl_;
 
   bool enable_fused_kernel_ = false;
   int32_t embedding_size_ = 0;

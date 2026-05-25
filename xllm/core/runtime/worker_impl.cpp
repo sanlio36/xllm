@@ -358,6 +358,48 @@ void WorkerImpl::get_cache_info(uint64_t& cluster_id,
 #endif
 }
 
+#if defined(USE_NPU)
+layer::NpuLmHead WorkerImpl::get_npu_lm_head() {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  return model_->get_npu_lm_head();
+}
+
+void WorkerImpl::set_npu_lm_head(layer::NpuLmHead& head) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->set_npu_lm_head(head);
+}
+
+layer::NpuWordEmbedding WorkerImpl::get_npu_word_embedding() {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  return model_->get_npu_word_embedding();
+}
+
+void WorkerImpl::set_npu_word_embedding(layer::NpuWordEmbedding& embedding) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->set_npu_word_embedding(embedding);
+}
+#endif
+
+layer::LmHead WorkerImpl::get_lm_head() {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  return model_->get_lm_head();
+}
+
+void WorkerImpl::set_lm_head(layer::LmHead& head) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->set_lm_head(head);
+}
+
+layer::WordEmbedding WorkerImpl::get_word_embedding() {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  return model_->get_word_embedding();
+}
+
+void WorkerImpl::set_word_embedding(layer::WordEmbedding& embedding) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->set_word_embedding(embedding);
+}
+
 bool WorkerImpl::link_cluster(const std::vector<uint64_t>& cluster_ids,
                               const std::vector<std::string>& addrs,
                               const std::vector<std::string>& device_ips,

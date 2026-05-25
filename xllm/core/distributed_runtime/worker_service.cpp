@@ -284,6 +284,11 @@ void WorkerService::InitModel(::google::protobuf::RpcController* controller,
                               ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
+    LOG(INFO) << "[KimiEagle3][worker_service] InitModel begin"
+              << ", backend=" << options_.backend()
+              << ", speculative=" << options_.enable_speculative_decode()
+              << ", algo=" << options_.speculative_algorithm()
+              << ", model_path=" << request->model_weights_path();
     auto model_weights_path = request->model_weights_path();
     auto random_seed = request->random_seed();
     auto init_future =
@@ -622,6 +627,15 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                       forward_input,
                                       device_,
                                       stream_.get());
+        LOG(INFO) << "[KimiEagle3][worker_service] ExecuteModel begin"
+                  << ", backend=" << options_.backend()
+                  << ", speculative=" << options_.enable_speculative_decode()
+                  << ", algo=" << options_.speculative_algorithm()
+                  << ", seqs=" << forward_input.input_params.meta.num_sequences
+                  << ", tokens=" << forward_input.token_ids.numel()
+                  << ", pos=" << forward_input.positions.numel()
+                  << ", has_embeddings="
+                  << forward_input.input_params.embedding.input_embedding.defined();
 
         // model output
         torch::Tensor next_tokens;
@@ -651,6 +665,10 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              src_seq_idxes,
              out_tokens,
              out_logprobs);
+        LOG(INFO) << "[KimiEagle3][worker_service] ExecuteModel done"
+                  << ", next_tokens_defined=" << next_tokens.defined()
+                  << ", embeddings_defined=" << embeddings.defined()
+                  << ", expert_load_defined=" << expert_load_data.defined();
         // convert to proto output
         forward_output_to_proto(next_tokens,
                                 logprobs,

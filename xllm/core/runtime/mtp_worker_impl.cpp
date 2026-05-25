@@ -142,6 +142,107 @@ runtime::Options MTPDraftOptions(const runtime::Options& options) {
   return opts;
 }
 
+int64_t get_kv_cache_world_size(const ParallelArgs& parallel_args) {
+  CHECK_GT(parallel_args.dp_size(), 0) << "dp_size must be positive.";
+  CHECK_GT(parallel_args.cp_size(), 0) << "cp_size must be positive.";
+  const int64_t dp_cp_size =
+      static_cast<int64_t>(parallel_args.dp_size()) * parallel_args.cp_size();
+  CHECK_EQ(parallel_args.world_size() % dp_cp_size, 0)
+      << "world_size must be divisible by dp_size * cp_size.";
+  return parallel_args.world_size() / dp_cp_size;
+}
+
+int64_t get_num_layers_for_kv_cache(const ModelArgs& model_args) {
+  return model_args.n_layers();
+}
+
+int64_t get_kv_cache_slot_size(const ModelArgs& model_args,
+                               torch::ScalarType dtype,
+                               int64_t world_size) {
+  const int64_t dtype_size =
+      static_cast<int64_t>(torch::scalarTypeToTypeMeta(dtype).itemsize());
+  if (model_args.enable_mla()) {
+    return dtype_size *
+           (model_args.kv_lora_rank() + model_args.qk_rope_head_dim());
+  }
+  const int64_t total_kv_head_count =
+      model_args.n_kv_heads().value_or(model_args.n_heads());
+  const int64_t local_kv_head_count =
+      std::max<int64_t>(1, total_kv_head_count / world_size);
+  return 2 * dtype_size * model_args.head_dim() * local_kv_head_count;
+}
+
+int64_t get_index_slot_size(const ModelArgs& model_args,
+                            torch::ScalarType dtype) {
+  if (model_args.index_n_heads() <= 0) {
+    return 0;
+  }
+  const int64_t dtype_size =
+      static_cast<int64_t>(torch::scalarTypeToTypeMeta(dtype).itemsize());
+  return dtype_size * model_args.index_head_dim();
+}
+
+KVCacheShape make_kv_cache_shape(const KVCacheShape& base_kv_cache_shape,
+                                 const ModelArgs& model_args,
+                                 int64_t num_blocks,
+                                 int64_t block_size,
+                                 int64_t world_size) {
+  KVCacheCapacity kv_cache_cap;
+  kv_cache_cap.n_blocks() = num_blocks;
+  kv_cache_cap.block_size() = block_size;
+  if (base_kv_cache_shape.has_conv_cache_shape()) {
+    kv_cache_cap.num_linear_state_blocks() =
+        base_kv_cache_shape.conv_cache_shape()[0];
+  }
+  return KVCacheShape(kv_cache_cap, model_args, world_size);
+}
+
+int64_t estimate_mtp_target_cache_size(int64_t cache_size_in_bytes,
+                                       int64_t block_size,
+                                       const ModelArgs& target_model_args,
+                                       const ModelArgs& draft_model_args,
+                                       torch::ScalarType target_dtype,
+                                       torch::ScalarType draft_dtype,
+                                       int64_t world_size) {
+  const int64_t target_slot_size =
+      get_kv_cache_slot_size(target_model_args, target_dtype, world_size) +
+      get_index_slot_size(target_model_args, target_dtype);
+  const int64_t draft_slot_size =
+      get_kv_cache_slot_size(draft_model_args, draft_dtype, world_size) +
+      get_index_slot_size(draft_model_args, draft_dtype);
+  CHECK_GT(target_slot_size, 0)
+      << "target kv cache slot size must be positive.";
+  CHECK_GT(draft_slot_size, 0)
+      << "draft kv cache slot size must be positive.";
+  CHECK_GT(block_size, 0) << "block_size must be positive.";
+
+  const int64_t target_layers =
+      get_num_layers_for_kv_cache(target_model_args);
+  const int64_t draft_layers = get_num_layers_for_kv_cache(draft_model_args);
+  CHECK_GT(target_layers, 0) << "target kv cache layers must be positive.";
+  CHECK_GT(draft_layers, 0) << "draft kv cache layers must be positive.";
+
+  const int64_t target_block_bytes =
+      block_size * target_slot_size * target_layers;
+  const int64_t draft_block_bytes = block_size * draft_slot_size * draft_layers;
+  const int64_t total_block_bytes = target_block_bytes + draft_block_bytes;
+  CHECK_GT(total_block_bytes, 0)
+      << "mtp kv cache block bytes must be positive.";
+  return cache_size_in_bytes * target_block_bytes / total_block_bytes;
+}
+
+KVCacheShape make_draft_kv_cache_shape(
+    const KVCacheShape& target_kv_cache_shape,
+    const ModelArgs& draft_model_args,
+    int64_t block_size,
+    int64_t world_size) {
+  return make_kv_cache_shape(target_kv_cache_shape,
+                             draft_model_args,
+                             target_kv_cache_shape.key_cache_shape()[0],
+                             block_size,
+                             world_size);
+}
+
 }  // namespace
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
@@ -172,6 +273,16 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
                                MasterStatus master_status) {
   // Load target model via base class
   bool result = true;
+  LOG(INFO) << "[KimiEagle3][mtp_init] rank=" << parallel_args_.rank()
+            << ", target_path=" << model_weights_path
+            << ", draft_path="
+            << options_.draft_model_path().value_or(model_weights_path)
+            << ", master_status=" << static_cast<int32_t>(master_status)
+            << ", target_status=" << static_cast<int32_t>(impl_->get_status())
+            << ", draft_status="
+            << static_cast<int32_t>(draft_impl_ != nullptr
+                                        ? draft_impl_->get_status()
+                                        : WorkerImpl::Status::UNINITIALIZED);
   if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
     result = SpeculativeWorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
@@ -212,8 +323,50 @@ int64_t MTPWorkerImpl::get_embedding_placeholder_size() {
   return static_cast<int64_t>(embedding_size_);
 }
 
+std::tuple<int64_t, int64_t> MTPWorkerImpl::estimate_kv_cache_capacity() {
+  CHECK(impl_ != nullptr);
+  CHECK(draft_impl_ != nullptr);
+  auto [available_memory, total_memory] = impl_->estimate_kv_cache_capacity();
+  const int64_t target_cache_size = estimate_mtp_target_cache_size(
+      available_memory,
+      options_.block_size(),
+      impl_->context_.get_model_args(),
+      draft_impl_->context_.get_model_args(),
+      impl_->dtype(),
+      draft_impl_->dtype(),
+      get_kv_cache_world_size(parallel_args_));
+  LOG(INFO) << "[KimiEagle3][mtp_kv] estimate kv cache capacity, rank="
+            << parallel_args_.rank()
+            << ", available_memory=" << available_memory
+            << ", target_available_memory=" << target_cache_size
+            << ", total_memory=" << total_memory;
+  return {target_cache_size, total_memory};
+}
+
 bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
+  const int64_t world_size = get_kv_cache_world_size(parallel_args_);
+  const KVCacheShape target_kv_cache_shape =
+      make_kv_cache_shape(kv_cache_shape,
+                          impl_->context_.get_model_args(),
+                          num_blocks,
+                          options_.block_size(),
+                          world_size);
+  const KVCacheShape draft_kv_cache_shape =
+      make_kv_cache_shape(kv_cache_shape,
+                          draft_impl_->context_.get_model_args(),
+                          num_blocks,
+                          options_.block_size(),
+                          get_kv_cache_world_size(parallel_args_));
+  LOG(INFO) << "[KimiEagle3][mtp_kv] allocate kv cache, rank="
+            << parallel_args_.rank()
+            << ", blocks=" << num_blocks
+            << ", target_key_shape=[" << target_kv_cache_shape.key_cache_shape()
+            << "], target_value_shape=["
+            << target_kv_cache_shape.value_cache_shape()
+            << "], draft_key_shape=[" << draft_kv_cache_shape.key_cache_shape()
+            << "], draft_value_shape=["
+            << draft_kv_cache_shape.value_cache_shape() << "]";
   // init_model() must run first so dtype_/embedding_size_ are initialized.
   embedding_cache_ = std::make_shared<EmbeddingCache>(num_blocks);
   if (embedding_cache_) {
@@ -229,7 +382,7 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool target_allocated = true;
   const auto target_status = impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
-    target_allocated = impl_->allocate_kv_cache(kv_cache_shape);
+    target_allocated = impl_->allocate_kv_cache(target_kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
   }
@@ -237,7 +390,7 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   bool draft_allocated = true;
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
-    draft_allocated = draft_impl_->allocate_kv_cache(kv_cache_shape);
+    draft_allocated = draft_impl_->allocate_kv_cache(draft_kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }
@@ -248,9 +401,31 @@ bool MTPWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 #if defined(USE_NPU) || defined(USE_MLU)
 bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
-  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);
+  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
+  const int64_t world_size = get_kv_cache_world_size(parallel_args_);
+  const KVCacheShape target_kv_cache_shape =
+      make_kv_cache_shape(kv_cache_shape,
+                          impl_->context_.get_model_args(),
+                          num_blocks,
+                          options_.block_size(),
+                          world_size);
+  const KVCacheShape draft_kv_cache_shape =
+      make_kv_cache_shape(kv_cache_shape,
+                          draft_impl_->context_.get_model_args(),
+                          num_blocks,
+                          options_.block_size(),
+                          get_kv_cache_world_size(parallel_args_));
+  LOG(INFO) << "[KimiEagle3][mtp_kv_transfer] allocate kv cache, rank="
+            << parallel_args_.rank()
+            << ", blocks=" << num_blocks
+            << ", target_key_shape=[" << target_kv_cache_shape.key_cache_shape()
+            << "], target_value_shape=["
+            << target_kv_cache_shape.value_cache_shape()
+            << "], draft_key_shape=[" << draft_kv_cache_shape.key_cache_shape()
+            << "], draft_value_shape=["
+            << draft_kv_cache_shape.value_cache_shape() << "]";
 
   if (kv_cache_transfer_ == nullptr) {
 #if defined(USE_NPU)
@@ -278,7 +453,7 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const auto target_status = impl_->get_status();
   if (target_status == WorkerImpl::Status::LOADED) {
     target_allocated = impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_, target_kv_cache_shape);
   } else {
     CHECK_EQ(target_status, WorkerImpl::Status::READY);
   }
@@ -287,7 +462,7 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
   const auto draft_status = draft_impl_->get_status();
   if (draft_status == WorkerImpl::Status::LOADED) {
     draft_allocated = draft_impl_->allocate_kv_cache_with_transfer(
-        kv_cache_transfer_, kv_cache_shape);
+        kv_cache_transfer_, draft_kv_cache_shape);
   } else {
     CHECK_EQ(draft_status, WorkerImpl::Status::READY);
   }

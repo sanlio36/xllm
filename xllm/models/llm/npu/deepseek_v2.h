@@ -16,9 +16,16 @@ limitations under the License.
 #pragma once
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
+
+#include <optional>
+#include <sstream>
+#include <unordered_set>
+#include <vector>
 
 // DeepSeek v2 compatible with huggingface weights
 // ref to:
@@ -28,6 +35,16 @@ namespace xllm::npu::model {
 
 using torch::indexing::None;
 using ISlice = torch::indexing::Slice;
+
+inline std::string deepseek_v2_tensor_debug_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::stringstream ss;
+  ss << "shape=" << tensor.sizes() << ", dtype=" << tensor.dtype()
+     << ", device=" << tensor.device();
+  return ss.str();
+}
 
 class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
  public:
@@ -146,12 +163,71 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     dp_rank_ = parallel_args.rank() / dp_local_tp_size_;
     rank_ = parallel_args.rank();
     num_experts_per_tok_ = model_args.num_experts_per_tok();
+
+    if (::xllm::SpeculativeConfig::get_instance().speculative_algorithm() ==
+        "Eagle3") {
+      const auto& layer_ids_from_config = model_args.layers_to_capture();
+      if (!layer_ids_from_config.empty()) {
+        set_eagle3_layers_to_capture(layer_ids_from_config);
+      } else {
+        set_eagle3_layers_to_capture(std::nullopt);
+      }
+      const int64_t num_captured = layers_to_capture_set_.size();
+      const int64_t aux_dim = model_args.hidden_size() * num_captured;
+      aux_output_buffer_ = torch::empty(
+          {::xllm::SchedulerConfig::get_instance().max_tokens_per_batch(),
+           aux_dim},
+          options);
+    }
+  }
+
+  void set_eagle3_layers_to_capture(
+      const std::optional<std::vector<int32_t>>& layer_ids) {
+    capture_aux_hidden_states_ = true;
+    layers_to_capture_set_.clear();
+    if (layer_ids.has_value()) {
+      for (int32_t layer_id : layer_ids.value()) {
+        layers_to_capture_set_.insert(layer_id);
+      }
+    } else {
+      const int32_t num_layers = static_cast<int32_t>(layers_.size());
+      layers_to_capture_set_.insert(2);
+      layers_to_capture_set_.insert(num_layers / 2);
+      layers_to_capture_set_.insert(num_layers - 3);
+    }
+    LOG(INFO) << "DeepseekV2 Eagle3 layers_to_capture size: "
+              << layers_to_capture_set_.size();
   }
 
   ModelOutput forward(torch::Tensor tokens,
                       torch::Tensor positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) {
+    LOG(INFO) << "[KimiEagle3][deepseek_v2.forward] enter"
+              << ", batch_forward_type="
+              << input_params.meta.batch_forward_type.to_string()
+              << ", num_sequences=" << input_params.meta.num_sequences
+              << ", tokens=" << deepseek_v2_tensor_debug_string(tokens)
+              << ", positions="
+              << deepseek_v2_tensor_debug_string(positions)
+              << ", input_embedding="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.embedding.input_embedding)
+              << ", expert_array="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.expert.expert_array)
+              << ", q_seq_lens="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.attention.device.q_seq_lens)
+              << ", kv_seq_lens="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.attention.device.kv_seq_lens)
+              << ", block_tables="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.attention.device.block_tables)
+              << ", new_cache_slots="
+              << deepseek_v2_tensor_debug_string(
+                     input_params.attention.device.new_cache_slots);
     if (dp_size_ > 1) {
       if (tokens.sizes() == 0) {
         tokens = torch::tensor({1}).to(torch::kInt32).to(device_);
@@ -183,6 +259,9 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
           num_speculative_tokens_ + 1, dtype_, device_);
     }
 
+    const int64_t num_tokens = h.size(0);
+    const int64_t hidden_size = h.size(-1);
+    int64_t capture_idx = 0;
     RollingLayerGuard rolling_guard(rolling_mgr_);
     for (size_t i = 0; i < layers_.size(); i++) {
       aclrtEvent* event = nullptr;
@@ -198,6 +277,15 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = i;
+      if (capture_aux_hidden_states_ &&
+          layers_to_capture_set_.count(layer_index) != 0) {
+        aux_output_buffer_.slice(0, 0, num_tokens)
+            .slice(
+                1, capture_idx * hidden_size, (capture_idx + 1) * hidden_size)
+            .copy_(h.reshape({num_tokens, hidden_size}));
+        capture_idx++;
+      }
+      
       rolling_guard.before_layer(layer_index);
       layer(h,
             cos_pos,
@@ -208,8 +296,22 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
             event,
             event_flag);
       rolling_guard.after_layer(layer_index);
+      LOG(INFO) << "[KimiEagle3][deepseek_v2.forward] after_layer"
+                << ", layer=" << i
+                << ", h=" << deepseek_v2_tensor_debug_string(h)
+                << ", k_cache=" << deepseek_v2_tensor_debug_string(
+                       kv_caches[i].get_k_cache())
+                << ", v_cache=" << deepseek_v2_tensor_debug_string(
+                       kv_caches[i].get_v_cache());
     }
     auto hidden_states = norm_(h, 0);
+    if (capture_aux_hidden_states_) {
+      auto aux_hidden_states =
+          aux_output_buffer_.slice(0, 0, num_tokens).clone();
+      return ModelOutput(hidden_states,
+                         /*residual=*/torch::Tensor(),
+                         /*aux_hidden_states=*/aux_hidden_states);
+    }
     return ModelOutput(hidden_states);
   }
 
@@ -328,6 +430,9 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   layer::NpuPosEmbedding atb_pos_emb_{nullptr};
   layer::AttentionMask attn_mask_;
   layer::NpuRMSNorm norm_{nullptr};
+  bool capture_aux_hidden_states_ = false;
+  std::unordered_set<int32_t> layers_to_capture_set_;
+  torch::Tensor aux_output_buffer_;
   RollingLoadManager* rolling_mgr_ = nullptr;
 };
 TORCH_MODULE(DeepseekV2Model);

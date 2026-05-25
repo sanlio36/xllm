@@ -19,6 +19,8 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/speculative_config.h"
 #include "spec_input_builder.h"
+#include "runtime/llm_worker_impl.h"
+#include "runtime/vlm_worker_impl.h"
 #include "util/slice.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -65,8 +67,13 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
     const runtime::Options& options,
     const runtime::Options& target_options)
     : WorkerImpl(parallel_args, device, options) {
-  impl_ =
-      std::make_unique<LLMWorkerImpl>(parallel_args, device, target_options);
+  if (target_options.backend() == "vlm") {
+    impl_ = std::make_unique<VLMWorkerImpl>(
+        parallel_args, device, target_options);
+  } else {
+    impl_ = std::make_unique<LLMWorkerImpl>(
+        parallel_args, device, target_options);
+  }
 }
 
 bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,

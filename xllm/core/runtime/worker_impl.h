@@ -96,6 +96,18 @@ class WorkerImpl {
                               int64_t& k_cache_id,
                               int64_t& v_cache_id);
 
+  #if defined(USE_NPU)
+  virtual layer::NpuLmHead get_npu_lm_head();
+  virtual void set_npu_lm_head(layer::NpuLmHead& head);
+  virtual layer::NpuWordEmbedding get_npu_word_embedding();
+  virtual void set_npu_word_embedding(layer::NpuWordEmbedding& embedding);
+  #endif
+
+  virtual layer::LmHead get_lm_head();
+  virtual void set_lm_head(layer::LmHead& head);
+  virtual layer::WordEmbedding get_word_embedding();
+  virtual void set_word_embedding(layer::WordEmbedding& embedding);
+
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
                             const std::vector<std::string>& device_ips,

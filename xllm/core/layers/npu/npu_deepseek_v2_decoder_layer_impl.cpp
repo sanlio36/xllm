@@ -18,6 +18,7 @@ limitations under the License.
 #include <gflags/gflags.h>
 
 #include <boost/algorithm/string.hpp>
+#include <sstream>
 #include <utility>
 
 #include "common/global_flags.h"
@@ -31,6 +32,20 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+std::string tensor_debug_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+  std::stringstream ss;
+  ss << "shape=" << tensor.sizes() << ", dtype=" << tensor.dtype()
+     << ", device=" << tensor.device();
+  return ss.str();
+}
+
+}  // namespace
 
 namespace {
 
@@ -779,6 +794,23 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
   atb::Status st;
   ModelInputParams& input_params_new =
       const_cast<ModelInputParams&>(input_params);
+  LOG(INFO) << "[KimiEagle3][deepseek_v2_layer.forward] layer=" << layer_id_
+            << ", node_id=" << node_id
+            << ", batch_forward_type="
+            << input_params_new.meta.batch_forward_type.to_string()
+            << ", x=" << tensor_debug_string(x)
+            << ", cos_pos=" << tensor_debug_string(cos_pos)
+            << ", sin_pos=" << tensor_debug_string(sin_pos)
+            << ", attn_mask=" << tensor_debug_string(attn_mask)
+            << ", block_tables="
+            << tensor_debug_string(input_params.attention.device.block_tables)
+            << ", q_seq_lens="
+            << tensor_debug_string(input_params.attention.device.q_seq_lens)
+            << ", kv_seq_lens="
+            << tensor_debug_string(input_params.attention.device.kv_seq_lens);
+  LOG(INFO) << "[KimiEagle3][deepseek_v2_layer.forward] before_build"
+            << ", layer=" << layer_id_ << ", node_id=" << node_id
+            << ", phase=" << input_params_new.meta.batch_forward_type.to_string();
   // all micro batches are in same prefill/decode stage,
   if (input_params_new.meta.batch_forward_type.is_chunked_prefill()) {
     build_node_variant_pack(prefill_node_prefixcache_,
@@ -838,6 +870,10 @@ torch::Tensor NpuDeepseekV2DecoderLayerImpl::forward(
           << model_name_ << "excute decode layer fail, error code: " << st;
     }
   }
+  LOG(INFO) << "[KimiEagle3][deepseek_v2_layer.forward] after_execute"
+            << ", layer=" << layer_id_ << ", node_id=" << node_id
+            << ", phase=" << input_params_new.meta.batch_forward_type.to_string()
+            << ", x=" << tensor_debug_string(x);
   return tensor_placeholder_;
 }
 

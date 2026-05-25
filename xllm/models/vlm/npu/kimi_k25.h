@@ -1352,6 +1352,9 @@ REGISTER_MODEL_ARGS(kimi_k25, [&] {
       rope_scaling_attn_factor, "text_config.rope_scaling.attn_factor", 1.0f);
   LOAD_ARG_OR(
       num_nextn_predict_layers, "text_config.num_nextn_predict_layers", 1);
+  LOAD_ARG_OR(layers_to_capture,
+              "text_config.layers_to_capture",
+              std::vector<int32_t>{});
 
   LOAD_ARG_OR(bos_token_id, "text_config.bos_token_id", 163584);
   LOAD_ARG_OR(eos_token_id, "text_config.eos_token_id", 163585);

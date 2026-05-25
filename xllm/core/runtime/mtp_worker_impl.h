@@ -20,6 +20,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
 #endif
+#include "runtime/llm_worker_impl.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
@@ -55,6 +56,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 

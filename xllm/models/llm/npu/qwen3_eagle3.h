@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,55 @@ limitations under the License.
 #include "models/model_registry.h"
 
 namespace xllm::npu::model {
+
+namespace {
+
+constexpr const char* kQwen3Eagle3Tag = "[Qwen3Eagle3][EAGLE3]";
+
+inline std::string tensor_shape_string(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "undefined";
+  }
+
+  std::ostringstream oss;
+  oss << tensor.sizes();
+  return oss.str();
+}
+
+inline std::string kv_cache_shapes_string(
+    const std::vector<std::vector<int64_t>>& shapes) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << "(";
+    for (size_t j = 0; j < shapes[i].size(); ++j) {
+      if (j > 0) {
+        oss << ", ";
+      }
+      oss << shapes[i][j];
+    }
+    oss << ")";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+inline void log_tensor_shape(const std::string& name,
+                             const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    LOG(INFO) << kQwen3Eagle3Tag << " " << name << " shape=undefined";
+    return;
+  }
+
+  LOG(INFO) << kQwen3Eagle3Tag << " " << name
+            << " shape=" << tensor_shape_string(tensor)
+            << ", dtype=" << tensor.dtype() << ", device=" << tensor.device();
+}
+
+}  // namespace
 
 // EAGLE-3 specific decoder layer that accepts embeds and hidden_states
 // separately, applies layernorms, then concatenates them
@@ -66,6 +116,29 @@ class QWen3Eagle3DecoderLayerImpl : public torch::nn::Module {
                                 ModelInputParams& input_params,
                                 aclrtEvent* event,
                                 std::atomic<bool>* event_flag) {
+    LOG(INFO) << kQwen3Eagle3Tag << "[decoder] layer_id=" << layer_id_
+              << ", phase="
+              << (input_params.meta.batch_forward_type.is_decode() ? "decode"
+                                                                  : "prefill");
+    log_tensor_shape("decoder.hidden_states.before", hidden_states);
+    log_tensor_shape("decoder.hidden_states_extra.before", hidden_states_extra);
+    log_tensor_shape("decoder.cos_pos", cos_pos);
+    log_tensor_shape("decoder.sin_pos", sin_pos);
+    log_tensor_shape("decoder.attn_mask", attn_mask);
+    LOG(INFO) << kQwen3Eagle3Tag << "[decoder] kv_cache.shapes="
+              << kv_cache_shapes_string(kv_cache.get_shapes());
+    if (input_params.attention.device.block_tables.defined()) {
+      log_tensor_shape("decoder.block_tables",
+                       input_params.attention.device.block_tables);
+    }
+    if (input_params.attention.device.new_cache_slots.defined()) {
+      log_tensor_shape("decoder.new_cache_slots",
+                       input_params.attention.device.new_cache_slots);
+    }
+    if (input_params.attention.device.q_seq_lens.defined()) {
+      log_tensor_shape("decoder.q_seq_lens",
+                       input_params.attention.device.q_seq_lens);
+    }
     return decoder_layer_(hidden_states,
                           hidden_states_extra,
                           cos_pos,
@@ -151,6 +224,44 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     ModelInputParams& input_params_new =
         const_cast<ModelInputParams&>(input_params);
 
+    LOG(INFO) << kQwen3Eagle3Tag << "[model] model_type=" << model_type_
+              << ", dp_size=" << dp_size_ << ", dp_rank=" << dp_rank_
+              << ", dp_local_tp_size=" << dp_local_tp_size_
+              << ", phase="
+              << (input_params.meta.batch_forward_type.is_decode() ? "decode"
+                                                                  : "prefill")
+              << ", tokens=" << tensor_shape_string(tokens)
+              << ", positions=" << tensor_shape_string(positions);
+    if (tokens.numel() > 0) {
+      log_tensor_shape("model.tokens", tokens);
+      log_tensor_shape("model.positions", positions);
+    }
+    if (input_params.embedding.input_embedding.defined()) {
+      log_tensor_shape("model.input_embedding",
+                       input_params.embedding.input_embedding);
+    } else {
+      LOG(INFO) << kQwen3Eagle3Tag << "[model] input_embedding=undefined";
+    }
+    log_tensor_shape("model.expert_array", input_params.expert.expert_array);
+    log_tensor_shape("model.expert_load_data",
+                     input_params.expert.expert_load_data);
+    log_tensor_shape("model.attention.q_seq_lens",
+                     input_params.attention.device.q_seq_lens);
+    log_tensor_shape("model.attention.kv_seq_lens",
+                     input_params.attention.device.kv_seq_lens);
+    log_tensor_shape("model.attention.q_cu_seq_lens",
+                     input_params.attention.device.q_cu_seq_lens);
+    log_tensor_shape("model.attention.block_tables",
+                     input_params.attention.device.block_tables);
+    log_tensor_shape("model.attention.new_cache_slots",
+                     input_params.attention.device.new_cache_slots);
+    log_tensor_shape("model.attention.kv_cache_tokens_nums",
+                     input_params.attention.device.kv_cache_tokens_nums);
+    log_tensor_shape("model.graph.attn_mask", input_params.graph.attn_mask);
+    log_tensor_shape("model.graph.tiling_data", input_params.graph.tiling_data);
+    LOG(INFO) << kQwen3Eagle3Tag << "[model] kv_cache.shapes="
+              << kv_cache_shapes_string(kv_caches[0].get_shapes());
+
     // Handle empty tokens case for dp
     if (dp_size_ > 1 && tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
@@ -158,6 +269,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     }
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
+    log_tensor_shape("model.hidden_states.embedded", hidden_states);
     // Get hidden_states_extra from input_params.embedding.input_embedding
     // In EAGLE-3, hidden_states_extra comes from verifier layers
     // (3 layers concatenated)
@@ -166,19 +278,27 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
       LOG(WARNING) << "hidden_states_extra use embedding from tokens.";
       hidden_states_extra = hidden_states;
     }
+    log_tensor_shape("model.hidden_states_extra.before_fusion",
+                     hidden_states_extra);
 
     // Apply fusion if hidden_states_extra dimension doesn't match hidden_states
     // hidden_states_extra shape: [B*L, 3*target_hidden_size] or [B*L,
     // hidden_size]
     if (hidden_states_extra.size(-1) != hidden_states.size(-1)) {
       hidden_states_extra = fc_(hidden_states_extra, 0);
+      log_tensor_shape("model.hidden_states_extra.after_fc",
+                       hidden_states_extra);
     }
+    log_tensor_shape("model.hidden_states_extra.after_fusion",
+                     hidden_states_extra);
 
     // Compute positional embeddings
     torch::Tensor target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = target_cos_sin_chunks[0].contiguous();
     auto sin_pos = target_cos_sin_chunks[1].contiguous();
+    log_tensor_shape("model.cos_pos", cos_pos);
+    log_tensor_shape("model.sin_pos", sin_pos);
 
     // Generate attention mask
     torch::Tensor attn_mask;
@@ -205,6 +325,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
             128, cos_pos.dtype().toScalarType(), cos_pos.device());
       }
     }
+    log_tensor_shape("model.attn_mask", attn_mask);
 
     // EAGLE-3 has only 1 layer
     aclrtEvent* event{nullptr};
@@ -227,7 +348,6 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
              input_params_new,
              event,
              event_flag);
-    auto aux_hidden_states = hidden_states.clone();
     hidden_states = norm_(hidden_states, 0);
 
     // For draft decode, we capture the hidden state before norm as
@@ -235,7 +355,7 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     // states to next step
     return ModelOutput(hidden_states,
                        /*residual=*/torch::Tensor(),
-                       /*aux_hidden_states=*/aux_hidden_states);
+                       /*aux_hidden_states=*/hidden_states.clone());
   }
 
   virtual void load_state_dict(const StateDict& state_dict) {
