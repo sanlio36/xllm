@@ -55,15 +55,14 @@ class WorkerServer {
       std::atomic<bool>& done,
       const std::string& master_node_addr,
       const torch::Device& d,
+      const ParallelArgs& startup_parallel_args,
       int32_t world_size,
       int32_t global_rank,
       int32_t dp_size,
       int32_t local_rank,
       int32_t ep_size,
       int32_t cp_size,
-      WorkerType worker_type,
-      std::unique_ptr<ForwardSharedMemoryManager> input_shm_manager,
-      std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager);
+      WorkerType worker_type);
 
   void stop();
 
