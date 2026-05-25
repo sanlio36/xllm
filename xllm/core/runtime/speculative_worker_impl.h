@@ -39,7 +39,8 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   SpeculativeWorkerImpl(const ParallelArgs& parallel_args,
                         const torch::Device& device,
                         const runtime::Options& options,
-                        const runtime::Options& target_options);
+                        const runtime::Options& target_options,
+                        WorkerType worker_type);
 
  public:
   // initialize model, cache manager. blocking call

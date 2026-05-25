@@ -103,6 +103,8 @@ void VLMEngine::process_group_test() {
 #endif
 }
 
+bool VLMEngine::init(MasterStatus master_status) { return init(); }
+
 bool VLMEngine::init() {
   if (!init_model()) {
     LOG(ERROR) << "Failed to init model from: " << options_.model_path();
@@ -269,7 +271,7 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
 
 bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   LOG(INFO) << "kv cache capacity: "
-            << "bytes: " << kv_cache_cap.cache_size_in_bytes()
+            << "bytes: " << readable_size(kv_cache_cap.cache_size_in_bytes())
             << ", blocks: " << kv_cache_cap.n_blocks()
             << ", slot_size: " << kv_cache_cap.slot_size();
 

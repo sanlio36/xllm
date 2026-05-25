@@ -247,12 +247,14 @@ KVCacheShape make_draft_kv_cache_shape(
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
-                             const runtime::Options& options)
+                             const runtime::Options& options,
+                             WorkerType worker_type)
     : MTPWorkerImpl(parallel_args,
                     device,
                     options,
                     MTPTargetOptions(options),
                     MTPDraftOptions(options),
+                    worker_type,
                     ::xllm::SpeculativeConfig::get_instance()
                         .enable_opt_validate_probs()) {}
 
@@ -261,8 +263,13 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const runtime::Options& options,
                              const runtime::Options& target_options,
                              const runtime::Options& draft_options,
+                             WorkerType worker_type,
                              bool enable_opt_validate_probs)
-    : SpeculativeWorkerImpl(parallel_args, device, options, target_options),
+    : SpeculativeWorkerImpl(parallel_args,
+                            device,
+                            options,
+                            target_options,
+                            worker_type),
       enable_opt_validate_probs_(enable_opt_validate_probs) {
   draft_impl_ =
       std::make_unique<LLMWorkerImpl>(parallel_args, device, draft_options);
