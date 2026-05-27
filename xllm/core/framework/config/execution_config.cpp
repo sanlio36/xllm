@@ -48,6 +48,12 @@ DEFINE_int32(max_tokens_for_graph_mode,
              "Maximum number of tokens for graph execution. "
              "If 0, no limit is applied.");
 
+DEFINE_int32(acl_graph_decode_batch_size_limit,
+             16,
+             "Decode batch size threshold for ACL graph on NPU. "
+             "When actual decode batch_size > this value, ACL graph decode "
+             "falls back to eager mode to avoid OOM.");
+
 DEFINE_bool(enable_shm,
             false,
             "Whether to enable shared memory for executing model.");
@@ -76,6 +82,8 @@ void ExecutionConfig::from_flags() {
       .enable_prefill_piecewise_graph(FLAGS_enable_prefill_piecewise_graph)
       .enable_graph_vmm_pool(FLAGS_enable_graph_vmm_pool)
       .max_tokens_for_graph_mode(FLAGS_max_tokens_for_graph_mode)
+      .acl_graph_decode_batch_size_limit(
+          FLAGS_acl_graph_decode_batch_size_limit)
       .enable_shm(FLAGS_enable_shm)
       .use_contiguous_input_buffer(FLAGS_use_contiguous_input_buffer)
       .input_shm_size(FLAGS_input_shm_size)
@@ -94,6 +102,9 @@ void ExecutionConfig::from_json(const JsonReader& json) {
           json.value_or<bool>("enable_graph_vmm_pool", enable_graph_vmm_pool()))
       .max_tokens_for_graph_mode(json.value_or<int32_t>(
           "max_tokens_for_graph_mode", max_tokens_for_graph_mode()))
+      .acl_graph_decode_batch_size_limit(json.value_or<int32_t>(
+          "acl_graph_decode_batch_size_limit",
+          acl_graph_decode_batch_size_limit()))
       .enable_shm(json.value_or<bool>("enable_shm", enable_shm()))
       .use_contiguous_input_buffer(json.value_or<bool>(
           "use_contiguous_input_buffer", use_contiguous_input_buffer()))
