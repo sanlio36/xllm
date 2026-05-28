@@ -421,6 +421,8 @@ class DeepseekV4ModelImpl
         std::max<int64_t>(parallel_args.world_size() /
                               std::max<int64_t>(parallel_args.dp_size(), 1),
                           1);
+    local_dp_rank_ = std::max<int64_t>(parallel_args.rank(), 0) /
+                     dp_local_tp_size_;
     CHECK_EQ(num_heads_ % dp_local_tp_size_, 0)
         << "[DSV4][Init] n_heads must be divisible by local tp size. n_heads="
         << num_heads_ << ", local_tp_size=" << dp_local_tp_size_
@@ -643,8 +645,10 @@ class DeepseekV4ModelImpl
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     torch::NoGradGuard no_grad;
-    const bool is_empty_dp_rank = !tokens.defined() || tokens.numel() == 0;
-    if (is_empty_dp_rank) {
+    const bool is_empty_dp_rank =
+        is_empty_dp_rank_input(tokens, input_params);
+    const bool acl_graph_forward = deepseek_v4_uses_acl_graph(input_params);
+    if (is_empty_dp_rank && !acl_graph_forward) {
       tokens = torch::tensor(
           {1}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
       positions = torch::tensor(
@@ -652,6 +656,10 @@ class DeepseekV4ModelImpl
     }
 
     auto inputs_embeds = input_params.embedding.input_embedding;
+    if (is_empty_dp_rank && inputs_embeds.defined() &&
+        inputs_embeds.numel() == 0) {
+      inputs_embeds = torch::Tensor();
+    }
     torch::Tensor h =
         inputs_embeds.defined() ? inputs_embeds : embed_tokens_(tokens);
 
@@ -661,7 +669,6 @@ class DeepseekV4ModelImpl
 
     // Keep runtime inputs on the same accelerator device.
     const auto runtime_device = h.device();
-    const bool acl_graph_forward = deepseek_v4_uses_acl_graph(input_params);
     if (acl_graph_forward) {
       CHECK(tokens.defined() && tokens.device() == runtime_device)
           << "DeepSeek V4 ACL graph requires tokens on the runtime device";
@@ -961,40 +968,10 @@ class DeepseekV4ModelImpl
 #endif
   }
 
-  static int64_t infer_actual_batch_size(const ModelInputParams& params) {
-    if (params.meta.actual_num_sequences > 0) {
-      return params.meta.actual_num_sequences;
-    }
-    if (!params.attention.host.kv_seq_lens.empty()) {
-      return static_cast<int64_t>(params.attention.host.kv_seq_lens.size());
-    }
-    if (!params.attention.host.q_seq_lens.empty()) {
-      return static_cast<int64_t>(params.attention.host.q_seq_lens.size());
-    }
-    if (params.attention.device.kv_seq_lens.defined() &&
-        params.attention.device.kv_seq_lens.dim() >= 1) {
-      return params.attention.device.kv_seq_lens.size(0);
-    }
-    if (params.attention.device.q_seq_lens.defined() &&
-        params.attention.device.q_seq_lens.dim() >= 1) {
-      return params.attention.device.q_seq_lens.size(0);
-    }
-    if (params.attention.device.block_tables.defined() &&
-        params.attention.device.block_tables.dim() >= 2) {
-      return params.attention.device.block_tables.size(0);
-    }
-    for (const auto& block_table : params.multi_block_tables) {
-      if (block_table.defined() && block_table.dim() >= 2) {
-        return block_table.size(0);
-      }
-    }
-    return 0;
-  }
-
   void normalize_graph_metadata_input_params(ModelInputParams& params) const {
-    const int64_t actual_batch_size =
-        std::max<int64_t>(infer_actual_batch_size(params), 0);
-    int64_t metadata_batch_size = params.meta.actual_num_sequences;
+    int64_t actual_batch_size =
+        std::max<int64_t>(params.meta.actual_num_sequences, 0);
+    int64_t metadata_batch_size = actual_batch_size;
     if (params.enable_graph) {
       metadata_batch_size =
           std::max<int64_t>(metadata_batch_size, params.meta.num_sequences);
@@ -1002,6 +979,8 @@ class DeepseekV4ModelImpl
     if (metadata_batch_size <= 0) {
       metadata_batch_size = 1;
     }
+    actual_batch_size = std::min<int64_t>(actual_batch_size,
+                                          metadata_batch_size);
 
     auto trim_lens_vec = [metadata_batch_size,
                           actual_batch_size](std::vector<int32_t>& lens) {
@@ -1021,13 +1000,13 @@ class DeepseekV4ModelImpl
       }
     };
 
-    // Graph forward tensors are padded to the decode bucket. Build metadata
-    // for the same padded row count so compressor/attention inputs agree.
+    // Graph metadata keeps bucket capacity, but only actual rows carry real
+    // lengths. Padding rows must stay inactive for SparseAttnSharedkvMetadata.
     trim_lens_vec(params.attention.host.kv_seq_lens);
     trim_lens_vec(params.attention.host.q_seq_lens);
     params.meta.num_sequences = static_cast<int32_t>(metadata_batch_size);
     params.meta.actual_num_sequences =
-        static_cast<int32_t>(metadata_batch_size);
+        static_cast<int32_t>(actual_batch_size);
   }
 
   std::shared_ptr<layer::AttentionMetadata>
@@ -1062,6 +1041,23 @@ class DeepseekV4ModelImpl
         copy_to_persistent_tensor(dsa.start_pos, persistent.start_pos);
 
     return metadata;
+  }
+
+  bool is_empty_dp_rank_input(const torch::Tensor& tokens,
+                              const ModelInputParams& params) const {
+    if (!tokens.defined() || tokens.numel() == 0) {
+      return true;
+    }
+    if (params.enable_graph && params.meta.actual_num_sequences == 0) {
+      return true;
+    }
+    const auto& dp_token_nums = params.parallel.dp_global_token_nums;
+    if (dp_token_nums.size() <= 1) {
+      return false;
+    }
+    const int64_t dp_rank = std::clamp<int64_t>(
+        local_dp_rank_, 0, static_cast<int64_t>(dp_token_nums.size()) - 1);
+    return dp_token_nums[static_cast<size_t>(dp_rank)] == 0;
   }
 
   void fill_empty_dp_rank_input_params(
@@ -1511,6 +1507,7 @@ class DeepseekV4ModelImpl
   int64_t num_heads_ = 0;
   int64_t tp_num_heads_ = 0;
   int64_t dp_local_tp_size_ = 1;
+  int64_t local_dp_rank_ = 0;
   int64_t head_dim_ = 0;
   int64_t window_size_ = 128;
   int64_t index_n_heads_ = 0;
