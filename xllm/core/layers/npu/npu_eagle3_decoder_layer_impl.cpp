@@ -67,7 +67,8 @@ void NpuEagle3DecoderLayerImpl::param_from_args(
   param.quantGroupSize = 0;
   param.rmsNormEps = args.rms_norm_eps();
   param.worldSize = parallel_args.world_size();
-  param.numAttentionHeadsPerRank = args.n_heads() / param.worldSize;
+  CHECK_GT(dp_local_tp_size_, 0) << "dp local tp size must be positive";
+  param.numAttentionHeadsPerRank = args.n_heads() / dp_local_tp_size_;
   // param.hiddenSizePerAttentionHead = args.hidden_size() / args.n_heads();
   param.hiddenSizePerAttentionHead = args.head_dim();
   param.enableIntraLayerAddNorm = false;
@@ -75,8 +76,7 @@ void NpuEagle3DecoderLayerImpl::param_from_args(
   // param.numKeyValueHeadsPerRank = args.n_kv_heads();
   std::optional<long int> optionalValue = args.n_kv_heads();
   param.numKeyValueHeadsPerRank =
-      static_cast<int>(optionalValue.value()) / param.worldSize;
-  ;
+      static_cast<int>(optionalValue.value()) / dp_local_tp_size_;
   // param.numKeyValueHeadsPerRank = static_cast<int>(args.n_kv_heads());
 
   param.rank = parallel_args.rank();

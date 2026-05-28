@@ -93,13 +93,17 @@ class SpeculativeEngineBase : public Engine {
                       const int32_t src_kv_split_size = 1) override;
 
  protected:
-  SpeculativeEngineBase(const runtime::Options& options,
-                        bool use_draft_engine);
+  SpeculativeEngineBase(const runtime::Options& options, bool use_draft_engine);
 
  private:
   bool init_model(MasterStatus master_status);
 
   bool allocate_kv_cache();
+
+  bool should_skip_external_draft_kv_cache() const;
+
+  KVCacheCapacity get_internal_draft_kv_cache_capacity(
+      const KVCacheCapacity& draft_kv_cache_cap) const;
 
   int64_t calculate_kv_cache(const KVCacheCapacity& target_kv_cache_cap,
                              const KVCacheCapacity& draft_kv_cache_cap) const;

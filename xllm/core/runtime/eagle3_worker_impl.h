@@ -45,13 +45,33 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
   // selected prob extraction + draft->target token id mapping.
   void process_draft_sample_output(SampleOutput& sample_output) override;
 
-  void check_draft_input_embedding(
-      const torch::Tensor& embedding,
-      const std::string& phase) const override;
+  void check_draft_input_embedding(const torch::Tensor& embedding,
+                                   const std::string& phase) const override;
+
+  const torch::Tensor& get_draft_input_embedding(
+      const ModelEmbeddingInput& embedding_input) const override {
+    if (embedding_input.aux_input_embedding.defined()) {
+      return embedding_input.aux_input_embedding;
+    }
+    return embedding_input.input_embedding;
+  }
+
+  void set_draft_input_embedding(ModelEmbeddingInput& embedding_input,
+                                 const torch::Tensor& embedding,
+                                 const std::string& phase) const override {
+    check_draft_input_embedding(embedding, phase);
+    embedding_input.aux_input_embedding = embedding;
+  }
+
+  void clear_draft_input_embedding(
+      ModelEmbeddingInput& embedding_input) const override {
+    embedding_input.aux_input_embedding = torch::Tensor();
+  }
 
   // EAGLE-3 specific: hot_token_id for draft-to-target token mapping
   // hot_token_id = d2t + arange(d2t.size(0))
   torch::Tensor hot_token_id_;
+  bool use_draft_token_mapping_ = true;
 };
 
 }  // namespace xllm

@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -159,10 +160,20 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     }
 
     torch::Tensor hidden_states = embed_tokens_(tokens, 0);
-    // Get hidden_states_extra from input_params.embedding.input_embedding
     // In EAGLE-3, hidden_states_extra comes from verifier layers
-    // (3 layers concatenated)
-    torch::Tensor hidden_states_extra = input_params.embedding.input_embedding;
+    // (3 layers concatenated). Keep it separate from real input_embedding so
+    // VLM fused embeddings are not reused as verifier hidden states.
+    torch::Tensor hidden_states_extra =
+        input_params.embedding.aux_input_embedding;
+    if (!hidden_states_extra.defined() || hidden_states_extra.size(0) == 0) {
+      const bool has_multimodal_input =
+          input_params.multimodal.mm_data.valid() ||
+          input_params.multimodal.visual_pos_masks.defined() ||
+          !input_params.multimodal.deep_stacks.empty();
+      if (!has_multimodal_input) {
+        hidden_states_extra = input_params.embedding.input_embedding;
+      }
+    }
     if (!hidden_states_extra.defined() || hidden_states_extra.size(0) == 0) {
       LOG(WARNING) << "hidden_states_extra use embedding from tokens.";
       hidden_states_extra = hidden_states;
@@ -172,6 +183,17 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
     // hidden_states_extra shape: [B*L, 3*target_hidden_size] or [B*L,
     // hidden_size]
     if (hidden_states_extra.size(-1) != hidden_states.size(-1)) {
+      if (fc_weight_k_ > 0 && hidden_states_extra.size(-1) != fc_weight_k_) {
+        LOG(FATAL) << "Eagle3 draft fusion input dim mismatch, model_type="
+                   << model_type_ << ", tokens_sizes=" << tokens.sizes()
+                   << ", positions_sizes=" << positions.sizes()
+                   << ", token_embedding_sizes=" << hidden_states.sizes()
+                   << ", input_embedding_sizes=" << hidden_states_extra.sizes()
+                   << ", fc_weight_sizes=" << fc_weight_sizes_str_
+                   << ", expected_input_k=" << fc_weight_k_
+                   << ". Check that the Eagle3 draft checkpoint was trained "
+                      "for the target hidden size and captured layer count.";
+      }
       hidden_states_extra = fc_(hidden_states_extra, 0);
     }
 
@@ -273,7 +295,15 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
 
   virtual void load_state_dict(const StateDict& state_dict) {
     // fc: (hidden_size, 3*target_hidden_size) fusion layer
-    fc_->load_state_dict(state_dict.get_dict_with_prefix("fc."));
+    StateDict fc_state_dict = state_dict.get_dict_with_prefix("fc.");
+    torch::Tensor fc_weight = fc_state_dict.get_tensor("weight");
+    if (fc_weight.defined() && fc_weight.dim() >= 2) {
+      std::stringstream fc_weight_sizes_stream;
+      fc_weight_sizes_stream << fc_weight.sizes();
+      fc_weight_sizes_str_ = fc_weight_sizes_stream.str();
+      fc_weight_k_ = fc_weight.size(1);
+    }
+    fc_->load_state_dict(fc_state_dict);
 
     decoder_->load_state_dict(state_dict.get_dict_with_prefix("midlayer."));
 
@@ -319,6 +349,8 @@ class QWen3Eagle3ModelImpl : public torch::nn::Module {
   // EAGLE-3 specific modules
   layer::NpuColumnParallelLinear fc_{nullptr};  // fusion layer
   layer::NpuRMSNorm norm_{nullptr};             // final norm
+  std::string fc_weight_sizes_str_;
+  int64_t fc_weight_k_ = 0;
 
   // Decoder
   QWen3Eagle3DecoderLayer decoder_{nullptr};

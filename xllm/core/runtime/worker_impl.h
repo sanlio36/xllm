@@ -213,6 +213,10 @@ class WorkerImpl {
 
   virtual ForwardOutput get_last_step_result();
 
+  const std::vector<KVCache>& kv_caches_for_debug() const {
+    return kv_caches_;
+  }
+
   bool is_driver() const { return driver_ || dp_driver_; }
 
   int64_t get_active_activation_memory();

@@ -113,7 +113,10 @@ bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
 
 std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
     const ForwardInput& input) {
-  if (input.token_ids.numel() == 0) {
+  const bool empty_shard = input.input_params.meta.num_sequences == 0 ||
+                           !input.token_ids.defined() ||
+                           input.token_ids.numel() == 0;
+  if (empty_shard) {
     return step_empty(input);
   }
 

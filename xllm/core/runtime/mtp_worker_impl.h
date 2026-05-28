@@ -15,6 +15,10 @@ limitations under the License.
 
 #pragma once
 
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "framework/kv_cache/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #if defined(USE_NPU)
@@ -97,6 +101,23 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     (void)phase;
   }
 
+  virtual const torch::Tensor& get_draft_input_embedding(
+      const ModelEmbeddingInput& embedding_input) const {
+    return embedding_input.input_embedding;
+  }
+
+  virtual void set_draft_input_embedding(ModelEmbeddingInput& embedding_input,
+                                         const torch::Tensor& embedding,
+                                         const std::string& phase) const {
+    check_draft_input_embedding(embedding, phase);
+    embedding_input.input_embedding = embedding;
+  }
+
+  virtual void clear_draft_input_embedding(
+      ModelEmbeddingInput& embedding_input) const {
+    embedding_input.input_embedding = torch::Tensor();
+  }
+
   SampleOutput validate(const SamplingParameters& sampling_params,
                         const torch::Tensor& draft_token_ids,
                         const torch::Tensor& draft_probs,
@@ -105,6 +126,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // PD separation: placeholder size for empty embedding slot. Default: 1x
   // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
   virtual int64_t get_embedding_placeholder_size();
+
+  bool should_use_separate_draft_kv_cache_shape() const;
+  KVCacheShape get_draft_kv_cache_shape(
+      const KVCacheShape& target_kv_cache_shape) const;
+  std::unique_ptr<LLMWorkerImpl> create_draft_worker(
+      const std::string& model_weights_path) const;
 
   // prepare inputs for draft model at Prefill phase.
   void prepare_prefill_inputs(const ForwardInput& inputs,
@@ -135,6 +162,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
  protected:
   // Draft model worker
   std::unique_ptr<LLMWorkerImpl> draft_impl_;
+  runtime::Options draft_options_;
 
   // Embedding cache for speculative decoding
   std::shared_ptr<EmbeddingCache> embedding_cache_;
@@ -142,6 +170,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Whether validation directly uses selected-only draft_probs [B, S].
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;
+
+  std::unordered_map<int32_t, std::string> target_kv_slot_owners_;
+  std::unordered_set<std::string> target_only_request_ids_;
 
 #if defined(USE_NPU) || defined(USE_MLU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
