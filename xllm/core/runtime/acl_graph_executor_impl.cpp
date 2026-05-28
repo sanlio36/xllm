@@ -508,17 +508,23 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         static_cast<int32_t>(actual_batch_size);
     params_for_capture->attention.host.kv_seq_lens.resize(padded_num_tokens);
     params_for_capture->attention.host.q_seq_lens.resize(padded_num_tokens);
+    params_for_capture->attention.host.q_cu_seq_lens.resize(padded_num_tokens);
+    int32_t q_cu_prefix = 0;
     // Copy actual values from original params
     for (int64_t i = 0; i < actual_batch_size; i++) {
       params_for_capture->attention.host.kv_seq_lens[i] =
           params.attention.host.kv_seq_lens[i];
       params_for_capture->attention.host.q_seq_lens[i] =
           params.attention.host.q_seq_lens[i];
+      q_cu_prefix += params_for_capture->attention.host.q_seq_lens[i];
+      params_for_capture->attention.host.q_cu_seq_lens[i] = q_cu_prefix;
     }
     // Fill padded positions with default values
     for (int64_t i = actual_batch_size; i < padded_num_tokens; i++) {
       params_for_capture->attention.host.kv_seq_lens[i] = kPaddingSeqLen;
       params_for_capture->attention.host.q_seq_lens[i] = kPaddingSeqLen;
+      q_cu_prefix += kPaddingSeqLen;
+      params_for_capture->attention.host.q_cu_seq_lens[i] = q_cu_prefix;
     }
     params_for_capture->meta.num_sequences = padded_num_tokens;
     params_for_capture->meta.batch_forward_type = BatchForwardType::DECODE;
@@ -551,13 +557,10 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       params_for_capture->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
-    // Set q_cu_seq_lens if available
-    if (params.attention.device.q_cu_seq_lens.defined()) {
-      params_for_capture->attention.device.q_cu_seq_lens =
-          q_cu_seq_lens_.slice(/*dim=*/0,
-                               /*start=*/0,
-                               /*end=*/padded_batch_size);
-    }
+    params_for_capture->attention.device.q_cu_seq_lens =
+        q_cu_seq_lens_.slice(/*dim=*/0,
+                             /*start=*/0,
+                             /*end=*/padded_batch_size);
 
     return params_for_capture;
   }
