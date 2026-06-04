@@ -882,6 +882,7 @@ struct ModelInputParams {
     params.dit_forward_input = dit_forward_input.to(device);
     params.is_spec_verify = is_spec_verify;
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
+    params.dsa_topk_indices = safe_to(dsa_topk_indices, device, true);
     for (const auto& table : multi_block_tables) {
       params.multi_block_tables.push_back(
           safe_to(table, table.options().device(torch::kCPU), true));
@@ -1007,6 +1008,7 @@ struct ModelInputParams {
   torch::Tensor mtp_shifted_token_ids;
   bool is_spec_verify = false;
   torch::Tensor num_accepted_tokens;
+  torch::Tensor dsa_topk_indices;
 
   RecModelInputParams rec_params;
 
