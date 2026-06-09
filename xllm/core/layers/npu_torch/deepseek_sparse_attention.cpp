@@ -251,86 +251,6 @@ void scatter_by_slot(torch::Tensor& cache,
   cache_2d.index_copy_(/*dim=*/0, valid_slots, valid_values);
 }
 
-// Pack prefill TND KV [total_tokens, n, d] into temporary PA_ND blocks
-// [num_blocks + 1, block_size, n, d]. This mirrors vllm-ascend's
-// pad_to_blocks path and lets sparse_attn_sharedkv read prefill KV through a
-// block table without depending on the persistent SWA ring cache.
-std::tuple<torch::Tensor, torch::Tensor> build_prefill_pa_nd_kv(
-    const torch::Tensor& kv,
-    const torch::Tensor& cu_seqlens_q,
-    const torch::Tensor& block_table_hint,
-    int64_t block_size) {
-  if (!kv.defined() || !cu_seqlens_q.defined() || cu_seqlens_q.numel() <= 1 ||
-      block_size <= 0) {
-    return {torch::Tensor(), torch::Tensor()};
-  }
-
-  const int64_t batch_size = cu_seqlens_q.numel() - 1;
-  const auto cu_cpu = cu_seqlens_q.to(torch::kCPU).to(torch::kInt64);
-  std::vector<int64_t> q_starts(batch_size + 1);
-  auto cu_acc = cu_cpu.accessor<int64_t, 1>();
-  int64_t total_blocks = 0;
-  int64_t max_blocks_per_req = 0;
-  // cu_seqlens_q describes the packed token ranges for each request. Convert
-  // those ranges into the number of PA_ND blocks each request needs.
-  for (int64_t i = 0; i <= batch_size; ++i) {
-    q_starts[i] = cu_acc[i];
-    if (i > 0) {
-      const int64_t q_len = q_starts[i] - q_starts[i - 1];
-      const int64_t blocks = (q_len + block_size - 1) / block_size;
-      total_blocks += blocks;
-      max_blocks_per_req = std::max(max_blocks_per_req, blocks);
-    }
-  }
-  if (total_blocks <= 0) {
-    return {torch::Tensor(), torch::Tensor()};
-  }
-
-  const int64_t table_cols =
-      std::max<int64_t>(block_table_hint.defined() && block_table_hint.dim() > 1
-                            ? block_table_hint.size(1)
-                            : 0,
-                        max_blocks_per_req);
-  std::vector<int32_t> table_data(static_cast<size_t>(batch_size * table_cols),
-                                  0);
-
-  auto packed_kv = torch::zeros(
-      {total_blocks + 1, block_size, kv.size(1), kv.size(2)}, kv.options());
-
-  // Block 0 stays zero-filled as the padding block; real requests use 1-based
-  // block ids, matching the block tables consumed by sparse_attn_sharedkv.
-  int64_t next_block = 1;
-  for (int64_t req = 0; req < batch_size; ++req) {
-    const int64_t q_start = q_starts[req];
-    const int64_t q_len = q_starts[req + 1] - q_start;
-    const int64_t blocks = (q_len + block_size - 1) / block_size;
-    if (q_len <= 0 || blocks <= 0) {
-      continue;
-    }
-    for (int64_t j = 0; j < blocks; ++j) {
-      table_data[static_cast<size_t>(req * table_cols + j)] =
-          static_cast<int32_t>(next_block + j);
-    }
-    // Copy this request's contiguous prefill KV into its temporary PA_ND block
-    // range. The zero-initialized tail of the last block is padding.
-    auto target = packed_kv
-                      .slice(/*dim=*/0,
-                             /*start=*/next_block,
-                             /*end=*/next_block + blocks)
-                      .view({blocks * block_size, kv.size(1), kv.size(2)});
-    target.narrow(/*dim=*/0, /*start=*/0, /*length=*/q_len)
-        .copy_(kv.narrow(/*dim=*/0, /*start=*/q_start, /*length=*/q_len));
-    next_block += blocks;
-  }
-
-  auto table_cpu =
-      torch::tensor(table_data, torch::TensorOptions().dtype(torch::kInt32))
-          .view({batch_size, table_cols});
-  auto table = table_cpu.to(
-      block_table_hint.defined() ? block_table_hint.device() : kv.device());
-  return {packed_kv, table};
-}
-
 Dsv4PreprocessOutputs run_dsv4_preprocess_fallback(
     ReplicatedLinear& q_a_proj,
     RMSNorm& q_layernorm,
@@ -703,27 +623,12 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   }
 
   // 5) Prepare ori_kv for attention.
-  // Full prefill can read a temporary PA_ND cache built from current KV.
-  // Chunked prefill needs prefix KV, so it reads the persistent SWA cache.
   torch::Tensor ori_kv_for_attn;
   torch::Tensor ori_block_table_for_attn = ori_block_table;
   const std::string ori_kv_layout = "PA_ND";
   const bool use_prefill_attn = is_prefill || is_chunked_prefill;
-  const bool use_temporary_prefill_kv = is_prefill && !is_chunked_prefill;
-  if (use_temporary_prefill_kv) {
-    const int64_t block_size =
-        ori_kv.defined() && ori_kv.dim() > 1 ? ori_kv.size(1) : 128;
-    std::tie(ori_kv_for_attn, ori_block_table_for_attn) =
-        build_prefill_pa_nd_kv(kv,
-                               attn_metadata.actual_seq_lengths_query,
-                               ori_block_table,
-                               block_size);
-    CHECK(ori_kv_for_attn.defined())
-        << "Failed to build PA_ND KV for DeepSeek V4 prefill attention.";
-  } else {
-    scatter_by_slot(ori_kv, ori_slot, kv);
-    ori_kv_for_attn = ori_kv;
-  }
+  scatter_by_slot(ori_kv, ori_slot, kv);
+  ori_kv_for_attn = ori_kv;
 
   // 6) optional compressor for cmp cache
   // Token compressed cache is PA_ND for both prefill and decode.
@@ -849,12 +754,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_kv=*/ori_kv_layout,
       /*return_softmax_lse=*/false);
 
-  // 8) Deferred cache write for full prefill.
-  if (use_temporary_prefill_kv) {
-    scatter_by_slot(ori_kv, ori_slot, kv);
-  }
-
-  // 9) output RoPE + projection
+  // 8) output RoPE + projection
   auto o = attn_output.view({-1, n_local_heads_, head_dim_});
   apply_partial_rope(
       o, nope_head_dim_, rope_head_dim_, cos, sin, /*inverse=*/true);
