@@ -157,6 +157,18 @@ void print_debug_tensor(const std::string& name, const torch::Tensor& tensor) {
                                           "[DSV4_TENSOR_DEBUG] " + name);
 }
 
+void print_debug_optional_tensor(const std::string& name,
+                                 const std::optional<torch::Tensor>& tensor) {
+  if (!dsv4_tensor_debug_enabled()) {
+    return;
+  }
+  if (!tensor.has_value()) {
+    LOG(INFO) << "[DSV4_TENSOR_DEBUG] " << name << ": nullopt";
+    return;
+  }
+  print_debug_tensor(name, tensor.value());
+}
+
 torch::Tensor gather_cache_by_slot(const torch::Tensor& cache,
                                    const torch::Tensor& slot_mapping,
                                    int64_t value_rows) {
@@ -989,23 +1001,75 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         as_optional(attn_metadata.actual_seq_lengths_query);
   }
 
+  const std::optional<torch::Tensor> ori_kv_for_sparse =
+      as_optional(ori_kv_for_attn);
+  std::optional<torch::Tensor> cmp_kv_for_sparse = std::nullopt;
+  if (compress_ratio_i > 1) {
+    cmp_kv_for_sparse = as_optional(cmp_kv_for_attn);
+  }
+  std::optional<torch::Tensor> cmp_sparse_indices = std::nullopt;
+  if (compress_ratio_i == 4) {
+    cmp_sparse_indices = as_optional(compress_topk_idxs);
+  }
+  const std::optional<torch::Tensor> ori_block_table_for_sparse =
+      as_optional(ori_block_table_for_attn);
+  std::optional<torch::Tensor> cmp_block_table_for_sparse = std::nullopt;
+  if (compress_ratio_i > 1) {
+    cmp_block_table_for_sparse = as_optional(cmp_block_table);
+  }
+  const std::optional<torch::Tensor> cu_seqlens_q_for_sparse =
+      as_optional(attn_metadata.actual_seq_lengths_query);
+  const std::optional<torch::Tensor> seqused_kv_for_sparse =
+      as_optional(attn_metadata.actual_seq_lengths_kv);
+  std::optional<torch::Tensor> sinks_for_sparse = std::nullopt;
+  if (attn_sink_loaded_) {
+    sinks_for_sparse = as_optional(attn_sink_);
+  }
+
+  if (debug_layer) {
+    LOG(INFO) << "[DSV4_TENSOR_DEBUG][sparse_attn_inputs] layer="
+              << attn_metadata.layer_id
+              << ", compress_ratio=" << compress_ratio_i
+              << ", use_prefill_attn=" << use_prefill_attn
+              << ", softmax_scale=" << softmax_scale_
+              << ", ori_mask_mode=4, cmp_mask_mode=3"
+              << ", ori_win_left=" << std::max<int64_t>(window_size_ - 1, 0)
+              << ", ori_win_right=0, layout_q=TND"
+              << ", layout_kv=" << ori_kv_layout << ", return_softmax_lse=0";
+    print_debug_tensor("sparse.q", q);
+    print_debug_optional_tensor("sparse.ori_kv", ori_kv_for_sparse);
+    print_debug_optional_tensor("sparse.cmp_kv", cmp_kv_for_sparse);
+    print_debug_optional_tensor("sparse.ori_sparse_indices", std::nullopt);
+    print_debug_optional_tensor("sparse.cmp_sparse_indices",
+                                cmp_sparse_indices);
+    print_debug_optional_tensor("sparse.ori_block_table",
+                                ori_block_table_for_sparse);
+    print_debug_optional_tensor("sparse.cmp_block_table",
+                                cmp_block_table_for_sparse);
+    print_debug_optional_tensor("sparse.cu_seqlens_q", cu_seqlens_q_for_sparse);
+    print_debug_optional_tensor("sparse.cu_seqlens_ori_kv",
+                                cu_seqlens_ori_kv_for_attn);
+    print_debug_optional_tensor("sparse.cu_seqlens_cmp_kv", std::nullopt);
+    print_debug_optional_tensor("sparse.seqused_q", std::nullopt);
+    print_debug_optional_tensor("sparse.seqused_kv", seqused_kv_for_sparse);
+    print_debug_optional_tensor("sparse.sinks", sinks_for_sparse);
+    print_debug_optional_tensor("sparse.metadata", sparse_metadata);
+  }
+
   auto [attn_output, output_lse] = xllm::kernel::npu::sparse_attn_sharedkv(
       /*q=*/q,
-      /*ori_kv=*/as_optional(ori_kv_for_attn),
-      /*cmp_kv=*/compress_ratio_i > 1 ? as_optional(cmp_kv_for_attn)
-                                      : std::nullopt,
+      /*ori_kv=*/ori_kv_for_sparse,
+      /*cmp_kv=*/cmp_kv_for_sparse,
       /*ori_sparse_indices=*/std::nullopt,
-      /*cmp_sparse_indices=*/
-      compress_ratio_i == 4 ? as_optional(compress_topk_idxs) : std::nullopt,
-      /*ori_block_table=*/as_optional(ori_block_table_for_attn),
-      /*cmp_block_table=*/
-      compress_ratio_i > 1 ? as_optional(cmp_block_table) : std::nullopt,
-      /*cu_seqlens_q=*/as_optional(attn_metadata.actual_seq_lengths_query),
+      /*cmp_sparse_indices=*/cmp_sparse_indices,
+      /*ori_block_table=*/ori_block_table_for_sparse,
+      /*cmp_block_table=*/cmp_block_table_for_sparse,
+      /*cu_seqlens_q=*/cu_seqlens_q_for_sparse,
       /*cu_seqlens_ori_kv=*/cu_seqlens_ori_kv_for_attn,
       /*cu_seqlens_cmp_kv=*/std::nullopt,
       /*seqused_q=*/std::nullopt,
-      /*seqused_kv=*/as_optional(attn_metadata.actual_seq_lengths_kv),
-      /*sinks=*/attn_sink_loaded_ ? as_optional(attn_sink_) : std::nullopt,
+      /*seqused_kv=*/seqused_kv_for_sparse,
+      /*sinks=*/sinks_for_sparse,
       /*metadata=*/sparse_metadata,
       /*softmax_scale=*/softmax_scale_,
       /*cmp_ratio=*/compress_ratio_i,
