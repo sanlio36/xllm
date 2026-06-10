@@ -29,7 +29,6 @@ limitations under the License.
 #include <vector>
 
 #include "kernels/ops_api.h"
-#include "util/tensor_helper.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -121,12 +120,8 @@ bool should_debug_layer(int32_t layer_id) {
 std::string tensor_fingerprint_summary(const torch::Tensor& tensor,
                                        const std::string& tensor_name) {
   std::ostringstream stream;
-  stream << ::xllm::tensor_debug_summary(tensor,
-                                         tensor_name,
-                                         /*num=*/8,
-                                         /*part=*/true,
-                                         /*print_value=*/true);
   if (!tensor.defined()) {
+    stream << tensor_name << ", undefined tensor";
     return stream.str();
   }
 
@@ -140,7 +135,9 @@ std::string tensor_fingerprint_summary(const torch::Tensor& tensor,
     hash *= 1099511628211ULL;
   }
 
-  stream << ", stride=" << tensor.strides()
+  stream << tensor_name << ": shape=" << tensor.sizes()
+         << ", dtype=" << tensor.dtype() << ", device=" << tensor.device()
+         << ", numel=" << tensor.numel() << ", stride=" << tensor.strides()
          << ", storage_offset=" << tensor.storage_offset()
          << ", contiguous=" << tensor.is_contiguous()
          << ", num_bytes=" << num_bytes << ", fnv1a64=" << hash;
@@ -237,8 +234,16 @@ void print_debug_tensor_diff(const std::string& name,
       !rhs.is_floating_point()) {
     std::ostringstream lhs_shape;
     std::ostringstream rhs_shape;
-    lhs_shape << (lhs.defined() ? lhs.sizes() : at::IntArrayRef{});
-    rhs_shape << (rhs.defined() ? rhs.sizes() : at::IntArrayRef{});
+    if (lhs.defined()) {
+      lhs_shape << lhs.sizes();
+    } else {
+      lhs_shape << "undefined";
+    }
+    if (rhs.defined()) {
+      rhs_shape << rhs.sizes();
+    } else {
+      rhs_shape << "undefined";
+    }
     LOG(INFO) << "[DSV4_TENSOR_DEBUG] " << name
               << ": lhs_defined=" << lhs.defined()
               << ", rhs_defined=" << rhs.defined()
