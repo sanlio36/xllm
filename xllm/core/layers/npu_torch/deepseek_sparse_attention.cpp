@@ -18,13 +18,18 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "util/tensor_helper.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -73,6 +78,181 @@ std::optional<torch::Tensor> as_optional(const torch::Tensor& tensor) {
     return std::optional<torch::Tensor>(tensor);
   }
   return std::nullopt;
+}
+
+bool dsv4_tensor_debug_enabled() {
+  const char* value = std::getenv("XLLM_DSV4_TENSOR_DEBUG");
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string value_str(value);
+  return value_str != "0" && value_str != "false" && value_str != "FALSE";
+}
+
+bool dsv4_tensor_debug_all_layers() {
+  const char* value = std::getenv("XLLM_DSV4_TENSOR_DEBUG_ALL_LAYERS");
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string value_str(value);
+  return value_str != "0" && value_str != "false" && value_str != "FALSE";
+}
+
+int32_t dsv4_tensor_debug_layer() {
+  const char* value = std::getenv("XLLM_DSV4_TENSOR_DEBUG_LAYER");
+  if (value == nullptr) {
+    return -1;
+  }
+
+  char* end = nullptr;
+  const int64_t layer_id = std::strtol(value, &end, 10);
+  if (end == value) {
+    return -1;
+  }
+  return static_cast<int32_t>(layer_id);
+}
+
+bool should_debug_layer(int32_t layer_id) {
+  const int32_t debug_layer = dsv4_tensor_debug_layer();
+  return dsv4_tensor_debug_enabled() &&
+         (layer_id == debug_layer || dsv4_tensor_debug_all_layers());
+}
+
+std::string tensor_fingerprint_summary(const torch::Tensor& tensor,
+                                       const std::string& tensor_name) {
+  std::ostringstream stream;
+  stream << ::xllm::tensor_debug_summary(tensor,
+                                         tensor_name,
+                                         /*num=*/8,
+                                         /*part=*/true,
+                                         /*print_value=*/true);
+  if (!tensor.defined()) {
+    return stream.str();
+  }
+
+  const torch::Tensor cpu_tensor = tensor.detach().contiguous().to(torch::kCPU);
+  const size_t num_bytes =
+      static_cast<size_t>(cpu_tensor.numel()) * cpu_tensor.element_size();
+  const uint8_t* data = reinterpret_cast<const uint8_t*>(cpu_tensor.data_ptr());
+  uint64_t hash = 1469598103934665603ULL;
+  for (size_t i = 0; i < num_bytes; ++i) {
+    hash ^= static_cast<uint64_t>(data[i]);
+    hash *= 1099511628211ULL;
+  }
+
+  stream << ", stride=" << tensor.strides()
+         << ", storage_offset=" << tensor.storage_offset()
+         << ", contiguous=" << tensor.is_contiguous()
+         << ", num_bytes=" << num_bytes << ", fnv1a64=" << hash;
+  if (tensor.numel() > 0 && tensor.is_floating_point()) {
+    const torch::Tensor flat_tensor = cpu_tensor.view(-1).to(torch::kFloat32);
+    stream << ", abs_sum=" << flat_tensor.abs().sum().item<double>()
+           << ", square_sum=" << flat_tensor.square().sum().item<double>();
+  }
+  return stream.str();
+}
+
+void print_debug_tensor(const std::string& name, const torch::Tensor& tensor) {
+  if (!dsv4_tensor_debug_enabled()) {
+    return;
+  }
+  LOG(INFO) << tensor_fingerprint_summary(tensor,
+                                          "[DSV4_TENSOR_DEBUG] " + name);
+}
+
+torch::Tensor gather_cache_by_slot(const torch::Tensor& cache,
+                                   const torch::Tensor& slot_mapping,
+                                   int64_t value_rows) {
+  if (!cache.defined() || !slot_mapping.defined() ||
+      slot_mapping.numel() == 0 || value_rows <= 0) {
+    return torch::Tensor();
+  }
+
+  const int64_t hidden_size = cache.size(cache.dim() - 1);
+  torch::Tensor cache_2d = cache.view({-1, hidden_size});
+  torch::Tensor slots =
+      slot_mapping.reshape({-1}).to(torch::kLong).to(cache.device());
+  const int64_t rows = std::min<int64_t>(slots.size(0), value_rows);
+  if (rows <= 0) {
+    return torch::Tensor();
+  }
+
+  slots = slots.slice(/*dim=*/0, /*start=*/0, /*end=*/rows);
+  torch::Tensor valid_slots = slots.index({slots.ge(0)});
+  if (valid_slots.numel() == 0) {
+    return torch::Tensor();
+  }
+  return cache_2d.index_select(/*dim=*/0, valid_slots);
+}
+
+torch::Tensor gather_cache_by_block_table(const torch::Tensor& cache,
+                                          const torch::Tensor& block_table,
+                                          int64_t max_rows) {
+  if (!cache.defined() || !block_table.defined() || block_table.numel() == 0 ||
+      cache.dim() < 2 || max_rows <= 0) {
+    return torch::Tensor();
+  }
+
+  const int64_t block_size = cache.size(1);
+  const int64_t hidden_size = cache.size(cache.dim() - 1);
+  const torch::Tensor block_table_cpu =
+      block_table.detach().contiguous().to(torch::kCPU).to(torch::kInt64);
+  const torch::Tensor block_table_flat = block_table_cpu.view(-1);
+  const int64_t table_size = block_table_flat.size(0);
+  const int64_t* block_ids = block_table_flat.data_ptr<int64_t>();
+
+  std::vector<int64_t> slots;
+  slots.reserve(static_cast<size_t>(std::max<int64_t>(max_rows, 0)));
+  for (int64_t i = 0;
+       i < table_size && static_cast<int64_t>(slots.size()) < max_rows;
+       ++i) {
+    const int64_t block_id = block_ids[i];
+    if (block_id < 0) {
+      continue;
+    }
+    for (int64_t offset = 0;
+         offset < block_size && static_cast<int64_t>(slots.size()) < max_rows;
+         ++offset) {
+      slots.push_back(block_id * block_size + offset);
+    }
+  }
+  if (slots.empty()) {
+    return torch::Tensor();
+  }
+
+  torch::Tensor slot_tensor =
+      torch::tensor(slots, torch::TensorOptions().dtype(torch::kInt64))
+          .to(cache.device());
+  return cache.view({-1, hidden_size}).index_select(/*dim=*/0, slot_tensor);
+}
+
+void print_debug_tensor_diff(const std::string& name,
+                             const torch::Tensor& lhs,
+                             const torch::Tensor& rhs) {
+  if (!dsv4_tensor_debug_enabled()) {
+    return;
+  }
+  if (!lhs.defined() || !rhs.defined() || lhs.sizes() != rhs.sizes() ||
+      lhs.numel() == 0 || !lhs.is_floating_point() ||
+      !rhs.is_floating_point()) {
+    std::ostringstream lhs_shape;
+    std::ostringstream rhs_shape;
+    lhs_shape << (lhs.defined() ? lhs.sizes() : at::IntArrayRef{});
+    rhs_shape << (rhs.defined() ? rhs.sizes() : at::IntArrayRef{});
+    LOG(INFO) << "[DSV4_TENSOR_DEBUG] " << name
+              << ": lhs_defined=" << lhs.defined()
+              << ", rhs_defined=" << rhs.defined()
+              << ", lhs_shape=" << lhs_shape.str()
+              << ", rhs_shape=" << rhs_shape.str();
+    return;
+  }
+
+  const torch::Tensor diff =
+      lhs.to(torch::kFloat32).sub(rhs.to(torch::kFloat32)).abs();
+  LOG(INFO) << tensor_fingerprint_summary(diff, "[DSV4_TENSOR_DEBUG] " + name);
+  LOG(INFO) << "[DSV4_TENSOR_DEBUG] " << name
+            << ": max_abs=" << diff.max().item<double>()
+            << ", nonzero_count=" << diff.gt(0).sum().item<int64_t>();
 }
 
 torch::Tensor get_layer_cache_tensor(
@@ -556,6 +736,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto qr_pertoken_scale = preprocess_outputs.qr_pertoken_scale;
   auto q = preprocess_outputs.q;
   auto kv = preprocess_outputs.kv;
+  const bool debug_layer = should_debug_layer(attn_metadata.layer_id);
 
   // 4) resolve per-layer cache mapping
   const int64_t compress_ratio_i = static_cast<int64_t>(compress_ratio_);
@@ -596,6 +777,40 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto index_slot = get_layer_cache_tensor(attn_metadata.slot_mappings,
                                            attn_metadata.layer_id,
                                            mapping.index_cache_idx);
+  if (debug_layer) {
+    LOG(INFO) << "[DSV4_TENSOR_DEBUG][attention_begin] layer="
+              << attn_metadata.layer_id << ", is_prefill=" << is_prefill
+              << ", is_chunked_prefill=" << is_chunked_prefill
+              << ", compress_ratio=" << compress_ratio_i
+              << ", max_query_len=" << attn_metadata.max_query_len
+              << ", max_seq_len=" << attn_metadata.max_seq_len
+              << ", window_size=" << window_size_;
+    LOG(INFO) << "[DSV4_TENSOR_DEBUG][attention_mapping] layer="
+              << attn_metadata.layer_id
+              << ", cmp_cache_idx=" << mapping.cmp_cache_idx
+              << ", index_cache_idx=" << mapping.index_cache_idx
+              << ", ori_cache_idx=" << mapping.ori_cache_idx
+              << ", kv_state_cache_idx=" << mapping.kv_state_cache_idx
+              << ", score_state_cache_idx=" << mapping.score_state_cache_idx
+              << ", index_kv_state_cache_idx="
+              << mapping.index_kv_state_cache_idx
+              << ", index_score_state_cache_idx="
+              << mapping.index_score_state_cache_idx;
+    print_debug_tensor("attn.actual_seq_lengths_query",
+                       attn_metadata.actual_seq_lengths_query);
+    print_debug_tensor("attn.actual_seq_lengths_kv",
+                       attn_metadata.actual_seq_lengths_kv);
+    print_debug_tensor("attn.ori_block_table", ori_block_table);
+    print_debug_tensor("attn.cmp_block_table", cmp_block_table);
+    print_debug_tensor("attn.index_block_table", index_block_table);
+    print_debug_tensor("attn.ori_slot", ori_slot);
+    print_debug_tensor("attn.cmp_slot", cmp_slot);
+    print_debug_tensor("attn.index_slot", index_slot);
+    print_debug_tensor("attn.hidden_states", hidden_states);
+    print_debug_tensor("attn.q", q);
+    print_debug_tensor("attn.kv", kv);
+    print_debug_tensor("attn.qr", qr);
+  }
 
   auto ori_kv = std::get<0>(kv_state);
   if (!ori_kv.defined()) {
@@ -629,6 +844,23 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   const bool use_prefill_attn = is_prefill || is_chunked_prefill;
   scatter_by_slot(ori_kv, ori_slot, kv);
   ori_kv_for_attn = ori_kv;
+  if (debug_layer) {
+    torch::Tensor ori_cache_by_slot =
+        gather_cache_by_slot(ori_kv, ori_slot, kv.size(0));
+    print_debug_tensor("attn.ori_cache_by_slot", ori_cache_by_slot);
+    print_debug_tensor_diff("attn.ori_cache_scatter_diff",
+                            ori_cache_by_slot,
+                            kv.reshape({-1, kv.size(kv.dim() - 1)})
+                                .slice(/*dim=*/0,
+                                       /*start=*/0,
+                                       /*end=*/ori_cache_by_slot.defined()
+                                           ? ori_cache_by_slot.size(0)
+                                           : 0));
+    print_debug_tensor("attn.ori_cache_by_block_table",
+                       gather_cache_by_block_table(ori_kv_for_attn,
+                                                   ori_block_table_for_attn,
+                                                   attn_metadata.max_seq_len));
+  }
 
   // 6) optional compressor for cmp cache
   // Token compressed cache is PA_ND for both prefill and decode.
@@ -660,8 +892,31 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                              compress_sin,
                              compress_cos,
                              attn_metadata.actual_seq_lengths_query);
+    if (debug_layer) {
+      print_debug_tensor("attn.compressed_kv", compressed_kv);
+    }
     scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
     cmp_kv_for_attn = cmp_kv;
+    if (debug_layer) {
+      torch::Tensor cmp_cache_by_slot =
+          gather_cache_by_slot(cmp_kv, cmp_slot, compressed_kv.size(0));
+      print_debug_tensor("attn.cmp_cache_by_slot", cmp_cache_by_slot);
+      print_debug_tensor_diff(
+          "attn.cmp_cache_scatter_diff",
+          cmp_cache_by_slot,
+          compressed_kv
+              .reshape({-1, compressed_kv.size(compressed_kv.dim() - 1)})
+              .slice(/*dim=*/0,
+                     /*start=*/0,
+                     /*end=*/cmp_cache_by_slot.defined()
+                         ? cmp_cache_by_slot.size(0)
+                         : 0));
+      print_debug_tensor("attn.cmp_cache_by_block_table",
+                         gather_cache_by_block_table(
+                             cmp_kv_for_attn,
+                             cmp_block_table,
+                             attn_metadata.max_seq_len / compress_ratio_i + 1));
+    }
   }
 
   torch::Tensor compress_topk_idxs;
@@ -703,6 +958,9 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(compress_topk_idxs.defined())
         << "DSAttention indexer returned undefined topk indices for "
            "compress_ratio==4.";
+    if (debug_layer) {
+      print_debug_tensor("attn.compress_topk_idxs", compress_topk_idxs);
+    }
   }
 
   // 7) sparse shared-kv attention
@@ -753,17 +1011,37 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_q=*/"TND",
       /*layout_kv=*/ori_kv_layout,
       /*return_softmax_lse=*/false);
+  if (debug_layer) {
+    print_debug_tensor("attn.attn_output", attn_output);
+  }
 
   // 8) output RoPE + projection
   auto o = attn_output.view({-1, n_local_heads_, head_dim_});
   apply_partial_rope(
       o, nope_head_dim_, rope_head_dim_, cos, sin, /*inverse=*/true);
+  if (debug_layer) {
+    print_debug_tensor("attn.post_rope_output", o);
+  }
 
   const int64_t num_tokens = o.size(0);
   auto o_group = o.view({num_tokens, n_local_groups_, -1});
   auto wo_a = o_a_proj_->weight().view({n_local_groups_, o_lora_rank_, -1});
+  if (debug_layer) {
+    print_debug_tensor("attn.o_group", o_group);
+    print_debug_tensor("attn.wo_a", wo_a);
+  }
   auto o_low_rank = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+  if (debug_layer) {
+    auto o_low_rank_repeat = torch::einsum("tgd,grd->tgr", {o_group, wo_a});
+    print_debug_tensor("attn.o_low_rank", o_low_rank);
+    print_debug_tensor("attn.o_low_rank_repeat", o_low_rank_repeat);
+    print_debug_tensor_diff(
+        "attn.o_low_rank_repeat_diff", o_low_rank, o_low_rank_repeat);
+  }
   auto output = o_b_proj_->forward(o_low_rank.reshape({num_tokens, -1}));
+  if (debug_layer) {
+    print_debug_tensor("attn.projected_output", output);
+  }
   std::optional<torch::Tensor> final_lse = std::nullopt;
   (void)output_lse;
 
