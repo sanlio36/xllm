@@ -134,20 +134,6 @@ int quant_desc_to_linear_desc(const std::optional<std::string>& quant_desc,
   return default_desc;
 }
 
-std::vector<int> make_fp_attn_linear_descs(bool is_bf16) {
-  const int fp_desc = static_cast<int>(is_bf16 ? LinearTypeV2::BFLOAT16
-                                               : LinearTypeV2::FLOAT16);
-  return {fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc,
-          fp_desc};
-}
-
 std::vector<int> resolve_attn_linear_quant_types(const QuantArgs& quant_args,
                                                  int32_t layer_id) {
   const int w8a8_desc = static_cast<int>(LinearTypeV2::W8A8);
@@ -695,7 +681,15 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_quantization_parameters(
     param.moePackQuantType = static_cast<int>(PackType::ALL_FP);
     param.packQuantType = {static_cast<int>(PackType::ALL_FP),
                            static_cast<int>(PackType::ALL_FP)};
-    param.attnLinearQuantType = make_fp_attn_linear_descs(param.isBF16);
+    param.attnLinearQuantType = {static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP),
+                                 static_cast<int>(LinearType::FP)};
     param.mlpLinearQuantType = {static_cast<int>(LinearType::FP),
                                 static_cast<int>(LinearType::INVALID),
                                 static_cast<int>(LinearType::FP),
