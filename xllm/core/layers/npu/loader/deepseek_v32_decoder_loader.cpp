@@ -195,6 +195,7 @@ DeekseekV32DecoderLoader::DeekseekV32DecoderLoader(
     bool prefill_isBF16,
     bool decode_isBF16,
     const std::vector<int>& attn_linear_quant_types,
+    bool skip_topk,
     LoadMode mode)
     : BaseLoader(weight_count, context, mode),
       layer_id_(layer_id),
@@ -209,6 +210,7 @@ DeekseekV32DecoderLoader::DeekseekV32DecoderLoader(
       v_head_dim_(v_head_dim),
       prefill_isBF16_(prefill_isBF16),
       decode_isBF16_(decode_isBF16),
+      skip_topk_(skip_topk),
       attn_linear_quant_types_(attn_linear_quant_types) {
   auto model_args = context.get_model_args();
   auto quant_args = context.get_quant_args();
@@ -318,6 +320,22 @@ bool DeekseekV32DecoderLoader::is_attn_dynamic_desc(int index) const {
          index < static_cast<int>(attn_linear_quant_types_.size()) &&
          attn_linear_quant_types_[index] ==
              static_cast<int>(LinearTypeV2::W8A8_DYNAMIC);
+}
+
+bool DeekseekV32DecoderLoader::should_skip_indexer_weight(
+    const std::string& name) const {
+  return skip_topk_ && absl::StartsWith(name, "self_attn.indexer.");
+}
+
+void DeekseekV32DecoderLoader::reset_skipped_indexer_weights() {
+  if (!skip_topk_) {
+    return;
+  }
+  auto& t = working_tensors();
+  for (int index = IN_INDEXER_WQ_B_WEIGHT; index <= IN_INDEXER_PROJ_COMPRESS_IDX;
+       ++index) {
+    t[index] = tensor_placeholder_;
+  }
 }
 
 int DeekseekV32DecoderLoader::get_w4a8_expert_shard_dim(
@@ -549,6 +567,9 @@ void DeekseekV32DecoderLoader::process_general_weights(
     const StateDict& state_dict,
     const std::string& name,
     const torch::Tensor& tensor) {
+  if (should_skip_indexer_weight(name)) {
+    return;
+  }
   const int index = get_mapped_index(name, WEIGHT_MAPPING_W8A8);
   if (index == -1) {
     return;
@@ -1245,6 +1266,8 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
   }
 
   squeeze_experts_weights();
+
+  reset_skipped_indexer_weights();
 
   preprocess_linear_for_rope();
 

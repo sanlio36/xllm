@@ -366,6 +366,7 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       prefill_param_.isBF16,
       decode_param_.isBF16,
       attn_linear_quant_types_,
+      skip_topk_,
       ::xllm::LoadConfig::get_instance().enable_manual_loader()
           ? LoadMode::kManual
           : LoadMode::kEager);
