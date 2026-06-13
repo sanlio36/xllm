@@ -604,15 +604,12 @@ void DeekseekV32DecoderLoader::process_general_weights(
       (absl::EndsWith(name, "weight_offset") ||
        absl::EndsWith(name, "weight_scale"));
   const bool is_sharded =
-      WEIGHT_SHARD_W8A8.count(index) || is_dynamic_q_b_quant_param ||
-      is_dynamic_indexer_wq_b_quant_param;
+      WEIGHT_SHARD_W8A8.count(index) || is_dynamic_q_b_quant_param;
   torch::Tensor tmp_tensor;
 
   if (is_sharded) {
-    const int32_t shard_dim = (is_dynamic_q_b_quant_param ||
-                               is_dynamic_indexer_wq_b_quant_param)
-                                  ? 0
-                                  : WEIGHT_SHARD_W8A8.at(index);
+    const int32_t shard_dim =
+        is_dynamic_q_b_quant_param ? 0 : WEIGHT_SHARD_W8A8.at(index);
     tmp_tensor = get_sharded_tensor(state_dict,
                                     name,
                                     shard_dim,
