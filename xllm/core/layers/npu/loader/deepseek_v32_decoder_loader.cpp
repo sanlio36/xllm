@@ -35,6 +35,7 @@ constexpr int kQProjALinearIndex = 0;
 constexpr int kQProjBLinearIndex = 1;
 constexpr int kKvAProjLinearIndex = 2;
 constexpr int kOLinearIndex = 5;
+constexpr int kIndexerWqBLinearIndex = 6;
 
 std::string TensorShapeString(const torch::Tensor& tensor) {
   std::ostringstream oss;
@@ -322,6 +323,15 @@ bool DeekseekV32DecoderLoader::is_attn_dynamic_desc(int index) const {
              static_cast<int>(LinearTypeV2::W8A8_DYNAMIC);
 }
 
+bool DeekseekV32DecoderLoader::is_attn_quant_desc(int index) const {
+  return index >= 0 &&
+         index < static_cast<int>(attn_linear_quant_types_.size()) &&
+         (attn_linear_quant_types_[index] ==
+              static_cast<int>(LinearTypeV2::W8A8) ||
+          attn_linear_quant_types_[index] ==
+              static_cast<int>(LinearTypeV2::W8A8_DYNAMIC));
+}
+
 bool DeekseekV32DecoderLoader::should_skip_indexer_weight(
     const std::string& name) const {
   return skip_topk_ && absl::StartsWith(name, "self_attn.indexer.");
@@ -484,6 +494,9 @@ void DeekseekV32DecoderLoader::convert_offsets_to_int8() {
   if (!is_attn_dynamic_desc(kQProjBLinearIndex)) {
     convert_to_int8(IN_Q_PROJ_B_OFFSET);
   }
+  if (!is_attn_dynamic_desc(kIndexerWqBLinearIndex)) {
+    convert_to_int8(IN_INDEXER_WQ_B_OFFSET);
+  }
   if (!is_attn_dynamic_desc(kOLinearIndex)) {
     convert_to_int8(IN_ATTENTION_OUT_OFFSET);
   }
@@ -584,13 +597,22 @@ void DeekseekV32DecoderLoader::process_general_weights(
       (index == IN_ATTENTION_OUT_OFFSET || index == IN_ATTENTION_OUT_SCALE) &&
       (absl::EndsWith(name, "weight_offset") ||
        absl::EndsWith(name, "weight_scale"));
+  const bool is_dynamic_indexer_wq_b_quant_param =
+      use_quant_weight_mapping() &&
+      is_attn_dynamic_desc(kIndexerWqBLinearIndex) &&
+      (index == IN_INDEXER_WQ_B_OFFSET || index == IN_INDEXER_WQ_B_SCALE) &&
+      (absl::EndsWith(name, "weight_offset") ||
+       absl::EndsWith(name, "weight_scale"));
   const bool is_sharded =
-      WEIGHT_SHARD_W8A8.count(index) || is_dynamic_q_b_quant_param;
+      WEIGHT_SHARD_W8A8.count(index) || is_dynamic_q_b_quant_param ||
+      is_dynamic_indexer_wq_b_quant_param;
   torch::Tensor tmp_tensor;
 
   if (is_sharded) {
-    const int32_t shard_dim =
-        is_dynamic_q_b_quant_param ? 0 : WEIGHT_SHARD_W8A8.at(index);
+    const int32_t shard_dim = (is_dynamic_q_b_quant_param ||
+                               is_dynamic_indexer_wq_b_quant_param)
+                                  ? 0
+                                  : WEIGHT_SHARD_W8A8.at(index);
     tmp_tensor = get_sharded_tensor(state_dict,
                                     name,
                                     shard_dim,
@@ -611,7 +633,8 @@ void DeekseekV32DecoderLoader::process_general_weights(
              absl::EndsWith(name, "weight_offset")) {
     tmp_tensor = tmp_tensor.to(torch::kFloat16);
   }
-  if (is_dynamic_o_proj_quant_param) {
+  if (is_dynamic_o_proj_quant_param ||
+      is_dynamic_indexer_wq_b_quant_param) {
     tmp_tensor = tmp_tensor.flatten().contiguous();
   }
   auto& t = working_tensors();
@@ -1111,6 +1134,9 @@ void DeekseekV32DecoderLoader::convert_descaled_weights_to_float() {
   if (!is_attn_dynamic_desc(kQProjBLinearIndex)) {
     convert_to_float(IN_Q_PROJ_B_DESCALE);
   }
+  if (!is_attn_dynamic_desc(kIndexerWqBLinearIndex)) {
+    convert_to_float(IN_INDEXER_WQ_B_DESCALE);
+  }
   if (!is_attn_dynamic_desc(kOLinearIndex)) {
     convert_to_float(IN_ATTENTION_OUT_DESCALE);
   }
@@ -1366,6 +1392,12 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
   t[IN_Q_PROJ_B_WEIGHT] = cast_attn_weight(t[IN_Q_PROJ_B_WEIGHT],
                                            IN_Q_PROJ_B_WEIGHT,
                                            kQProjBLinearIndex);
+  if (is_attn_quant_desc(kIndexerWqBLinearIndex) &&
+      !IsPlaceholderTensor(t[IN_INDEXER_WQ_B_WEIGHT])) {
+    t[IN_INDEXER_WQ_B_WEIGHT] = cast_attn_weight(t[IN_INDEXER_WQ_B_WEIGHT],
+                                                 IN_INDEXER_WQ_B_WEIGHT,
+                                                 kIndexerWqBLinearIndex);
+  }
   t[IN_KV_PROJ_WITH_MQA_WEIGHT] = tensor_placeholder_;
   t[IN_KV_PROJ_WITH_MQA_BIAS] = tensor_placeholder_;
   t[IN_KV_PROJ_WITH_MQA_DESCALE] = tensor_placeholder_;
@@ -1405,6 +1437,11 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
       }
       if (!is_attn_dynamic_desc(kQProjBLinearIndex)) {
         t[IN_Q_PROJ_B_DESCALE] = convert_fp16_to_int64(t[IN_Q_PROJ_B_DESCALE]);
+      }
+      if (!is_attn_dynamic_desc(kIndexerWqBLinearIndex) &&
+          !IsPlaceholderTensor(t[IN_INDEXER_WQ_B_DESCALE])) {
+        t[IN_INDEXER_WQ_B_DESCALE] =
+            convert_fp16_to_int64(t[IN_INDEXER_WQ_B_DESCALE]);
       }
       if (!is_attn_dynamic_desc(kOLinearIndex)) {
         t[IN_ATTENTION_OUT_DESCALE] =

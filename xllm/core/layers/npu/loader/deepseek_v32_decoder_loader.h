@@ -108,6 +108,7 @@ class DeekseekV32DecoderLoader : public BaseLoader {
 
   bool use_quant_weight_mapping() const;
   bool is_attn_dynamic_desc(int index) const;
+  bool is_attn_quant_desc(int index) const;
   bool should_skip_indexer_weight(const std::string& name) const;
   void reset_skipped_indexer_weights();
 
