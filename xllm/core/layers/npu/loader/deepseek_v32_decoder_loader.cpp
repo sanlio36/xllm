@@ -1373,6 +1373,28 @@ void DeekseekV32DecoderLoader::merge_host_at_weights() {
           << ", q_b_scale=" << TensorDebugString(t[IN_Q_PROJ_B_SCALE]);
     }
   }
+  if (is_attn_dynamic_desc(kIndexerWqBLinearIndex) &&
+      !IsPlaceholderTensor(t[IN_INDEXER_WQ_B_WEIGHT])) {
+    const int64_t indexer_wq_b_scale_size =
+        t[IN_INDEXER_WQ_B_SCALE].numel();
+    CHECK(t[IN_INDEXER_WQ_B_WEIGHT].dim() != 2 ||
+          t[IN_INDEXER_WQ_B_WEIGHT].size(0) == indexer_wq_b_scale_size)
+        << "GLM/DeepSeekV32 layer " << layer_id_
+        << " dynamic indexer wq_b weight/scale mismatch before ATB: "
+        << "indexer_wq_b_weight="
+        << TensorDebugString(t[IN_INDEXER_WQ_B_WEIGHT])
+        << ", indexer_wq_b_scale="
+        << TensorDebugString(t[IN_INDEXER_WQ_B_SCALE]);
+    if (!IsPlaceholderTensor(t[IN_INDEXER_WQ_B_OFFSET])) {
+      CHECK_EQ(t[IN_INDEXER_WQ_B_OFFSET].numel(), indexer_wq_b_scale_size)
+          << "GLM/DeepSeekV32 layer " << layer_id_
+          << " dynamic indexer wq_b offset/scale mismatch before ATB: "
+          << "indexer_wq_b_offset="
+          << TensorDebugString(t[IN_INDEXER_WQ_B_OFFSET])
+          << ", indexer_wq_b_scale="
+          << TensorDebugString(t[IN_INDEXER_WQ_B_SCALE]);
+    }
+  }
 
   auto cast_attn_weight = [this](torch::Tensor tensor,
                                  int weight_index,
