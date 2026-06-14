@@ -130,7 +130,8 @@ class ProfileManager {
       bool is_prefill);
 
   std::shared_ptr<Request> generate_single_request(int32_t token_length,
-                                                   int32_t prefix_length);
+                                                   int32_t prefix_length,
+                                                   int32_t extra_capacity = 0);
   std::shared_ptr<Request> generate_single_decode_request(int32_t total_length);
 
   std::string generate_filename(const std::string& file_suffix);
@@ -159,6 +160,8 @@ class ProfileManager {
                                     std::vector<int32_t>& token_length_vec);
 
   double run_decode_request(const std::vector<int32_t>& total_length_vec);
+  double run_mtp_decode_warmup_request(
+      const std::vector<int32_t>& total_length_vec);
 
   static const std::vector<ProfileManager::CopyBlockProfile>&
   get_copy_block_profile();

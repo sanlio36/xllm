@@ -20,12 +20,14 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <string>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -38,6 +40,21 @@ limitations under the License.
 #include "util/rec_model_utils.h"
 
 namespace xllm {
+namespace {
+
+std::string make_profile_request_id() {
+  static std::atomic<uint64_t> next_id{0};
+  return "profile-" + std::to_string(next_id.fetch_add(1));
+}
+
+bool is_mtp_speculative_enabled() {
+  const auto& speculative_config = ::xllm::SpeculativeConfig::get_instance();
+  const std::string& algorithm = speculative_config.speculative_algorithm();
+  return speculative_config.num_speculative_tokens() > 0 &&
+         (algorithm == "MTP" || algorithm == "mtp");
+}
+
+}  // namespace
 
 ProfileManager::ProfileManager(Engine* engine, const Options& options)
     : options_(options), engine_(engine) {
@@ -580,7 +597,8 @@ double ProfileManager::predict_copy_blocks_time(
 
 std::shared_ptr<Request> ProfileManager::generate_single_request(
     int32_t token_length,
-    int32_t prefix_length) {
+    int32_t prefix_length,
+    int32_t extra_capacity) {
   auto& model_args = engine_->model_args();
   int32_t vocab_size = model_args.vocab_size();
   int32_t eos_token_id = model_args.eos_token_id();
@@ -600,9 +618,11 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
 
   RequestState req_state(token_ids);
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
+  req_state.seq_capacity += static_cast<size_t>(extra_capacity);
+  std::string request_id = make_profile_request_id();
   auto request = std::make_shared<Request>(
-      /*request_id=*/"",
-      /*x_request_id=*/"",
+      request_id,
+      /*x_request_id=*/request_id,
       /*x_request_time=*/"",
       req_state);
 
@@ -617,9 +637,9 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
   }
 
   if (!block_manager_pool_->BlockManagerPool::allocate(
-          request->sequences()[0].get(), token_length)) {
+          request->sequences()[0].get(), token_length + extra_capacity)) {
     LOG(FATAL) << "Profiling time failed! Not enough blocks, token length : "
-               << token_length;
+               << token_length << ", extra capacity: " << extra_capacity;
   }
 
   return request;
@@ -657,9 +677,10 @@ std::shared_ptr<Request> ProfileManager::generate_single_decode_request(
     seq_capacity += static_cast<size_t>(num_speculative_tokens) + 1;
   }
   req_state.seq_capacity = seq_capacity;
+  std::string request_id = make_profile_request_id();
   auto request = std::make_shared<Request>(
-      /*request_id=*/"",
-      /*x_request_id=*/"",
+      request_id,
+      /*x_request_id=*/request_id,
       /*x_request_time=*/"",
       req_state);
 
@@ -812,6 +833,56 @@ double ProfileManager::run_decode_request(
   return latency;
 }
 
+double ProfileManager::run_mtp_decode_warmup_request(
+    const std::vector<int32_t>& total_length_vec) {
+  std::vector<Sequence*> sequences;
+  std::vector<size_t> sequences_budget;
+  std::vector<std::shared_ptr<Request>> requests;
+
+  requests.reserve(total_length_vec.size());
+  sequences.reserve(total_length_vec.size());
+  sequences_budget.reserve(total_length_vec.size());
+
+  for (int32_t total_length : total_length_vec) {
+    CHECK_GT(total_length, 1) << "MTP decode warmup requires total_length > 1.";
+    std::shared_ptr<Request> request =
+        generate_single_request(total_length - 1,
+                                0,
+                                ::xllm::SpeculativeConfig::get_instance()
+                                        .num_speculative_tokens() +
+                                    1);
+    requests.emplace_back(request);
+    sequences.emplace_back(request->sequences()[0].get());
+    sequences_budget.emplace_back(total_length - 1);
+  }
+
+  auto prefill_batches =
+      BatchFactory::get_instance(options_.dp_size())
+          ->create_batches(requests, sequences, sequences_budget, nullptr);
+  engine_->step(prefill_batches);
+  if (options_.enable_schedule_overlap()) {
+    engine_->update_last_step_result(prefill_batches);
+  }
+
+  std::fill(sequences_budget.begin(), sequences_budget.end(), 1);
+  auto decode_batches =
+      BatchFactory::get_instance(options_.dp_size())
+          ->create_batches(requests, sequences, sequences_budget, nullptr);
+
+  absl::Time start_time = absl::Now();
+  engine_->step(decode_batches);
+  if (options_.enable_schedule_overlap()) {
+    engine_->update_last_step_result(decode_batches);
+  }
+  double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
+  for (auto& request : requests) {
+    block_manager_pool_->deallocate_without_cache(
+        request->sequences()[0].get());
+  }
+
+  return latency;
+}
+
 // Generate a batch of decode requests in DECODE stage and execute one decode
 // step, then return the step latency.
 double ProfileManager::profile_decode_step_time(int32_t token_length,
@@ -903,7 +974,10 @@ void ProfileManager::warmup_for_graph() {
   double decode_total_latency = 0.0;
   for (int32_t batch_size : decode_batch_sizes) {
     std::vector<int32_t> total_length_vec(batch_size, decode_seq_len);
-    decode_total_latency += run_decode_request(total_length_vec);
+    decode_total_latency += is_mtp_speculative_enabled()
+                                ? run_mtp_decode_warmup_request(
+                                      total_length_vec)
+                                : run_decode_request(total_length_vec);
   }
 
   LOG(INFO) << "Decode warmup completed: bucket_count="
