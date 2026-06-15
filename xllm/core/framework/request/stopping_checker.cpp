@@ -74,7 +74,8 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
   }
 
   // check stop tokens
-  if (stop_tokens_.count(last_token_id) > 0) {
+  if ((!ignore_eos_ || last_token_id != eos_token_) &&
+      stop_tokens_.count(last_token_id) > 0) {
     return FinishReason::STOP;
   }
 
