@@ -4,7 +4,7 @@
 
 + 国内可用: https://gitcode.com/xLLM-AI/xllm
 
-+ 权重下载: 
++ 权重下载:
 
   [modelscope-GLM-5-W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5-W8A8-xLLM-0403/files)
 
@@ -55,7 +55,7 @@ sudo docker run -it --ipc=host -u 0 --privileged --name mydocker --network=host 
 
 ```bash
 git clone https://github.com/jd-opensource/xllm
-cd xllm 
+cd xllm
 git checkout preview/glm-5.2
 git submodule update --init --recursive
 ```
@@ -466,7 +466,7 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
   MODEL_PATH=/export/home/models/GLM-5-w8a8/
   #模型路径（此处为int量化的Glm-5）
   DRAFT_MODEL_PATH=/export/home/models/GLM-5-MTP/
-  
+
   MASTER_NODE_ADDR="11.87.49.110:10015"
   LOCAL_HOST="11.87.49.110"
   # Service Port
@@ -474,7 +474,7 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
   START_DEVICE=0
   LOG_DIR="logs"
   NNODES=16
-  
+
   for (( i=0; i<$NNODES; i++ ))
   do
     PORT=$((START_PORT + i))
@@ -506,13 +506,13 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
       --disagg_pd_port=8877 \
       > $LOG_FILE 2>&1 &
   done
-  
+
   #--etcd_addr=$LOCAL_HOST:3389  参考etcd中advertise-client-urls的配置
   #--instance_role=DECODE     PD配置，DECODE\PREFILL
   ```
 
 - 启动Decode实例
-  
+
   ```bash
     BATCH_SIZE=256
   #推理最大batch数量
@@ -521,7 +521,7 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
   MODEL_PATH=/export/home/models/GLM-5-w8a8/
   #模型路径（此处为int量化的Glm-5）
   DRAFT_MODEL_PATH=/export/home/models/GLM-5-MTP/
-  
+
   MASTER_NODE_ADDR="11.87.49.110:10015"
   LOCAL_HOST="11.87.49.110"
   # Service Port
@@ -529,7 +529,7 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
   START_DEVICE=0
   LOG_DIR="logs"
   NNODES=16
-  
+
   for (( i=0; i<$NNODES; i++ ))
   do
     PORT=$((START_PORT + i))
@@ -561,11 +561,11 @@ ENABLE_DECODE_RESPONSE_TO_SERVICE=true ../xllm-service/build/xllm_service/xllm_m
       --disagg_pd_port=8877 \
       > $LOG_FILE 2>&1 &
   done
-  
+
   #--etcd_addr=$LOCAL_HOST:3389  参考etcd中advertise-client-urls的配置
   #--instance_role=DECODE     PD配置，DECODE\PREFILL
   ```
-  
+
   需要注意：
 
 - PD分离需要读取`/etc/hccn.conf`文件，确保将物理机上的该文件映射到了容器中
