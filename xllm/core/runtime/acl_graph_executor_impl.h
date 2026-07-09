@@ -21,7 +21,9 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "core/common/macros.h"
@@ -47,6 +49,7 @@ limitations under the License.
 namespace xllm::npu {
 
 struct AclGraphTaskUpdateContext;
+class OneRecPrefillAclGraph;
 
 // ACL graph executor using libtorch NPUGraph for memory management
 // NPUGraph provides mempool to manage temporary tensors during forward pass
@@ -123,7 +126,7 @@ class AclGraphExecutorImpl : public ExecutorImpl {
                        const torch::Device& device,
                        const runtime::Options& options);
 
-  ~AclGraphExecutorImpl() override = default;
+  ~AclGraphExecutorImpl() override;
 
   ForwardInput prepare_inputs(Batch& batch) override;
 
@@ -146,6 +149,16 @@ class AclGraphExecutorImpl : public ExecutorImpl {
 
   // Persistent parameters shared across all AclGraph instances
   std::unique_ptr<GraphPersistentParam> persistent_param_;
+
+  absl::flat_hash_map<std::string, std::unique_ptr<OneRecPrefillAclGraph>>
+      onerec_prefill_graphs_;
+  std::mutex onerec_prefill_graph_mutex_;
+  bool onerec_last_first_prefill_graph_ready_ = false;
+
+  ModelOutput run_onerec_prefill_graph(const torch::Tensor& tokens,
+                                       const torch::Tensor& positions,
+                                       std::vector<KVCache>& kv_caches,
+                                       const ModelInputParams& params);
 
   // Get bucket num_tokens for given num_tokens
   // For num_tokens < 8: use 1, 2, 4, 8

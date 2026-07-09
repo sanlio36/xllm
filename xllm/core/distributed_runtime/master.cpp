@@ -264,6 +264,8 @@ Master::Master(const Options& options, EngineType type)
             options_.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options_.enable_prefill_piecewise_graph())
+        .enable_onerec_prefill_acl_graph(
+            options_.enable_onerec_prefill_acl_graph())
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
         .max_tokens_per_chunk_for_prefill(
             options_.max_tokens_per_chunk_for_prefill());
@@ -339,6 +341,8 @@ Master::Master(const Options& options, EngineType type)
             options_.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options_.enable_prefill_piecewise_graph())
+        .enable_onerec_prefill_acl_graph(
+            options_.enable_onerec_prefill_acl_graph())
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode());
 
     if (use_suffix_spec) {
@@ -403,6 +407,8 @@ Master::Master(const Options& options, EngineType type)
             options_.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options_.enable_prefill_piecewise_graph())
+        .enable_onerec_prefill_acl_graph(
+            options_.enable_onerec_prefill_acl_graph())
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
         .kv_cache_dtype(options_.kv_cache_dtype())
         .model_id(options_.model_id());
@@ -444,6 +450,8 @@ Master::Master(const Options& options, EngineType type)
             options_.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options_.enable_prefill_piecewise_graph())
+        .enable_onerec_prefill_acl_graph(
+            options_.enable_onerec_prefill_acl_graph())
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
         .max_tokens_per_chunk_for_prefill(
             options_.max_tokens_per_chunk_for_prefill())

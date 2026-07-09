@@ -43,6 +43,7 @@ class ExecutionConfig final {
         {"enable_graph",
          "enable_graph_mode_decode_no_padding",
          "enable_prefill_piecewise_graph",
+         "enable_onerec_prefill_acl_graph",
          "enable_graph_vmm_pool",
          "max_tokens_for_graph_mode",
          "graph_decode_batch_size_limit",
@@ -59,6 +60,8 @@ class ExecutionConfig final {
   PROPERTY(bool, enable_graph_mode_decode_no_padding) = false;
 
   PROPERTY(bool, enable_prefill_piecewise_graph) = false;
+
+  PROPERTY(bool, enable_onerec_prefill_acl_graph) = false;
 
   PROPERTY(bool, enable_graph_vmm_pool) = true;
 

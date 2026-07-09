@@ -739,7 +739,7 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   param.loraEnableGMM = false;
   param.enableLogN = false;
   param.kvQuant = false;
-  param.enableIntraLayerAddNorm = false;
+  param.enableIntraLayerAddNorm = is_decoder_;
   param.enableInterLayerAddNorm = false;
   param.isDecoder = is_decoder_;
   param.isOneRecEncoder = !is_decoder_;
@@ -1302,6 +1302,13 @@ int64_t NpuOneRecBlockLayerImpl::init_node(
   return atb::NO_ERROR;
 }
 
+void NpuOneRecBlockLayerImpl::set_cross_kv_cache_for_graph(
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache) {
+  cross_k_cache_ = k_cache;
+  cross_v_cache_ = v_cache;
+}
+
 torch::Tensor NpuOneRecBlockLayerImpl::forward(
     torch::Tensor& x,
     torch::Tensor& attn_mask,
@@ -1338,8 +1345,20 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
         auto options = torch::TensorOptions()
                            .dtype(encoder_output->dtype())
                            .device(encoder_output->device());
-        cross_k_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
-        cross_v_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
+        const std::vector<int64_t> expected_shape = {
+            bs, seq_len, kv_hidden_size};
+        if (!cross_k_cache_.defined() ||
+            cross_k_cache_.sizes().vec() != expected_shape ||
+            cross_k_cache_.dtype() != encoder_output->dtype() ||
+            cross_k_cache_.device() != encoder_output->device()) {
+          cross_k_cache_ = torch::empty(expected_shape, options);
+        }
+        if (!cross_v_cache_.defined() ||
+            cross_v_cache_.sizes().vec() != expected_shape ||
+            cross_v_cache_.dtype() != encoder_output->dtype() ||
+            cross_v_cache_.device() != encoder_output->device()) {
+          cross_v_cache_ = torch::empty(expected_shape, options);
+        }
       }
 
       if (use_legacy_onerec_prefill_only_contract()) {

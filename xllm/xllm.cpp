@@ -214,6 +214,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
           execution_config.enable_graph_mode_decode_no_padding())
       .enable_prefill_piecewise_graph(
           execution_config.enable_prefill_piecewise_graph())
+      .enable_onerec_prefill_acl_graph(
+          execution_config.enable_onerec_prefill_acl_graph())
       .max_tokens_for_graph_mode(execution_config.max_tokens_for_graph_mode())
       .max_global_ttft_ms(profile_config.max_global_ttft_ms())
       .max_global_tpot_ms(profile_config.max_global_tpot_ms())

@@ -39,6 +39,11 @@ DEFINE_bool(enable_prefill_piecewise_graph,
             "use eager mode while other operations are captured in device "
             "graphs.");
 
+DEFINE_bool(enable_onerec_prefill_acl_graph,
+            false,
+            "Whether to enable OneRec decoder prefill ACL graph on NPU. "
+            "This is a narrow opt-in path for OneRec prefill graph capture.");
+
 constexpr bool kEnableGraphVmmPoolDefault = true;
 
 DEFINE_bool(enable_graph_vmm_pool,
@@ -82,6 +87,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_mode_decode_no_padding);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefill_piecewise_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_onerec_prefill_acl_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_vmm_pool);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_tokens_for_graph_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(graph_decode_batch_size_limit);
@@ -96,6 +102,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_mode_decode_no_padding);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefill_piecewise_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_onerec_prefill_acl_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_vmm_pool);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_tokens_for_graph_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(graph_decode_batch_size_limit);
@@ -115,6 +122,8 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, enable_graph_mode_decode_no_padding);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_prefill_piecewise_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_onerec_prefill_acl_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph_vmm_pool);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

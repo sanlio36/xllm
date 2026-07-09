@@ -24,6 +24,7 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <sstream>
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
@@ -59,7 +60,350 @@ std::pair<torch::Tensor, torch::Tensor> find_attention_plan_kv_cache(
   return {torch::Tensor(), torch::Tensor()};
 }
 
+void append_tensor_key(std::ostringstream& os,
+                       const char* name,
+                       const torch::Tensor& tensor) {
+  os << '|' << name << ':';
+  if (!tensor.defined()) {
+    os << "undef";
+    return;
+  }
+  os << static_cast<int>(tensor.scalar_type()) << ':';
+  for (const auto dim : tensor.sizes()) {
+    os << dim << ',';
+  }
+}
+
+void append_int_vec_key(std::ostringstream& os,
+                        const char* name,
+                        const std::vector<int32_t>& values) {
+  os << '|' << name << ':';
+  for (const auto value : values) {
+    os << value << ',';
+  }
+}
+
+void append_tensor_vec_key(std::ostringstream& os,
+                           const char* name,
+                           const std::vector<torch::Tensor>& tensors) {
+  os << '|' << name << "_size:" << tensors.size();
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    const std::string item_name = std::string(name) + "_" + std::to_string(i);
+    append_tensor_key(os, item_name.c_str(), tensors[i]);
+  }
+}
+
+int64_t get_onerec_decoder_output_tokens(const torch::Tensor& tokens,
+                                         const ModelInputParams& params,
+                                         const ModelArgs& args) {
+  const auto* onerec_params = params.onerec_params();
+  if (onerec_params != nullptr &&
+      onerec_params->decoder_context_embedding.defined()) {
+    const int64_t hidden_size = std::max<int64_t>(1, args.hidden_size());
+    return onerec_params->decoder_context_embedding.numel() / hidden_size;
+  }
+  return tokens.defined() && tokens.dim() >= 1 ? tokens.size(0) : 0;
+}
+
+std::string build_onerec_prefill_graph_key(const torch::Tensor& tokens,
+                                           const torch::Tensor& positions,
+                                           const ModelInputParams& params,
+                                           const ModelArgs& args) {
+  const auto* onerec_params = params.onerec_params();
+  CHECK(onerec_params != nullptr);
+  std::ostringstream os;
+  os << "onerec_prefill"
+     << "|out_tokens:" << get_onerec_decoder_output_tokens(tokens, params, args)
+     << "|is_first:" << onerec_params->is_first_prefill
+     << "|has_encoder_output:" << onerec_params->has_encoder_output
+     << "|bs:" << onerec_params->bs
+     << "|group_width:" << onerec_params->group_width
+     << "|seq_len:" << onerec_params->seq_len
+     << "|encoder_max_seq_len:" << onerec_params->encoder_max_seq_len
+     << "|num_sequences:" << params.meta.num_sequences
+     << "|q_max_seq_len:" << params.meta.q_max_seq_len
+     << "|kv_max_seq_len:" << params.meta.kv_max_seq_len
+     << "|use_xattn:" << (params.onerec_xattention_params() != nullptr)
+     << "|use_moe:" << args.use_moe();
+  append_tensor_key(os, "tokens", tokens);
+  append_tensor_key(os, "positions", positions);
+  append_tensor_key(
+      os, "decoder_context", onerec_params->decoder_context_embedding);
+  append_tensor_key(
+      os, "encoder_seq_lens_tensor", onerec_params->encoder_seq_lens_tensor);
+  append_tensor_key(
+      os, "cross_kv_cu", onerec_params->cross_attn_kv_cu_seq_lens);
+  append_tensor_key(
+      os, "cross_new_slots", onerec_params->cross_attn_new_cache_slots);
+  append_tensor_key(
+      os, "cross_block_tables", onerec_params->cross_attn_block_tables);
+  append_int_vec_key(os, "encoder_seq_lens", onerec_params->encoder_seq_lens);
+  append_int_vec_key(
+      os, "cross_kv_cu_vec", onerec_params->cross_attn_kv_cu_seq_lens_vec);
+
+  if (const auto* xattn_params = params.onerec_xattention_params()) {
+    append_tensor_vec_key(os, "unshared_k", xattn_params->unshared_k_caches);
+    append_tensor_vec_key(os, "unshared_v", xattn_params->unshared_v_caches);
+    append_tensor_vec_key(os, "shared_k", xattn_params->shared_k_caches);
+    append_tensor_vec_key(os, "shared_v", xattn_params->shared_v_caches);
+    append_tensor_key(os, "beam_width", xattn_params->beam_width_tensor);
+    append_tensor_key(os, "current_round", xattn_params->current_round_tensor);
+  }
+  return os.str();
+}
+
+bool is_onerec_decoder_prefill_graph_candidate(
+    CausalLM* model,
+    const ModelInputParams& params,
+    bool enable_onerec_prefill_acl_graph) {
+  const auto* onerec_params = params.onerec_params();
+  if (!enable_onerec_prefill_acl_graph || onerec_params == nullptr ||
+      !model->supports_onerec_prefill_graph()) {
+    return false;
+  }
+  if (onerec_params->is_encoder_forward ||
+      onerec_params->rec_stage != OneRecModelInputParams::RecStage::PREFILL) {
+    return false;
+  }
+  return params.parallel.layer_synchronizer == nullptr;
+}
+
 }  // namespace
+
+class OneRecPrefillGraphParam {
+ public:
+  OneRecPrefillGraphParam(const ModelArgs& args,
+                          const torch::Device& device,
+                          const runtime::Options& options)
+      : args_(args), device_(device), options_(options) {}
+
+  ModelInputParams update(CausalLM* model,
+                          const torch::Tensor& tokens,
+                          const torch::Tensor& positions,
+                          const ModelInputParams& params,
+                          const torch::Tensor& encoder_output) {
+    copy_tensor(tokens, persistent_tokens_);
+    copy_tensor(positions, persistent_positions_);
+    copy_tensor(encoder_output, persistent_encoder_output_);
+
+    params_for_capture_ = params;
+    auto& onerec_params = params_for_capture_.mutable_onerec_params();
+    copy_tensor(onerec_params.decoder_context_embedding,
+                persistent_decoder_context_embedding_);
+    copy_tensor(onerec_params.encoder_seq_lens_tensor,
+                persistent_encoder_seq_lens_tensor_);
+    copy_tensor(onerec_params.cross_attn_kv_cu_seq_lens,
+                persistent_cross_attn_kv_cu_seq_lens_);
+    copy_tensor(onerec_params.cross_attn_new_cache_slots,
+                persistent_cross_attn_new_cache_slots_);
+    copy_tensor(onerec_params.cross_attn_block_tables,
+                persistent_cross_attn_block_tables_);
+
+    if (persistent_decoder_context_embedding_.defined()) {
+      onerec_params.decoder_context_embedding =
+          persistent_decoder_context_embedding_;
+    }
+    if (persistent_encoder_seq_lens_tensor_.defined()) {
+      onerec_params.encoder_seq_lens_tensor =
+          persistent_encoder_seq_lens_tensor_;
+    }
+    if (persistent_cross_attn_kv_cu_seq_lens_.defined()) {
+      onerec_params.cross_attn_kv_cu_seq_lens =
+          persistent_cross_attn_kv_cu_seq_lens_;
+    }
+    if (persistent_cross_attn_new_cache_slots_.defined()) {
+      onerec_params.cross_attn_new_cache_slots =
+          persistent_cross_attn_new_cache_slots_;
+    }
+    if (persistent_cross_attn_block_tables_.defined()) {
+      onerec_params.cross_attn_block_tables =
+          persistent_cross_attn_block_tables_;
+    }
+
+    ensure_hidden_states(tokens, params);
+    ensure_cross_kv_caches(params, encoder_output);
+    bind_model(model, onerec_params.is_first_prefill);
+    return params_for_capture_;
+  }
+
+  torch::Tensor tokens() const { return persistent_tokens_; }
+  torch::Tensor positions() const { return persistent_positions_; }
+  torch::Tensor hidden_states() const { return hidden_states_; }
+
+  void set_hidden_states(const torch::Tensor& value) {
+    CHECK(hidden_states_.defined());
+    CHECK_EQ(hidden_states_.sizes(), value.sizes());
+    hidden_states_.copy_(value, /*non_blocking=*/true);
+  }
+
+ private:
+  static void copy_tensor(const torch::Tensor& src, torch::Tensor& dst) {
+    if (!src.defined()) {
+      dst = torch::Tensor();
+      return;
+    }
+    if (!dst.defined()) {
+      dst = torch::empty_like(src);
+    }
+    CHECK_EQ(dst.sizes(), src.sizes());
+    CHECK_EQ(dst.scalar_type(), src.scalar_type());
+    CHECK_EQ(dst.device(), src.device());
+    if (src.numel() > 0) {
+      dst.copy_(src, /*non_blocking=*/true);
+    }
+  }
+
+  void ensure_hidden_states(const torch::Tensor& tokens,
+                            const ModelInputParams& params) {
+    const int64_t output_tokens =
+        get_onerec_decoder_output_tokens(tokens, params, args_);
+    CHECK_GT(output_tokens, 0) << "OneRec prefill graph output is empty.";
+    const auto options = torch::TensorOptions()
+                             .dtype(util::parse_dtype(args_.dtype(), device_))
+                             .device(device_);
+    const std::vector<int64_t> shape = {output_tokens, args_.hidden_size()};
+    if (!hidden_states_.defined() || hidden_states_.sizes().vec() != shape) {
+      hidden_states_ = torch::empty(shape, options);
+    }
+  }
+
+  void ensure_cross_kv_caches(const ModelInputParams& params,
+                              const torch::Tensor& encoder_output) {
+    const auto* onerec_params = params.onerec_params();
+    if (onerec_params == nullptr || !onerec_params->is_first_prefill ||
+        !encoder_output.defined()) {
+      return;
+    }
+    const int64_t bs = encoder_output.size(0);
+    const int64_t seq_len = encoder_output.size(1);
+    const auto decoder_kv_heads = args_.decoder_n_kv_heads().has_value()
+                                      ? args_.decoder_n_kv_heads()
+                                      : args_.n_kv_heads();
+    const int64_t kv_heads = decoder_kv_heads.value_or(args_.decoder_n_heads());
+    const int64_t kv_heads_per_rank =
+        kv_heads / std::max<int32_t>(1, options_.tp_size());
+    const int64_t kv_hidden_size = kv_heads_per_rank * args_.decoder_head_dim();
+    const std::vector<int64_t> shape = {bs, seq_len, kv_hidden_size};
+    const auto options = torch::TensorOptions()
+                             .dtype(encoder_output.dtype())
+                             .device(encoder_output.device());
+    const size_t layer_num = static_cast<size_t>(args_.n_layers());
+    cross_k_caches_.resize(layer_num);
+    cross_v_caches_.resize(layer_num);
+    for (size_t i = 0; i < layer_num; ++i) {
+      if (!cross_k_caches_[i].defined() ||
+          cross_k_caches_[i].sizes().vec() != shape ||
+          cross_k_caches_[i].dtype() != encoder_output.dtype() ||
+          cross_k_caches_[i].device() != encoder_output.device()) {
+        cross_k_caches_[i] = torch::empty(shape, options);
+      }
+      if (!cross_v_caches_[i].defined() ||
+          cross_v_caches_[i].sizes().vec() != shape ||
+          cross_v_caches_[i].dtype() != encoder_output.dtype() ||
+          cross_v_caches_[i].device() != encoder_output.device()) {
+        cross_v_caches_[i] = torch::empty(shape, options);
+      }
+    }
+  }
+
+  void bind_model(CausalLM* model, bool bind_cross_kv_caches) {
+    model->bind_onerec_prefill_graph_buffers(
+        persistent_encoder_output_,
+        bind_cross_kv_caches ? cross_k_caches_ : empty_tensor_vec_,
+        bind_cross_kv_caches ? cross_v_caches_ : empty_tensor_vec_);
+  }
+
+  const ModelArgs& args_;
+  torch::Device device_;
+  runtime::Options options_;
+
+  ModelInputParams params_for_capture_;
+  torch::Tensor persistent_tokens_;
+  torch::Tensor persistent_positions_;
+  torch::Tensor persistent_encoder_output_;
+  torch::Tensor persistent_decoder_context_embedding_;
+  torch::Tensor persistent_encoder_seq_lens_tensor_;
+  torch::Tensor persistent_cross_attn_kv_cu_seq_lens_;
+  torch::Tensor persistent_cross_attn_new_cache_slots_;
+  torch::Tensor persistent_cross_attn_block_tables_;
+  std::vector<torch::Tensor> cross_k_caches_;
+  std::vector<torch::Tensor> cross_v_caches_;
+  std::vector<torch::Tensor> empty_tensor_vec_;
+  torch::Tensor hidden_states_;
+};
+
+class OneRecPrefillAclGraph {
+ public:
+  OneRecPrefillAclGraph(const ModelArgs& args,
+                        const torch::Device& device,
+                        const runtime::Options& options)
+      : param_(args, device, options), device_index_(device.index()) {
+    capture_stream_ = c10_npu::getStreamFromPool(true, device_index_);
+  }
+
+  bool capture(CausalLM* model,
+               const torch::Tensor& tokens,
+               const torch::Tensor& positions,
+               std::vector<KVCache>& kv_caches,
+               const ModelInputParams& params,
+               const torch::Tensor& encoder_output) {
+    torch::npu::synchronize();
+    auto params_for_capture =
+        param_.update(model, tokens, positions, params, encoder_output);
+    aclrtStream stream = c10_npu::getCurrentNPUStream(device_index_).stream();
+    aclrtSynchronizeStream(stream);
+
+    bool need_restore_stream = false;
+    {
+      auto& capture_lock =
+          ::xllm::npu::DeviceCaptureLock::get_instance().get_lock(
+              device_index_);
+      std::lock_guard<std::mutex> lock_guard(capture_lock);
+      if (c10_npu::getCurrentNPUStream(device_index_) ==
+          c10_npu::getDefaultNPUStream(device_index_)) {
+        c10_npu::setCurrentNPUStream(capture_stream_.value());
+        aclrtSynchronizeStream(capture_stream_.value().stream());
+        need_restore_stream = true;
+      }
+
+      graph_.capture_begin(
+          {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+      auto forward_result = model->forward(
+          param_.tokens(), param_.positions(), kv_caches, params_for_capture);
+      param_.set_hidden_states(forward_result.hidden_states);
+      graph_.capture_end();
+
+      if (need_restore_stream) {
+        c10_npu::setCurrentNPUStream(
+            c10_npu::getDefaultNPUStream(device_index_));
+      }
+    }
+    aclrtSynchronizeStream(stream);
+    graph_.replay();
+    captured_ = true;
+    return true;
+  }
+
+  ModelOutput replay(CausalLM* model,
+                     const torch::Tensor& tokens,
+                     const torch::Tensor& positions,
+                     const ModelInputParams& params,
+                     const torch::Tensor& encoder_output) {
+    CHECK(captured_);
+    param_.update(model, tokens, positions, params, encoder_output);
+    graph_.replay();
+    return ModelOutput(param_.hidden_states());
+  }
+
+  ModelOutput output() const { return ModelOutput(param_.hidden_states()); }
+
+ private:
+  OneRecPrefillGraphParam param_;
+  c10_npu::NPUGraph graph_;
+  std::optional<c10_npu::NPUStream> capture_stream_;
+  c10::DeviceIndex device_index_;
+  bool captured_ = false;
+};
 
 bool AclGraph::capture(CausalLM* model,
                        const runtime::Options& options,
@@ -359,10 +703,99 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
       args_, device_, options_, need_update_attn_mask, is_hybrid_linear_attn);
 }
 
+AclGraphExecutorImpl::~AclGraphExecutorImpl() = default;
+
 ForwardInput AclGraphExecutorImpl::prepare_inputs(Batch& batch) {
   // Prepare inputs for workers
   return batch.prepare_forward_input(
       options_.num_decoding_tokens(), 0, args_, options_.cp_size());
+}
+
+ModelOutput AclGraphExecutorImpl::run_onerec_prefill_graph(
+    const torch::Tensor& tokens,
+    const torch::Tensor& positions,
+    std::vector<KVCache>& kv_caches,
+    const ModelInputParams& params) {
+  const auto* onerec_params = params.onerec_params();
+  CHECK(onerec_params != nullptr);
+  const int64_t output_tokens =
+      get_onerec_decoder_output_tokens(tokens, params, args_);
+  if (output_tokens <= 0) {
+    if (onerec_params->is_first_prefill) {
+      onerec_last_first_prefill_graph_ready_ = false;
+    }
+    COUNTER_INC(num_model_execution_total_eager);
+    return model_->forward(tokens, positions, kv_caches, params);
+  }
+  if (options_.max_tokens_for_graph_mode() > 0 &&
+      output_tokens > options_.max_tokens_for_graph_mode()) {
+    VLOG(kGraphExecutorLogVerboseLevel)
+        << "OneRec prefill output token count " << output_tokens
+        << " exceeds max_tokens_for_graph_mode ("
+        << options_.max_tokens_for_graph_mode()
+        << "), falling back to eager mode";
+    if (onerec_params->is_first_prefill) {
+      onerec_last_first_prefill_graph_ready_ = false;
+    }
+    COUNTER_INC(num_model_execution_total_eager);
+    return model_->forward(tokens, positions, kv_caches, params);
+  }
+
+  torch::Tensor encoder_output;
+  if (onerec_params->has_encoder_output) {
+    encoder_output = model_->get_onerec_graph_encoder_output();
+    if (!encoder_output.defined()) {
+      LOG_FIRST_N(WARNING, 1)
+          << "Falling back to eager mode because OneRec encoder output is "
+             "not available for decoder prefill ACL graph.";
+      if (onerec_params->is_first_prefill) {
+        onerec_last_first_prefill_graph_ready_ = false;
+      }
+      COUNTER_INC(num_model_execution_total_eager);
+      return model_->forward(tokens, positions, kv_caches, params);
+    }
+  }
+
+  const std::string graph_key =
+      build_onerec_prefill_graph_key(tokens, positions, params, args_);
+  std::lock_guard<std::mutex> graph_lock(onerec_prefill_graph_mutex_);
+  if (!onerec_params->is_first_prefill &&
+      !onerec_last_first_prefill_graph_ready_) {
+    COUNTER_INC(num_model_execution_total_eager);
+    return model_->forward(tokens, positions, kv_caches, params);
+  }
+  auto it = onerec_prefill_graphs_.find(graph_key);
+  if (it != onerec_prefill_graphs_.end()) {
+    VLOG(kGraphExecutorLogVerboseLevel)
+        << "AclGraphExecutorImpl::run() in OneRec prefill replay mode";
+    if (onerec_params->is_first_prefill) {
+      onerec_last_first_prefill_graph_ready_ = true;
+    }
+    return it->second->replay(
+        model_, tokens, positions, params, encoder_output);
+  }
+
+  auto graph =
+      std::make_unique<OneRecPrefillAclGraph>(args_, device_, options_);
+  VLOG(kGraphExecutorLogVerboseLevel)
+      << "AclGraphExecutorImpl::run() in OneRec prefill capture mode";
+  const bool capture_success = graph->capture(
+      model_, tokens, positions, kv_caches, params, encoder_output);
+  if (capture_success) {
+    LOG(INFO) << "Lazy capturing OneRec prefill ACL graph done, key length: "
+              << graph_key.size() << ", output_tokens: " << output_tokens
+              << ", is_first_prefill: " << onerec_params->is_first_prefill;
+    auto result = graph->output();
+    onerec_prefill_graphs_[graph_key] = std::move(graph);
+    if (onerec_params->is_first_prefill) {
+      onerec_last_first_prefill_graph_ready_ = true;
+    }
+    return result;
+  }
+
+  LOG(FATAL) << "Failed to capture OneRec prefill ACL graph, output_tokens: "
+             << output_tokens;
+  return ModelOutput();
 }
 
 // Main execution method with graph optimization for decode phase
@@ -386,6 +819,19 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
            << " in_spec_verify_phase: " << in_spec_verify_phase
            << " q_max_seq_len: " << params_single.meta.q_max_seq_len
            << " n_layers: " << args_.n_layers();
+
+  if (is_onerec_decoder_prefill_graph_candidate(
+          model_, params_single, options_.enable_onerec_prefill_acl_graph())) {
+    return run_onerec_prefill_graph(
+        tokens_tensor, positions_tensor, kv_caches, params_single);
+  }
+  if (const auto* onerec_params = params_single.onerec_params();
+      onerec_params != nullptr &&
+      onerec_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL &&
+      !onerec_params->is_encoder_forward && onerec_params->is_first_prefill) {
+    onerec_last_first_prefill_graph_ready_ = false;
+  }
+
   if ((!in_decoding_phase && !in_spec_verify_phase) || args_.n_layers() == 1) {
     VLOG(kGraphExecutorLogVerboseLevel)
         << "AclGraphExecutorImpl::run() in eager mode";

@@ -88,6 +88,8 @@ void WorkerServer::create_server(const runtime::Options& options,
             options.enable_graph_mode_decode_no_padding())
         .enable_prefill_piecewise_graph(
             options.enable_prefill_piecewise_graph())
+        .enable_onerec_prefill_acl_graph(
+            options.enable_onerec_prefill_acl_graph())
         .max_tokens_for_graph_mode(options.max_tokens_for_graph_mode());
   }
 #if defined(USE_NPU)
@@ -267,6 +269,10 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
       std::to_string(options.enable_prefill_piecewise_graph());
   const char* enable_prefill_piecewise_graph_ptr =
       enable_prefill_piecewise_graph_str.c_str();
+  std::string enable_onerec_prefill_acl_graph_str =
+      std::to_string(options.enable_onerec_prefill_acl_graph());
+  const char* enable_onerec_prefill_acl_graph_ptr =
+      enable_onerec_prefill_acl_graph_str.c_str();
   std::string max_tokens_for_graph_mode_str =
       std::to_string(options.max_tokens_for_graph_mode());
   const char* max_tokens_for_graph_mode_ptr =
@@ -310,6 +316,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         enable_graph_ptr,
                         enable_graph_mode_decode_no_padding_ptr,
                         enable_prefill_piecewise_graph_ptr,
+                        enable_onerec_prefill_acl_graph_ptr,
                         max_tokens_for_graph_mode_ptr,
                         max_encoder_cache_size_ptr,
                         nullptr};

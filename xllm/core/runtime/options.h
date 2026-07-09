@@ -236,6 +236,8 @@ struct Options {
   PROPERTY(bool, enable_graph_mode_decode_no_padding) = false;
   // enable piecewise graph for prefill
   PROPERTY(bool, enable_prefill_piecewise_graph) = false;
+  // enable OneRec decoder prefill ACL graph
+  PROPERTY(bool, enable_onerec_prefill_acl_graph) = false;
   // maximum number of tokens for graph execution
   PROPERTY(int32_t, max_tokens_for_graph_mode) = 2048;
 

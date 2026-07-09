@@ -81,6 +81,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      bool enable_graph,
                                      bool enable_graph_mode_decode_no_padding,
                                      bool enable_prefill_piecewise_graph,
+                                     bool enable_onerec_prefill_acl_graph,
                                      int32_t max_tokens_for_graph_mode,
                                      int64_t max_encoder_cache_size) {
   // TODO: pass whole xllm::runtime::Options here from main process.
@@ -109,6 +110,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
       .enable_graph(enable_graph)
       .enable_graph_mode_decode_no_padding(enable_graph_mode_decode_no_padding)
       .enable_prefill_piecewise_graph(enable_prefill_piecewise_graph)
+      .enable_onerec_prefill_acl_graph(enable_onerec_prefill_acl_graph)
       .max_tokens_for_graph_mode(max_tokens_for_graph_mode)
       .task_type(task_type)
       .max_encoder_cache_size(max_encoder_cache_size);

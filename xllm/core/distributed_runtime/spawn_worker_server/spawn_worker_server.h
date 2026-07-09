@@ -51,6 +51,7 @@ class SpawnWorkerServer final {
                              bool enable_graph,
                              bool enable_graph_mode_decode_no_padding,
                              bool enable_prefill_piecewise_graph,
+                             bool enable_onerec_prefill_acl_graph,
                              int32_t max_tokens_for_graph_mode,
                              int64_t max_encoder_cache_size);
 
