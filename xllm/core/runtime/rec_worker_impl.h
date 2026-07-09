@@ -179,8 +179,14 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     void allocate_unshared_kv_caches();
 
+    void allocate_shared_kv_caches();
+
     void prepare_unshared_kv_caches_for_input(
         const ForwardInput& inputs,
+        OneRecXAttentionParams& onerec_params);
+
+    void prepare_shared_kv_caches_for_input(
+        int64_t shared_kv_tokens,
         OneRecXAttentionParams& onerec_params);
 
     void execute_cache_select(const torch::Tensor& out_token_index,
@@ -195,11 +201,16 @@ class RecWorkerImpl : public LLMWorkerImpl {
     std::unique_ptr<RecConstrainedDecoding> constrained_decoding_;
     std::unique_ptr<ThreadPool> filter_mask_threadpool_;
     RecConstraintDeviceTensors constraint_device_tensors_;
+    std::vector<torch::Tensor> cached_shared_k_caches_;
+    std::vector<torch::Tensor> cached_shared_v_caches_;
     std::vector<torch::Tensor> cached_unshared_k_caches_;
     std::vector<torch::Tensor> cached_unshared_v_caches_;
     int32_t max_seqs_per_batch_ = 0;
+    int32_t max_tokens_per_batch_ = 0;
     int32_t beam_width_ = 1;
     int32_t max_decode_step_ = 0;
+    torch::Tensor beam_width_tensor_;
+    torch::Tensor current_round_tensor_;
   };
 
   class LlmRecWithMmDataWorkPipeline final : public RecWorkPipeline {
