@@ -83,6 +83,10 @@ TEST(DeepseekV32CppTemplate, ToolsInjectionFormat) {
   tool.function.description = "query weather";
   tool.function.parameters = nlohmann::json{
       {"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}};
+  tool.function.ordered_parameters =
+      nlohmann::ordered_json{{"type", "object"},
+                             {"properties", {{"city", {{"type", "string"}}}}},
+                             {"required", nlohmann::ordered_json::array()}};
   tools.push_back(tool);
 
   nlohmann::ordered_json kwargs = nlohmann::json::object();
@@ -94,6 +98,10 @@ TEST(DeepseekV32CppTemplate, ToolsInjectionFormat) {
   EXPECT_NE(prompt->find("get_weather"), std::string::npos);
   EXPECT_NE(prompt->find("<functions>"), std::string::npos);
   EXPECT_NE(prompt->find("</functions>"), std::string::npos);
+  EXPECT_NE(
+      prompt->find(
+          R"({"name": "get_weather", "description": "query weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": []}})"),
+      std::string::npos);
   // User message after tools
   EXPECT_NE(prompt->find("<｜User｜>weather in beijing"
                          "<｜Assistant｜>"),

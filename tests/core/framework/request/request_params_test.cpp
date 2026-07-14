@@ -18,6 +18,9 @@ limitations under the License.
 #include <google/protobuf/util/json_util.h>
 #include <gtest/gtest.h>
 
+#include <string>
+#include <vector>
+
 #include "anthropic.pb.h"
 #include "chat.pb.h"
 #include "completion.pb.h"
@@ -100,6 +103,27 @@ TEST(RequestParamsTest, ChatBeamSearchKeepsExplicitZeroTopLogprobs) {
 
   EXPECT_TRUE(params.logprobs);
   EXPECT_EQ(params.top_logprobs, 0);
+}
+
+TEST(RequestParamsTest, ChatToolPreservesOrderedParametersJson) {
+  proto::ChatRequest request;
+  auto* tool = request.add_tools();
+  tool->set_type("function");
+  tool->mutable_function()->set_name("submit");
+  tool->mutable_function()->set_xllm_parameters_json(
+      R"({"type":"object","properties":{},"required":[]})");
+
+  RequestParams params(request, "", "");
+
+  ASSERT_EQ(params.tools.size(), 1);
+  const JsonFunction& function = params.tools[0].function;
+  ASSERT_TRUE(function.ordered_parameters.has_value());
+  std::vector<std::string> keys;
+  keys.reserve(function.ordered_parameters->size());
+  for (const auto& item : function.ordered_parameters->items()) {
+    keys.emplace_back(item.key());
+  }
+  EXPECT_EQ(keys, (std::vector<std::string>{"type", "properties", "required"}));
 }
 
 TEST(RequestParamsTest, AnthropicPreservesIgnoreEos) {

@@ -9,6 +9,8 @@ message Function {
   string name = 1;
   string description = 2;
   google.protobuf.Struct parameters = 3;
+  // Internal transport for preserving JSON object key order from HTTP input.
+  optional string xllm_parameters_json = 4;
 }
 
 message Tool {

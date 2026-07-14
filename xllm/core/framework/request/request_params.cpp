@@ -303,10 +303,22 @@ std::vector<xllm::JsonTool> parse_tools_from_proto(
     json_tool.function.name = proto_function.name();
     json_tool.function.description = proto_function.description();
 
-    if (proto_function.has_parameters()) {
+    if (proto_function.has_xllm_parameters_json()) {
+      nlohmann::ordered_json ordered_parameters =
+          nlohmann::ordered_json::parse(proto_function.xllm_parameters_json(),
+                                        /*cb=*/nullptr,
+                                        /*allow_exceptions=*/false);
+      if (!ordered_parameters.is_discarded()) {
+        json_tool.function.parameters = ordered_parameters;
+        json_tool.function.ordered_parameters = std::move(ordered_parameters);
+      }
+    }
+    if (json_tool.function.parameters.is_null() &&
+        proto_function.has_parameters()) {
       json_tool.function.parameters =
           proto_struct_to_json(proto_function.parameters());
-    } else {
+    }
+    if (json_tool.function.parameters.is_null()) {
       json_tool.function.parameters = nlohmann::json::object();
     }
 

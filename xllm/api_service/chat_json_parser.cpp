@@ -22,12 +22,14 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
+constexpr const char* kXllmParametersJson = "xllm_parameters_json";
+
+Status normalize_tool_choice(nlohmann::ordered_json* json, bool* modified) {
   if (!json->contains("tool_choice")) {
     return Status();
   }
 
-  nlohmann::json& tool_choice = (*json)["tool_choice"];
+  nlohmann::ordered_json& tool_choice = (*json)["tool_choice"];
   if (tool_choice.is_string()) {
     return Status();
   }
@@ -53,7 +55,7 @@ Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
                   "Function tool_choice must contain a function object.");
   }
 
-  const nlohmann::json& function = tool_choice["function"];
+  const nlohmann::ordered_json& function = tool_choice["function"];
   if (!function.contains("name") || !function["name"].is_string() ||
       function["name"].get_ref<const std::string&>().empty()) {
     return Status(
@@ -61,12 +63,35 @@ Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
         "Function tool_choice must contain a non-empty function.name string.");
   }
 
-  nlohmann::json normalized_tool_choice = {
+  nlohmann::ordered_json normalized_tool_choice = {
       {"type", "function"},
       {"function", {{"name", function["name"].get<std::string>()}}}};
   tool_choice = normalized_tool_choice.dump();
   *modified = true;
   return Status();
+}
+
+bool preserve_tool_parameters_order(nlohmann::ordered_json* json) {
+  if (!json->contains("tools") || !(*json)["tools"].is_array()) {
+    return false;
+  }
+
+  bool modified = false;
+  for (nlohmann::ordered_json& tool : (*json)["tools"]) {
+    if (!tool.is_object() || !tool.contains("function") ||
+        !tool["function"].is_object()) {
+      continue;
+    }
+
+    nlohmann::ordered_json& function = tool["function"];
+    if (!function.contains("parameters")) {
+      continue;
+    }
+
+    function[kXllmParametersJson] = function["parameters"].dump();
+    modified = true;
+  }
+  return modified;
 }
 
 }  // namespace
@@ -88,8 +113,8 @@ const ChatJsonParser& ChatJsonParser::anthropic() {
 std::pair<Status, std::string> VlmChatJsonParser::preprocess(
     std::string json_str) const {
   try {
-    auto json = nlohmann::json::parse(json_str);
-    bool modified = false;
+    nlohmann::ordered_json json = nlohmann::ordered_json::parse(json_str);
+    bool modified = preserve_tool_parameters_order(&json);
     Status status = normalize_tool_choice(&json, &modified);
     if (!status.ok()) {
       return {status, ""};
@@ -133,8 +158,8 @@ std::pair<Status, std::string> VlmChatJsonParser::preprocess(
 std::pair<Status, std::string> LlmChatJsonParser::preprocess(
     std::string json_str) const {
   try {
-    auto json = nlohmann::json::parse(json_str);
-    bool modified = false;
+    nlohmann::ordered_json json = nlohmann::ordered_json::parse(json_str);
+    bool modified = preserve_tool_parameters_order(&json);
     Status status = normalize_tool_choice(&json, &modified);
     if (!status.ok()) {
       return {status, ""};

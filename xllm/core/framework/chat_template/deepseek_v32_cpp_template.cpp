@@ -109,17 +109,46 @@ constexpr const char* kRoleAssistant = "assistant";
 constexpr const char* kThinkingModeThinking = "thinking";
 constexpr const char* kThinkingModeChat = "chat";
 
+std::string add_python_json_separator_spaces(const std::string& compact_json) {
+  std::string formatted_json;
+  formatted_json.reserve(compact_json.size());
+  bool in_string = false;
+  bool escaped = false;
+  for (const char ch : compact_json) {
+    formatted_json += ch;
+    if (in_string) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+
+    if (ch == '"') {
+      in_string = true;
+    } else if (ch == ',' || ch == ':') {
+      formatted_json += ' ';
+    }
+  }
+  return formatted_json;
+}
+
 std::string to_json(const nlohmann::ordered_json& value) {
   try {
-    return value.dump(/*indent=*/-1,
-                      /*indent_char=*/' ',
-                      /*ensure_ascii=*/false,
-                      nlohmann::json::error_handler_t::replace);
+    return add_python_json_separator_spaces(
+        value.dump(/*indent=*/-1,
+                   /*indent_char=*/' ',
+                   /*ensure_ascii=*/false,
+                   nlohmann::json::error_handler_t::replace));
   } catch (const std::exception&) {
-    return value.dump(/*indent=*/-1,
-                      /*indent_char=*/' ',
-                      /*ensure_ascii=*/true,
-                      nlohmann::json::error_handler_t::replace);
+    return add_python_json_separator_spaces(
+        value.dump(/*indent=*/-1,
+                   /*indent_char=*/' ',
+                   /*ensure_ascii=*/true,
+                   nlohmann::json::error_handler_t::replace));
   }
 }
 
@@ -339,7 +368,11 @@ nlohmann::ordered_json normalize_messages(
       nlohmann::ordered_json function;
       function["name"] = tool.function.name;
       function["description"] = tool.function.description;
-      function["parameters"] = tool.function.parameters;
+      if (tool.function.ordered_parameters.has_value()) {
+        function["parameters"] = tool.function.ordered_parameters.value();
+      } else {
+        function["parameters"] = tool.function.parameters;
+      }
       openai_tool["function"] = std::move(function);
       tools_json.emplace_back(std::move(openai_tool));
     }

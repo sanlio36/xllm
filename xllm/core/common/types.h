@@ -322,6 +322,8 @@ struct JsonFunction {
   std::string name;
   std::string description;
   nlohmann::json parameters;
+  // Preserves HTTP JSON key order for prompt rendering when available.
+  std::optional<nlohmann::ordered_json> ordered_parameters;
 
   JsonFunction() = default;
   JsonFunction(const std::string& func_name,

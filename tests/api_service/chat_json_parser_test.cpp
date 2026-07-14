@@ -307,6 +307,41 @@ TEST_F(PreprocessChatJsonTest, OpenAIObjectToolChoiceRemapped) {
   EXPECT_EQ(nlohmann::json::parse(request.tool_choice()), expected_tool_choice);
 }
 
+TEST_F(PreprocessChatJsonTest, ToolParametersOrderPreservedForProtobuf) {
+  std::string input = R"({
+    "messages": [{"role": "user", "content": "Hello"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "submit",
+        "description": "Submit the final answer.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    }]
+  })";
+
+  LlmChatJsonParser parser;
+  auto [status, processed_json] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
+
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status = google::protobuf::util::JsonStringToMessage(
+      processed_json, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+  ASSERT_EQ(request.tools_size(), 1);
+
+  const proto::Function& function = request.tools(0).function();
+  ASSERT_TRUE(function.has_xllm_parameters_json());
+  EXPECT_EQ(function.xllm_parameters_json(),
+            R"({"type":"object","properties":{},"required":[]})");
+}
+
 TEST_F(PreprocessChatJsonTest, InvalidObjectToolChoiceReturnsError) {
   std::string input = R"({
     "messages": [{"role": "user", "content": "Hello"}],
