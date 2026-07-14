@@ -21,9 +21,14 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "common/device_monitor.h"
 #include "common/metrics.h"
@@ -41,12 +46,15 @@ limitations under the License.
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
 #include "models/model_registry.h"
+#include "util/tensor_helper.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
 namespace xllm {
 
 namespace {
+
+constexpr int64_t kPrefillTopTokenCount = 3;
 
 void wait_input_ready_events(const ForwardInput& input, const Stream& stream) {
   CHECK(stream.wait_event(input.metadata_ready_event))
@@ -60,6 +68,65 @@ StreamEventPtr record_current_stream_event(const Device& device) {
     stream->synchronize();
   }
   return event;
+}
+
+void log_prefill_sampling_top_tokens(const ForwardInput& input,
+                                     const SampleOutput& sample_output) {
+  const BatchForwardType& forward_type =
+      input.input_params.meta.batch_forward_type;
+  if (!forward_type.no_decode() || !sample_output.probs.defined() ||
+      sample_output.probs.numel() == 0) {
+    return;
+  }
+
+  if (sample_output.probs.dim() != 2) {
+    LOG(WARNING) << "Skip prefill sampling top tokens log for batch_id: "
+                 << input.input_params.meta.batch_id
+                 << ", expected 2-D probabilities but got "
+                 << sample_output.probs.sizes();
+    return;
+  }
+
+  const int64_t top_token_count =
+      std::min(kPrefillTopTokenCount, sample_output.probs.size(/*dim=*/1));
+  if (top_token_count == 0) {
+    return;
+  }
+
+  auto [top_probs, top_token_ids] =
+      sample_output.probs.topk(top_token_count, /*dim=*/-1);
+  top_probs = safe_to(top_probs, torch::kCPU).to(torch::kFloat32).contiguous();
+  top_token_ids =
+      safe_to(top_token_ids, torch::kCPU).to(torch::kInt64).contiguous();
+
+  const float* top_probs_data = top_probs.data_ptr<float>();
+  const int64_t* top_token_ids_data = top_token_ids.data_ptr<int64_t>();
+  const int64_t num_samples = top_probs.size(/*dim=*/0);
+  const std::vector<std::string>& request_ids =
+      input.input_params.embedding.request_ids;
+  for (int64_t sample_idx = 0; sample_idx < num_samples; ++sample_idx) {
+    std::ostringstream top_tokens_stream;
+    top_tokens_stream << std::fixed << std::setprecision(6) << "[";
+    for (int64_t rank = 0; rank < top_token_count; ++rank) {
+      if (rank > 0) {
+        top_tokens_stream << ", ";
+      }
+      const int64_t offset = sample_idx * top_token_count + rank;
+      top_tokens_stream << "{token_id: " << top_token_ids_data[offset]
+                        << ", probability: " << top_probs_data[offset] << "}";
+    }
+    top_tokens_stream << "]";
+
+    const std::string request_id =
+        sample_idx < static_cast<int64_t>(request_ids.size())
+            ? request_ids[static_cast<size_t>(sample_idx)]
+            : "";
+    LOG(INFO) << "prefill sampling top3, batch_id: "
+              << input.input_params.meta.batch_id
+              << ", request_id: " << request_id
+              << ", sample_idx: " << sample_idx
+              << ", top_tokens: " << top_tokens_stream.str();
+  }
 }
 
 }  // namespace
@@ -302,6 +369,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.max_top_logprobs = sampling_params.max_top_logprobs;
     if (!input.skip_sampling_for_logits_only) {
       auto sample_output = sampler_->forward(logits, sampling_params);
+      log_prefill_sampling_top_tokens(input, sample_output);
 
       // beam search kernel
       BeamSearchOutput beam_search_output;
