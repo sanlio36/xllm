@@ -166,6 +166,8 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   int32_t layer_id_ = 0;
 
   std::unordered_map<std::string, std::vector<torch::Tensor>> experts_weights_;
+  torch::Tensor fused_expert_weight1_scale_;
+  torch::Tensor fused_expert_weight2_scale_;
   std::mutex experts_mutex_;
   int32_t start_expert_id_ = 0;
   int32_t end_expert_id_ = 0;

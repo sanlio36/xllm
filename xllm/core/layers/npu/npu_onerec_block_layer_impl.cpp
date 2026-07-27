@@ -724,10 +724,8 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   param.isBF16 = args.dtype() == "bfloat16";
   param.isPack = true;
   param.supportSwiGLU = true;
-  // Shared experts in the current OneRec MoE path are loaded as bf16/fp
-  // weights. Do not force the dedicated SwigluQuant scale contract unless the
-  // shared expert path is explicitly wired for dynamic quant.
-  param.enableSwiGLUQuantForSharedExperts = false;
+  param.enableSwiGLUQuantForSharedExperts =
+      quantize_type_ == "w8a8_dynamic" && is_decoder_;
   param.supportLcoc = is_prefill;
   param.supportSpeculate = false;
   param.enableSplitFuse = FLAGS_enable_chunked_prefill && is_prefill;
@@ -796,6 +794,7 @@ void NpuOneRecBlockLayerImpl::param_from_args(
 
   param.use_moe = args.use_moe() && is_decoder_;
   if (param.use_moe) {
+    const bool enable_w8a8_dynamic = quantize_type_ == "w8a8_dynamic";
     ep_size_ = 1;
     const int32_t ep_rank = 0;
     ep_local_tp_size_ = parallel_args.world_size() / ep_size_;
@@ -820,10 +819,16 @@ void NpuOneRecBlockLayerImpl::param_from_args(
     param.moe_config->moe_num_shared_experts = args.n_shared_experts();
     param.moe_config->enable_integrated_softmax_topk = true;
 
-    param.moeLinearQuantType = {atb_speed::common::LinearType::FP,
-                                atb_speed::common::LinearType::FP,
-                                atb_speed::common::LinearType::INVALID,
-                                atb_speed::common::LinearType::FP};
+    param.enableGMMSwigluQuant = enable_w8a8_dynamic;
+    param.moePackQuantType = static_cast<int>(
+        enable_w8a8_dynamic ? PackType::ALL_W8A8_DYNAMIC : PackType::ALL_FP);
+    param.moeLinearQuantType = {
+        atb_speed::common::LinearType::FP,
+        enable_w8a8_dynamic ? atb_speed::common::LinearType::INT
+                            : atb_speed::common::LinearType::FP,
+        atb_speed::common::LinearType::INVALID,
+        enable_w8a8_dynamic ? atb_speed::common::LinearType::INT
+                            : atb_speed::common::LinearType::FP};
   }
 }
 
@@ -927,6 +932,30 @@ bool NpuOneRecBlockLayerImpl::validate_decoder_moe_weights(
     if (!gate_defined) {
       LOG(ERROR) << "Missing OneRec MoE tensor for local expert " << i << " in "
                  << prefix << " (layer " << layer_id_ << ").";
+      return false;
+    }
+  }
+
+  if (quantize_type_ == "w8a8_dynamic") {
+    const auto all_defined = [this](const char* key) {
+      const auto it = experts_weights_.find(key);
+      return it != experts_weights_.end() &&
+             it->second.size() ==
+                 static_cast<size_t>(num_experts_per_partition_) &&
+             std::all_of(
+                 it->second.begin(),
+                 it->second.end(),
+                 [](const torch::Tensor& tensor) { return tensor.defined(); });
+    };
+    const bool has_gate_up_scale = fused_expert_weight1_scale_.defined() ||
+                                   (all_defined("gate_proj.weight_scale") &&
+                                    all_defined("up_proj.weight_scale"));
+    const bool has_down_scale = fused_expert_weight2_scale_.defined() ||
+                                all_defined("down_proj.weight_scale");
+    if (!has_gate_up_scale || !has_down_scale) {
+      LOG(ERROR) << "Missing OneRec W8A8 expert scale tensors in " << prefix
+                 << ": gate_up=" << has_gate_up_scale
+                 << ", down=" << has_down_scale << ", layer " << layer_id_;
       return false;
     }
   }
@@ -1105,6 +1134,8 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
       }
     }
     shared_expert_weights_map_.clear();
+    fused_expert_weight1_scale_ = torch::Tensor();
+    fused_expert_weight2_scale_ = torch::Tensor();
     shared_expert_gate_weights_.clear();
     shared_expert_up_weights_.clear();
     shared_expert_down_weights_.clear();
@@ -1924,17 +1955,40 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
   (void)state_dict;
   std::lock_guard<std::mutex> lock(experts_mutex_);
 
+  if (absl::EndsWith(name, ".ffn.experts.weight1.scale")) {
+    fused_expert_weight1_scale_ = tensor;
+    return;
+  }
+  if (absl::EndsWith(name, ".ffn.experts.weight2.scale")) {
+    fused_expert_weight2_scale_ = tensor;
+    return;
+  }
+
   auto unpack_fused_weight1 = [&](const torch::Tensor& fused_weight) {
     if (num_experts_per_partition_ <= 0 || fused_weight.dim() != 2) {
       LOG(WARNING) << "Invalid OneRec fused expert weight1 shape for " << name
                    << ": " << fused_weight.sizes();
       return;
     }
+    const int64_t num_experts = num_experts_per_partition_;
+    CHECK_EQ(fused_weight.size(1) % num_experts, 0)
+        << "OneRec fused expert weight1 output dim must be divisible by the "
+           "number of experts for "
+        << name << ", got shape " << fused_weight.sizes() << " and experts "
+        << num_experts;
+    const int64_t gate_up_size = fused_weight.size(1) / num_experts;
+    CHECK_EQ(gate_up_size % 2, 0)
+        << "OneRec fused expert weight1 per-expert output dim must be even for "
+        << name << ", got shape " << fused_weight.sizes();
+    CHECK(prefill_param_.moe_config != nullptr);
+    CHECK_EQ(gate_up_size, 2 * prefill_param_.moe_config->moe_inter_dim)
+        << "OneRec fused expert weight1 does not match moe_inter_dim for "
+        << name << ", got shape " << fused_weight.sizes();
+
+    // [H, E * 2I] is only the checkpoint's outer shape. Its flat storage is
+    // expert-major and must be interpreted as [E, H, 2I].
     torch::Tensor reshaped = fused_weight.contiguous().view(
-        {num_experts_per_partition_, fused_weight.size(0), -1});
-    CHECK_EQ(reshaped.size(2) % 2, 0)
-        << "OneRec fused expert weight1 last dim must be even for " << name
-        << ", got shape " << fused_weight.sizes();
+        {num_experts, fused_weight.size(0), gate_up_size});
     std::vector<torch::Tensor> gate_up_chunks =
         reshaped.chunk(/*chunks=*/2, /*dim=*/-1);
     for (int32_t i = 0; i < num_experts_per_partition_; ++i) {
@@ -1955,6 +2009,17 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
                    << ": " << fused_weight.sizes();
       return;
     }
+    CHECK_EQ(fused_weight.size(0) % num_experts_per_partition_, 0)
+        << "OneRec fused expert weight2 input dim must be divisible by the "
+           "number of experts for "
+        << name << ", got shape " << fused_weight.sizes() << " and experts "
+        << num_experts_per_partition_;
+    CHECK(prefill_param_.moe_config != nullptr);
+    CHECK_EQ(fused_weight.size(0) / num_experts_per_partition_,
+             prefill_param_.moe_config->moe_inter_dim)
+        << "OneRec fused expert weight2 does not match moe_inter_dim for "
+        << name << ", got shape " << fused_weight.sizes();
+    // The checkpoint packs weight2 as [E * I, H].
     auto reshaped = fused_weight.contiguous().view(
         {num_experts_per_partition_, -1, fused_weight.size(1)});
     for (int32_t i = 0; i < num_experts_per_partition_; ++i) {
@@ -1966,11 +2031,11 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
               << fused_weight.sizes() << "]";
   };
 
-  if (absl::StrContains(name, ".ffn.experts.weight1")) {
+  if (absl::EndsWith(name, ".ffn.experts.weight1")) {
     unpack_fused_weight1(tensor);
     return;
   }
-  if (absl::StrContains(name, ".ffn.experts.weight2")) {
+  if (absl::EndsWith(name, ".ffn.experts.weight2")) {
     unpack_fused_weight2(tensor);
     return;
   }
@@ -2031,15 +2096,20 @@ void NpuOneRecBlockLayerImpl::process_shared_expert_weights(
   (void)state_dict;
   torch::Tensor tmp_tensor = tensor.to(device_);
 
+  const bool is_scale = absl::EndsWith(name, ".weight.scale") ||
+                        absl::EndsWith(name, ".weight_scale");
+  const char* suffix = is_scale ? "weight_scale" : "weight";
+
   std::string canonical_name;
-  if (absl::StrContains(name, "gate_proj") || absl::StrContains(name, "w1")) {
-    canonical_name = "gate_proj.weight";
-  } else if (absl::StrContains(name, "up_proj") ||
-             absl::StrContains(name, "w3")) {
-    canonical_name = "up_proj.weight";
-  } else if (absl::StrContains(name, "down_proj") ||
-             absl::StrContains(name, "w2")) {
-    canonical_name = "down_proj.weight";
+  if (absl::StrContains(name, ".gate_proj.") ||
+      absl::StrContains(name, ".w1.")) {
+    canonical_name = std::string("gate_proj.") + suffix;
+  } else if (absl::StrContains(name, ".up_proj.") ||
+             absl::StrContains(name, ".w3.")) {
+    canonical_name = std::string("up_proj.") + suffix;
+  } else if (absl::StrContains(name, ".down_proj.") ||
+             absl::StrContains(name, ".w2.")) {
+    canonical_name = std::string("down_proj.") + suffix;
   } else {
     return;
   }
@@ -2139,16 +2209,25 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
     return;
   }
 
+  const bool enable_w8a8_dynamic = quantize_type_ == "w8a8_dynamic";
   auto merged_gate_up =
       merge_experts_weights(experts_weights_["gate_proj.weight"],
                             experts_weights_["up_proj.weight"],
-                            /*transpose=*/false);
+                            /*transpose=*/enable_w8a8_dynamic);
   CHECK(merged_gate_up.defined()) << "OneRec MoE gate/up experts merge failed.";
+  if (enable_w8a8_dynamic) {
+    CHECK_EQ(merged_gate_up.dim(), 3)
+        << "OneRec W8A8 gate/up weight must be [E, K, 2N].";
+    CHECK_EQ(merged_gate_up.scalar_type(), torch::kInt8)
+        << "OneRec W8A8 gate/up weight must be int8.";
+  }
   at_weight_tensors_[kInMoeExpertW1Weight] =
-      at_npu::native::npu_format_cast(merged_gate_up, /*format=*/2)
+      at_npu::native::npu_format_cast(
+          merged_gate_up,
+          enable_w8a8_dynamic ? ACL_FORMAT_FRACTAL_NZ : ACL_FORMAT_ND)
           .contiguous();
 
-  if (quantize_type_ == "w8a8_dynamic") {
+  if (enable_w8a8_dynamic) {
     if (experts_weights_.count("gate_proj.weight_offset") > 0 &&
         experts_weights_.count("up_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> gate_offset_1d;
@@ -2174,8 +2253,39 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
                                   /*transpose=*/false);
       }
     }
-    if (experts_weights_.count("gate_proj.weight_scale") > 0 &&
-        experts_weights_.count("up_proj.weight_scale") > 0) {
+    if (fused_expert_weight1_scale_.defined()) {
+      const int64_t num_experts = merged_gate_up.size(0);
+      const int64_t gate_up_size = merged_gate_up.size(2);
+      CHECK_EQ(gate_up_size % 2, 0)
+          << "OneRec W8A8 gate/up output size must be even.";
+      const int64_t expert_size = gate_up_size / 2;
+      auto scale = fused_expert_weight1_scale_.reshape({-1}).to(device_).to(
+          torch::kFloat32);
+      torch::Tensor normalized_scale;
+      if (scale.numel() == expert_size) {
+        // The fused checkpoint shares one per-channel scale across experts and
+        // the gate/up halves. Materialize the [E, 2N] ACLNN contract here.
+        normalized_scale = scale.view({1, 1, expert_size})
+                               .expand({num_experts, 2, expert_size})
+                               .reshape({num_experts, gate_up_size});
+      } else if (scale.numel() == gate_up_size) {
+        normalized_scale =
+            scale.view({1, gate_up_size}).expand({num_experts, gate_up_size});
+      } else if (scale.numel() == num_experts * expert_size) {
+        normalized_scale = scale.view({num_experts, 1, expert_size})
+                               .expand({num_experts, 2, expert_size})
+                               .reshape({num_experts, gate_up_size});
+      } else {
+        CHECK_EQ(scale.numel(), num_experts * gate_up_size)
+            << "OneRec fused weight1.scale cannot be normalized to ["
+            << num_experts << ", " << gate_up_size << "] from shape "
+            << fused_expert_weight1_scale_.sizes();
+        normalized_scale = scale.view({num_experts, gate_up_size});
+      }
+      at_weight_tensors_[kInMlpGateUpScaleExpert] =
+          normalized_scale.contiguous();
+    } else if (experts_weights_.count("gate_proj.weight_scale") > 0 &&
+               experts_weights_.count("up_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> gate_scale_1d;
       std::vector<torch::Tensor> up_scale_1d;
       gate_scale_1d.reserve(experts_weights_["gate_proj.weight_scale"].size());
@@ -2201,13 +2311,19 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
   }
 
   auto merged_down = merge_experts_weights(experts_weights_["down_proj.weight"],
-                                           /*transpose=*/false);
+                                           /*transpose=*/enable_w8a8_dynamic);
   CHECK(merged_down.defined()) << "OneRec MoE down experts merge failed.";
+  if (enable_w8a8_dynamic) {
+    CHECK_EQ(merged_down.dim(), 3)
+        << "OneRec W8A8 down weight must be [E, K, N].";
+    CHECK_EQ(merged_down.scalar_type(), torch::kInt8)
+        << "OneRec W8A8 down weight must be int8.";
+  }
   at_weight_tensors_[kInMoeExpertW2Weight] =
       at_npu::native::npu_format_cast(merged_down, ACL_FORMAT_FRACTAL_NZ)
           .contiguous();
 
-  if (quantize_type_ == "w8a8_dynamic") {
+  if (enable_w8a8_dynamic) {
     if (experts_weights_.count("down_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> down_offset_1d;
       down_offset_1d.reserve(
@@ -2222,7 +2338,29 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
             merge_experts_weights(down_offset_1d, /*transpose=*/false);
       }
     }
-    if (experts_weights_.count("down_proj.weight_scale") > 0) {
+    // GroupedMatmulV4 requires BF16 scales for BF16 output and FP32 scales
+    // for FP16 output in the per-token W8A8 path.
+    const auto down_scale_dtype =
+        dtype_ == torch::kBFloat16 ? torch::kBFloat16 : torch::kFloat32;
+    if (fused_expert_weight2_scale_.defined()) {
+      const int64_t num_experts = merged_down.size(0);
+      const int64_t output_size = merged_down.size(2);
+      auto scale = fused_expert_weight2_scale_.reshape({-1}).to(device_).to(
+          down_scale_dtype);
+      if (scale.numel() == output_size) {
+        at_weight_tensors_[kInMlpDownScaleExpert] =
+            scale.view({1, output_size})
+                .expand({num_experts, output_size})
+                .contiguous();
+      } else {
+        CHECK_EQ(scale.numel(), num_experts * output_size)
+            << "OneRec fused weight2.scale cannot be normalized to ["
+            << num_experts << ", " << output_size << "] from shape "
+            << fused_expert_weight2_scale_.sizes();
+        at_weight_tensors_[kInMlpDownScaleExpert] =
+            scale.view({num_experts, output_size}).contiguous();
+      }
+    } else if (experts_weights_.count("down_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> down_scale_1d;
       down_scale_1d.reserve(experts_weights_["down_proj.weight_scale"].size());
       for (const auto& tensor : experts_weights_["down_proj.weight_scale"]) {
@@ -2232,7 +2370,8 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
       }
       if (!down_scale_1d.empty()) {
         at_weight_tensors_[kInMlpDownScaleExpert] =
-            merge_experts_weights(down_scale_1d, /*transpose=*/false);
+            merge_experts_weights(down_scale_1d, /*transpose=*/false)
+                .to(down_scale_dtype);
       }
     }
   }
@@ -2248,6 +2387,9 @@ void NpuOneRecBlockLayerImpl::merge_shared_experts_weights() {
   torch::Tensor gate_weight = get_shared_weight("gate_proj.weight");
   torch::Tensor up_weight = get_shared_weight("up_proj.weight");
   torch::Tensor down_weight = get_shared_weight("down_proj.weight");
+  torch::Tensor gate_scale = get_shared_weight("gate_proj.weight_scale");
+  torch::Tensor up_scale = get_shared_weight("up_proj.weight_scale");
+  torch::Tensor down_scale = get_shared_weight("down_proj.weight_scale");
 
   if (!gate_weight.defined() && !up_weight.defined() &&
       !down_weight.defined()) {
@@ -2276,6 +2418,36 @@ void NpuOneRecBlockLayerImpl::merge_shared_experts_weights() {
   if (down_weight.defined()) {
     at_weight_tensors_[kInMlpDownWeightSharedExpert] =
         prepare_shared_weight_2d(down_weight, "down");
+  }
+
+  if (quantize_type_ == "w8a8_dynamic") {
+    CHECK(gate_weight.defined() && up_weight.defined() && down_weight.defined())
+        << "OneRec W8A8 shared expert weights are incomplete at layer "
+        << layer_id_ << ".";
+    CHECK_EQ(gate_weight.scalar_type(), torch::kInt8)
+        << "OneRec W8A8 shared expert gate weight must be int8.";
+    CHECK_EQ(up_weight.scalar_type(), torch::kInt8)
+        << "OneRec W8A8 shared expert up weight must be int8.";
+    CHECK_EQ(down_weight.scalar_type(), torch::kInt8)
+        << "OneRec W8A8 shared expert down weight must be int8.";
+    CHECK_EQ(gate_weight.sizes(), up_weight.sizes())
+        << "OneRec W8A8 shared expert gate/up shapes must match.";
+    CHECK_EQ(down_weight.size(0), gate_weight.size(1));
+    CHECK_EQ(down_weight.size(1), gate_weight.size(0));
+    CHECK(gate_scale.defined() && up_scale.defined() && down_scale.defined())
+        << "OneRec W8A8 shared expert scales are incomplete at layer "
+        << layer_id_ << ".";
+    CHECK_EQ(gate_scale.numel(), gate_weight.size(0));
+    CHECK_EQ(up_scale.numel(), up_weight.size(0));
+    CHECK_EQ(down_scale.numel(), down_weight.size(0));
+
+    at_weight_tensors_[kInMlpGateUpScaleSharedExpert] =
+        torch::cat({gate_scale.reshape({-1}), up_scale.reshape({-1})}, 0)
+            .to(device_)
+            .to(torch::kFloat32)
+            .contiguous();
+    at_weight_tensors_[kInMlpDownScaleSharedExpert] =
+        down_scale.reshape({-1}).to(device_).to(torch::kFloat32).contiguous();
   }
 
   shared_expert_weights_map_.clear();
