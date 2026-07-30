@@ -367,6 +367,7 @@ int main(int argc, char** argv) {
   FLAGS_minloglevel = 0;
   google::ParseCommandLineFlags(&argc, &argv, true);
   apply_multistream_perf_mode_env_overrides();
+  apply_onerec_async_perf_env_overrides();
 
   google::InitGoogleLogging("xllm");
 

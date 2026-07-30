@@ -211,6 +211,11 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Whether to enable OneRec xattention multistream performance mode */
   bool enable_multistream_perf_mode;
 
+  /** Whether to enable OneRec xattention async perf env overrides in one shot:
+   *  XLLM_ONEREC_XATTN_ASYNC_BEAM_SEARCH, XLLM_ONEREC_XATTN_ASYNC_CACHE_SELECT,
+   *  TASK_QUEUE_ENABLE, PER_STREAM_QUEUE. Default false. */
+  bool enable_onerec_async_perf;
+
   /** Whether to split NPU cores between two OneRec worker streams */
   bool enable_onerec_multistream_core_split;
 

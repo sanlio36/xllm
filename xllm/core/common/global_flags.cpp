@@ -732,6 +732,12 @@ DEFINE_bool(enable_multistream_perf_mode,
             "Enable experimental OneRec xattention multistream performance "
             "mode. When enabled, it disables OneRec xattention prepare/model "
             "forward serialization and enables thread-local ACLNN cache.");
+DEFINE_bool(enable_onerec_async_perf,
+            false,
+            "Enable OneRec xattention async perf env overrides in one shot: "
+            "XLLM_ONEREC_XATTN_ASYNC_BEAM_SEARCH, "
+            "XLLM_ONEREC_XATTN_ASYNC_CACHE_SELECT, TASK_QUEUE_ENABLE, "
+            "PER_STREAM_QUEUE.");
 DEFINE_bool(enable_onerec_multistream_core_split,
             false,
             "Limit each of two OneRec NPU worker streams to a configurable "
@@ -758,6 +764,17 @@ void apply_multistream_perf_mode_env_overrides() {
   set_env_override("XLLM_ONEREC_XATTN_SERIALIZE_PREPARE", "false");
   set_env_override("XLLM_ONEREC_XATTN_SERIALIZE_MODEL_FORWARD", "false");
   set_env_override("XLLM_ATB_ACLNN_THREAD_LOCAL_CACHE", "1");
+}
+
+void apply_onerec_async_perf_env_overrides() {
+  if (!FLAGS_enable_onerec_async_perf) {
+    return;
+  }
+
+  set_env_override("XLLM_ONEREC_XATTN_ASYNC_BEAM_SEARCH", "1");
+  set_env_override("XLLM_ONEREC_XATTN_ASYNC_CACHE_SELECT", "1");
+  set_env_override("TASK_QUEUE_ENABLE", "1");
+  set_env_override("PER_STREAM_QUEUE", "1");
 }
 
 #if defined(USE_NPU)

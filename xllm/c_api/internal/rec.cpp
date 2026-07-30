@@ -214,11 +214,13 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         xllm_init_options.total_conversion_threshold;
     FLAGS_enable_multistream_perf_mode =
         xllm_init_options.enable_multistream_perf_mode;
+    FLAGS_enable_onerec_async_perf = xllm_init_options.enable_onerec_async_perf;
     FLAGS_enable_onerec_multistream_core_split =
         xllm_init_options.enable_onerec_multistream_core_split;
     FLAGS_onerec_multistream_core_ratio =
         xllm_init_options.onerec_multistream_core_ratio;
     apply_multistream_perf_mode_env_overrides();
+    apply_onerec_async_perf_env_overrides();
 
     if (xllm_init_options.request_queue_size > 0) {
       FLAGS_request_queue_size = xllm_init_options.request_queue_size;
