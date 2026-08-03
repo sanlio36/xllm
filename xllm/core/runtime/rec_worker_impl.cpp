@@ -3460,6 +3460,26 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                        context.get_quant_args(),
                                        context.get_tensor_options());
 
+#if defined(USE_NPU)
+    if (FLAGS_enable_prefetch_weight &&
+        rec_model_kind_ == RecModelKind::kOneRec &&
+        context.get_model_args().use_moe()) {
+      runtime.weight_prefetch_stream = device_.get_stream_from_pool();
+      aclrtStream main_stream = runtime.stream->get_stream()->stream();
+      aclrtStream prefetch_stream =
+          runtime.weight_prefetch_stream->get_stream()->stream();
+      CHECK_NE(main_stream, prefetch_stream)
+          << "OneRec main and weight prefetch streams must be distinct";
+      atb::Context* atb_context = const_cast<atb::Context*>(
+          runtime.context->get_atb_context());
+      CHECK(atb_context != nullptr)
+          << "ATB context is null while registering OneRec prefetch stream";
+      CHECK_EQ(atb_context->SetExecuteStreams({main_stream, prefetch_stream}),
+               atb::NO_ERROR)
+          << "Failed to register OneRec main and weight prefetch streams";
+    }
+#endif
+
     if (rec_model_kind_ == RecModelKind::kOneRec) {
       runtime.model = create_rec_model(*runtime.context.get());
     } else {
@@ -3658,7 +3678,24 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
               work_pipelines_[index]->runtime().context->get_atb_context());
           CHECK(atb_context != nullptr)
               << "ATB context is null for REC pipeline " << index;
-          atb_context->SetExecuteStream(current_stream);
+          if (work_pipelines_[index]
+                  ->runtime()
+                  .weight_prefetch_stream != nullptr) {
+            aclrtStream prefetch_stream = work_pipelines_[index]
+                                                ->runtime()
+                                                .weight_prefetch_stream
+                                                ->get_stream()
+                                                ->stream();
+            CHECK_EQ(atb_context->SetExecuteStreams(
+                         {current_stream, prefetch_stream}),
+                     atb::NO_ERROR)
+                << "Failed to bind REC main and prefetch streams for pipeline "
+                << index;
+          } else {
+            CHECK_EQ(atb_context->SetExecuteStream(current_stream),
+                     atb::NO_ERROR)
+                << "Failed to bind REC execute stream for pipeline " << index;
+          }
 #endif
 
           ForwardInput input_on_device;

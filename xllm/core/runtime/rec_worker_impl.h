@@ -73,6 +73,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
     RecPipelineRuntime(RecWorkerImpl& worker) : worker(worker) {}
     RecPipelineRuntime(RecPipelineRuntime&& other) : worker(other.worker) {
       stream = std::move(other.stream);
+      weight_prefetch_stream = std::move(other.weight_prefetch_stream);
       model = std::move(other.model);
       executor = std::move(other.executor);
       context = std::move(other.context);
@@ -80,6 +81,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
       expert_load_data = std::move(other.expert_load_data);
     }
     std::unique_ptr<Stream> stream;
+    std::unique_ptr<Stream> weight_prefetch_stream;
     std::unique_ptr<CausalLM> model;
     std::unique_ptr<Executor> executor;
     std::unique_ptr<ModelContext> context;

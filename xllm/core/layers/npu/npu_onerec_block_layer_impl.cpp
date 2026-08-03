@@ -818,6 +818,8 @@ void NpuOneRecBlockLayerImpl::param_from_args(
     param.moe_config->moe_use_shared_experts = args.moe_use_shared_experts();
     param.moe_config->moe_num_shared_experts = args.n_shared_experts();
     param.moe_config->enable_integrated_softmax_topk = true;
+    param.moe_config->enable_gateup_weight_prefetch =
+        FLAGS_enable_prefetch_weight && !is_prefill;
 
     param.enableGMMSwigluQuant = enable_w8a8_dynamic;
     param.moePackQuantType = static_cast<int>(
