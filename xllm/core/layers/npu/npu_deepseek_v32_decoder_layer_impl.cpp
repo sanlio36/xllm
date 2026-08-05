@@ -596,7 +596,7 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_mlp_parameters(
   param.processLogits = "normScaling";
   param.routedScalingFactor = args.routed_scaling_factor();
   param.numOfSelectedExperts = {args.num_experts_per_tok()};
-  param.enableDispatchCombineV2 = is_glm_moe_dsa;
+  param.enableDispatchCombineV2 = is_glm_moe_dsa && !param.isPrefill;
 
   if (ep_size_ > 1) {
     param.expertParallelDegree = std::max(
@@ -1077,7 +1077,7 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
                             output_topk_);
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "execute prefill layer fail, error code: " << st;
+                           << "execute decode layer fail, error code: " << st;
   } else {
     build_node_variant_pack(prefill_node_,
                             x,
