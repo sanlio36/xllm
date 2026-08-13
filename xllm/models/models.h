@@ -77,6 +77,7 @@ limitations under the License.
 #include "llm/deepseek_v32.h"                     // IWYU pragma: keep
 #include "llm/glm5.h"                             // IWYU pragma: keep
 #include "llm/glm52.h"                            // IWYU pragma: keep
+#include "llm/glm5_next.h"                        // IWYU pragma: keep
 #include "llm/joyai_llm_flash.h"                  // IWYU pragma: keep
 #include "llm/mlu/deepseek_mtp.h"                 // IWYU pragma: keep
 #include "llm/mlu/deepseek_v4.h"                  // IWYU pragma: keep
@@ -137,6 +138,7 @@ limitations under the License.
 #include "vlm/qwen3_5.h"                                 // IWYU pragma: keep
 #include "vlm/qwen3_vl.h"                                // IWYU pragma: keep
 #include "vlm/qwen3_vl_moe.h"                            // IWYU pragma: keep
+#include "vlm/glm5_next_vlm.h"                           // IWYU pragma: keep
 #else
 #error "Unsupported device type, only support NPU, CUDA, MLU, ILU and MUSA now."
 #endif

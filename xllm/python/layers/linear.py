@@ -128,11 +128,28 @@ class RowParallelLinear(nn.Module):
         self._weight_is_transposed = is_transposed
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.tp_size <= 1:
+            # tp==1: no collective. Fuse the bias into the matmul
+            # (``F.linear(x, w, b)``) so the path is bit-identical to
+            # ``nn.Linear`` — a separated ``F.linear(x, w) + b`` drifts ~1e-5
+            # on CPU because the fused kernel rounds the bias add differently.
+            # The transposed (NPU) path has no fused bias variant, so it stays
+            # matmul-then-add (not exercised on the CPU standalone align path).
+            if self._weight_is_transposed:
+                out = torch.matmul(x, self.weight)
+                if self.bias is not None:
+                    out = out + self.bias
+            else:
+                out = torch.nn.functional.linear(x, self.weight, self.bias)
+            return out
+        # tp>1: each rank produces a partial output that is SUM all-reduced
+        # across the TP group; the bias is replicated (full ``out``) and added
+        # ONCE after the reduce so it is not summed ``tp_size`` times.
         if self._weight_is_transposed:
             out = torch.matmul(x, self.weight)
         else:
             out = torch.nn.functional.linear(x, self.weight)
-        if self.tp_size > 1 and self.reduce_results:
+        if self.reduce_results:
             distributed.all_reduce_(out)
         if self.bias is not None:
             out = out + self.bias

@@ -157,6 +157,9 @@ struct ModelArgs {
   PROPERTY(int32_t, index_head_dim) = 0;
   PROPERTY(int32_t, index_n_heads) = 0;
   PROPERTY(int32_t, index_topk) = 0;
+  PROPERTY(int32_t, index_kpool) = 1;
+  PROPERTY(bool, index_kpool_compress) = false;
+  PROPERTY(bool, index_kpool_always_select_tail) = false;
   PROPERTY(bool, indexer_rope_interleave) = false;
   // IndexCache: https://arxiv.org/abs/2603.12201
   PROPERTY(int32_t, index_topk_freq) = 1;
@@ -215,6 +218,7 @@ struct ModelArgs {
   // qwen3 next initialized with 0, and will be loaded in model file
   PROPERTY(bool, attn_output_gate) = false;
   PROPERTY(int32_t, full_attention_interval) = 0;
+  PROPERTY(std::vector<int32_t>, full_attn_layers) = {};
   PROPERTY(int32_t, linear_conv_kernel_dim) = 0;
   PROPERTY(int32_t, linear_key_head_dim) = 0;
   PROPERTY(int32_t, linear_value_head_dim) = 0;
@@ -594,7 +598,12 @@ inline bool is_full_attention_layer(const ModelArgs& args, int64_t layer_id) {
   if (layer_id >= 0 &&
       layer_id < static_cast<int64_t>(hybrid_layer_types.size())) {
     const auto& layer_type = hybrid_layer_types[layer_id];
-    return layer_type == "full_attention" || layer_type == "attention";
+    // deepseek_sparse_attention (glm5_next DSA layers) is a full-attention
+    // variant: it uses paged KV, not the linear (conv/ssm) state cache. Treat
+    // it as full attention here so capacity estimation and per-layer dispatch
+    // classify it correctly (mirrors is_linear_attention_layer's exclusion).
+    return layer_type == "full_attention" || layer_type == "attention" ||
+           layer_type == "deepseek_sparse_attention";
   }
 
   int32_t attention_interval = args.full_attention_interval();
@@ -611,7 +620,8 @@ inline bool has_linear_attention_layers(const ModelArgs& args) {
                        hybrid_layer_types.end(),
                        [](const std::string& layer_type) {
                          return layer_type != "full_attention" &&
-                                layer_type != "attention";
+                                layer_type != "attention" &&
+                                layer_type != "deepseek_sparse_attention";
                        });
   }
   return args.full_attention_interval() > 1;

@@ -139,6 +139,7 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "glm4_moe_lite",
       "glm_moe_dsa",  // glm5 model type
       "glm_moe_dsa_mtp",
+      "glm5_next",  // glm5_next: absorbed MLA (NoPE, kv_lora=512)
       "joyai_llm_flash"};
   return kMlaModelTypeSet;
 }

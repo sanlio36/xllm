@@ -418,6 +418,7 @@ class W8A8WeightLoader:
         tp_size: int,
         tp_rank: int,
     ) -> None:
+        self._model = model
         self._params_by_name = dict(model.named_parameters())
         self._buffers_by_name = dict(model.named_buffers())
         self._state_dicts = state_dicts
@@ -450,6 +451,17 @@ class W8A8WeightLoader:
         p = self._params_by_name.get(param_name)
         if p is None:
             p = self._buffers_by_name.get(param_name)
+        if p is None:
+            # resolve_quant / lazy construction (e.g. QLinear._w8a8, bf16 experts)
+            # may add params AFTER _params_by_name was cached at __init__. Fall
+            # back to a live model walk and cache the result.
+            live = dict(self._model.named_parameters())
+            live.update(dict(self._model.named_buffers()))
+            self._params_by_name.update(live)
+            self._buffers_by_name.update(live)
+            p = self._params_by_name.get(param_name)
+            if p is None:
+                p = self._buffers_by_name.get(param_name)
         assert p is not None, f"no parameter/buffer named {param_name}"
         p.data.copy_(tensor.to(dtype=p.dtype, device=p.device))
 

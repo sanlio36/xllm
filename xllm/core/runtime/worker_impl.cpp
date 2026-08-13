@@ -391,9 +391,10 @@ bool WorkerImpl::allocate_kv_cache_storage(
   const auto& args = context_.get_model_args();
   const bool enable_linear_attention = has_linear_attention_layers(args);
   const bool enable_lighting_indexer = args.index_n_heads() > 0;
-  CHECK(!(enable_linear_attention && enable_lighting_indexer))
-      << "KVCache does not support linear attention and lighting indexer "
-      << "simultaneously.";
+  // A model may be BOTH linear-attention (KDA layers) AND have a lighting
+  // indexer (DSA layers) — e.g. glm5_next. create_kv_cache_impl dispatches ONE
+  // impl per layer, each reading only its own shape, so coexistence is
+  // harmless. The prior exclusivity CHECK guarded a non-problem.
 
   const int64_t num_layers = get_num_layers();
   std::vector<bool> indexer_cache_enabled_layers =
@@ -440,6 +441,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
       .ssm_dtype(ssm_dtype)
       .num_layers(num_layers)
       .full_attention_interval(args.full_attention_interval())
+      .layer_types(args.layer_types())
       .model_id(options_.model_id())
       .model_type(args.model_type())
       .enable_xtensor(::xllm::KVCacheConfig::get_instance().enable_xtensor())

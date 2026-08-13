@@ -33,7 +33,8 @@ class EagerRunner(BaseRunner):
         metadata: AttentionMetadata,
         layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor:
-        self.attention_backend.prepare(metadata)
+        if self.attention_backend is not None:
+            self.attention_backend.prepare(metadata)
         with forward_context(
             ForwardContext(
                 self.attention_backend,

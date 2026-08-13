@@ -259,12 +259,21 @@ class NpuPagedAttentionBackend(AttentionBackend):
         nope_cache, rope_cache = layer_cache.key, layer_cache.value
         if nope_cache is None or rope_cache is None:
             raise RuntimeError(f"MLA latent cache is missing for layer {layer_id}")
-
+        # NoPE (qk_rope_head_dim==0): skip rope cache write + pass None to SFA.
+        rope_dim = getattr(layer, "qk_rope_head_dim", None)
+        if rope_dim and rope_dim > 0:
+            torch.ops.xllm_ops.reshape_paged_cache(
+                metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+            )
+            return self._mla_sparse(
+                q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
+            )
+        # NoPE path: latent only, no rope.
         torch.ops.xllm_ops.reshape_paged_cache(
-            metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+            metadata.slot_mapping, k_latent_3d, k_latent_3d, nope_cache, nope_cache
         )
         return self._mla_sparse(
-            q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
+            q_latent, None, nope_cache, None, topk, metadata.block_table
         )
 
     def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
@@ -282,6 +291,243 @@ class NpuPagedAttentionBackend(AttentionBackend):
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
         )
+
+    def gather_index_history(
+        self, layer: "Attention", batch_size: int,
+    ) -> torch.Tensor:
+        """Gather the kPool packed history into a dense ``[B, kv_len, W]`` tensor.
+
+        The index cache is paged (``[blocks, block_size, 1, W]``); the kPool
+        indexer's ``select_topk`` needs the per-sequence rows contiguous. For
+        each sequence we walk its block table, concatenating ``block_size``
+        rows per block (the last block yields only ``last_page_len``).
+        ``kv_len`` is padded to the max across the batch; out-of-range rows
+        are zeroed so ``valid`` channels read as false downstream.
+        """
+        metadata = self._metadata
+        assert metadata is not None, "gather_index_history called before prepare()"
+        index_cache = self._kv_caches[layer.layer_id].index
+        assert index_cache is not None, (
+            "gather_index_history requires a paged index cache")
+        block_table = metadata.block_table
+        if block_table is None:
+            # No paged view (standalone): caller should not reach here.
+            raise RuntimeError("gather_index_history needs a paged block_table")
+        block_size = index_cache.shape[1]
+        width = index_cache.shape[3]
+        device = index_cache.device
+
+        # batch_size is hidden_states.shape[0] which the engine flattens to 1
+        # for multi-sequence batches; the real sequence count is the block
+        # table's first dim. Use it to gather every sequence's history.
+        num_seqs = block_table.shape[0] if block_table is not None else batch_size
+
+        kv_seq_lens = metadata.kv_seq_lens
+        if kv_seq_lens is not None:
+            kv_lens = kv_seq_lens[:num_seqs].to(torch.int64)
+        else:
+            kv_host = metadata.kv_seq_lens_host
+            if kv_host is not None:
+                kl = kv_host.cpu()
+                if kl.numel() == num_seqs + 1:
+                    kv_lens = (kl[1:] - kl[:-1]).to(torch.int64)
+                else:
+                    kv_lens = kl[:num_seqs].to(torch.int64)
+            else:
+                raise RuntimeError("gather_index_history needs kv_seq_lens")
+
+        max_kv = int(kv_lens.max().item()) if num_seqs > 0 else 0
+        flat = index_cache.view(-1, width)
+        bt = block_table[:num_seqs].to(torch.int64)
+        out = torch.zeros(num_seqs, max_kv, width, dtype=index_cache.dtype, device=device)
+        for b in range(num_seqs):
+            kl = int(kv_lens[b].item())
+            if kl == 0:
+                continue
+            n_full = kl // block_size
+            tail = kl - n_full * block_size
+            rows = []
+            blk = bt[b]
+            if n_full > 0:
+                slot_ids = (blk[:n_full, None] * block_size + torch.arange(block_size, device=device)[None, :]).reshape(-1)
+                rows.append(flat.index_select(0, slot_ids))
+            if tail > 0:
+                last_blk = int(blk[n_full].item())
+                slot_ids = last_blk * block_size + torch.arange(tail, device=device)
+                rows.append(flat.index_select(0, slot_ids))
+            packed = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
+            out[b, :kl] = packed
+        return out
+
+    def execute_linear(
+        self,
+        mixed_qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        layer: "Attention",
+    ) -> torch.Tensor:
+        """KDA delta-rule over framework conv/ssm slots.
+
+        Returns ``[B, S, num_heads_local, head_dim]``. The conv1d + delta-rule
+        math is identical to the model-layer self-contained path (validated
+        against the transformers reference); only the state I/O moved here so
+        both attention layer types dispatch through the backend.
+        """
+        from xllm.python.models.glm5_next import (
+            _causal_conv1d_fn,
+            _causal_conv1d_update,
+            chunk_kimi_delta_attention,
+            recurrent_kimi_delta_attention,
+        )
+
+        metadata = self._metadata
+        assert metadata is not None, "execute_linear called before prepare()"
+        layer_cache = self._kv_caches[layer.layer_id]
+        conv_cache = layer_cache.conv
+        ssm_cache = layer_cache.ssm
+        assert conv_cache is not None and ssm_cache is not None, (
+            "execute_linear requires a linear-attention layer cache (conv/ssm)")
+
+        batch_size, _, seq_len = mixed_qkv.shape
+        conv_kernel_size = layer.conv_kernel_size
+        conv_state_len = conv_kernel_size - 1
+        head_dim = layer.head_dim
+        num_heads_local = layer.num_heads_local
+        qkv_dim = layer.qkv_dim
+        hidden_shape = (batch_size, seq_len, -1, head_dim)
+
+        idx = metadata.linear_state_indices
+        num_seqs = idx.shape[0] if idx is not None else batch_size
+        if idx is None:
+            device = mixed_qkv.device
+            conv_state = torch.zeros(
+                batch_size, layer.conv_dim, conv_state_len,
+                dtype=layer.conv1d.weight.dtype, device=device,
+            )
+            ssm_state = torch.zeros(
+                batch_size, num_heads_local, head_dim, head_dim,
+                dtype=torch.float32, device=device,
+            )
+        else:
+            if idx.dtype != torch.int64:
+                idx = idx.to(torch.int64)
+            conv_i = conv_cache.index_select(0, idx)
+            conv_i = conv_i.transpose(1, 2).contiguous()
+            ssm_i = ssm_cache.index_select(0, idx)
+            his = metadata.has_initial_state
+            if his is not None and len(his) == num_seqs:
+                if not isinstance(his, torch.Tensor):
+                    his = torch.tensor(
+                        his, dtype=torch.int64, device=conv_i.device
+                    )
+                warm = his.to(torch.bool).view(num_seqs, 1, 1)
+                conv_i = torch.where(warm, conv_i, torch.zeros_like(conv_i))
+                ssm_i = torch.where(
+                    warm.view(num_seqs, 1, 1, 1),
+                    ssm_i,
+                    torch.zeros_like(ssm_i),
+                )
+            conv_state, ssm_state = conv_i, ssm_i
+
+        conv_weight = layer.conv1d.weight.squeeze(1)
+        activation = layer.activation
+        if num_seqs == batch_size:
+            # Simple path: mixed_qkv is already [B, conv_dim, S] (one sequence
+            # per batch row, or a single flattened sequence).
+            if seq_len == 1:
+                mixed_qkv = _causal_conv1d_update(
+                    mixed_qkv, conv_state, conv_weight, activation
+                )
+            else:
+                conv_in = torch.cat([conv_state, mixed_qkv], dim=-1)
+                mixed_qkv = _causal_conv1d_fn(
+                    conv_in, conv_weight, activation
+                )[:, :, -seq_len:]
+                conv_state = conv_in[..., -conv_state_len:]
+                if conv_state.shape[-1] < conv_state_len:
+                    conv_state = F.pad(
+                        conv_state,
+                        (conv_state_len - conv_state.shape[-1], 0), value=0,
+                    )
+        else:
+            # Flattened multi-sequence: mixed_qkv is [1, conv_dim, T] (T = sum
+            # of per-seq token counts). Reshape to [num_seqs, conv_dim, S_q] so
+            # the conv1d runs batched over all sequences at once (conv_state is
+            # already [num_seqs, conv_dim, state_len]). Requires uniform
+            # per-seq length (the decode case: every sequence 1 token); variable
+            # lengths would need padding + masking (not exercised here since
+            # chunked prefill is off — multi-seq batches are decode-only).
+            q_cu = metadata.q_cu_seq_lens
+            assert q_cu is not None, (
+                "multi-sequence linear attention needs q_cu_seq_lens")
+            per_seq = int(q_cu[1].item()) - int(q_cu[0].item())
+            for s in range(1, num_seqs):
+                if int(q_cu[s + 1].item()) - int(q_cu[s].item()) != per_seq:
+                    raise NotImplementedError(
+                        "variable-length multi-sequence KDA not supported")
+            # mixed_qkv is [1, conv_dim, T] with the time axis LAST. A direct
+            # reshape(num_seqs, -1, per_seq) would scramble channels across
+            # sequences (row-major flattening interleaves [c0t0,c0t1,c1t0,...]),
+            # giving each seq a different channel subset and corrupting conv1d
+            # even for identical prompts. Transpose the time axis to dim 1 so
+            # the reshape splits sequences cleanly, then transpose back to the
+            # [num_seqs, conv_dim, per_seq] layout conv1d expects.
+            mixed_qkv = (mixed_qkv.transpose(1, 2)
+                         .reshape(num_seqs, per_seq, -1)
+                         .transpose(1, 2).contiguous())
+            seq_len = per_seq
+            hidden_shape = (num_seqs, seq_len, -1, head_dim)
+            if seq_len == 1:
+                mixed_qkv = _causal_conv1d_update(
+                    mixed_qkv, conv_state, conv_weight, activation
+                )
+            else:
+                conv_in = torch.cat([conv_state, mixed_qkv], dim=-1)
+                mixed_qkv = _causal_conv1d_fn(
+                    conv_in, conv_weight, activation
+                )[:, :, -seq_len:]
+                conv_state = conv_in[..., -conv_state_len:]
+                if conv_state.shape[-1] < conv_state_len:
+                    conv_state = F.pad(
+                        conv_state,
+                        (conv_state_len - conv_state.shape[-1], 0), value=0,
+                    )
+
+        query, key, value = torch.split(
+            mixed_qkv.transpose(1, 2), [qkv_dim] * 3, dim=-1
+        )
+        query = query.view(hidden_shape)
+        key = key.view(hidden_shape)
+        value = value.view(hidden_shape)
+
+        g = gate if num_seqs == batch_size else gate.view(hidden_shape)
+        b = beta if num_seqs == batch_size else beta.view(num_seqs, seq_len, num_heads_local)
+        if seq_len == 1:
+            core_attn_out, final_state = recurrent_kimi_delta_attention(
+                query, key, value, g, b,
+                initial_state=ssm_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out, final_state = chunk_kimi_delta_attention(
+                query, key, value, g, b,
+                chunk_size=64, initial_state=ssm_state,
+                output_final_state=True, use_qk_l2norm_in_kernel=True,
+            )
+
+        if idx is not None:
+            conv_cache.index_copy_(
+                0, idx, conv_state.transpose(1, 2).contiguous()
+            )
+            ssm_cache.index_copy_(
+                0, idx, final_state.float().contiguous()
+            )
+        # multi-seq path reshaped mixed_qkv to [num_seqs, ...]; flatten the
+        # output back to [1, T, ...] so the KDA forward's hidden_shape [1, T]
+        # aligns for o_norm / o_proj.
+        if num_seqs != batch_size:
+            core_attn_out = core_attn_out.reshape(1, -1, *core_attn_out.shape[2:])
+        return core_attn_out
 
     def _mla_sparse(
         self,

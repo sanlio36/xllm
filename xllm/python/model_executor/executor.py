@@ -88,21 +88,29 @@ class ModelExecutor:
         if not attention_layers:
             raise ValueError("Python model does not contain an Attention layer")
 
-        first_attention = attention_layers[0]
-        expected_config = self._attention_config(first_attention)
-        for layer in attention_layers[1:]:
-            if self._attention_config(layer) != expected_config:
-                raise ValueError(
-                    "Attention backend requires identical attention configuration "
-                    "across all layers"
-                )
+        # GLM-Next mixes DSA (MLA) and KDA (linear-attention) layers with
+        # different head/dim configs; the paged backend only serves the DSA
+        # layers, so it is built from the first DSA layer and the "identical
+        # config across all layers" check is skipped. A pure-KDA model (no DSA
+        # layer) runs without a paged backend; KDA layers dispatch their own
+        # ``execute_linear`` through ``None`` (they self-contain the linear
+        # state when there is no backend to own it).
+        from xllm.python.models.glm5_next import Glm5NextMlaAttention
+        dsa_layers = [
+            layer for layer in attention_layers
+            if isinstance(layer, Glm5NextMlaAttention)
+        ]
+        first_attention = dsa_layers[0] if dsa_layers else attention_layers[0]
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        self.attention_backend = _create_attention_backend(
-            first_attention, device, first_parameter.dtype
-        )
+        if dsa_layers:
+            self.attention_backend = _create_attention_backend(
+                first_attention, device, first_parameter.dtype
+            )
+        else:
+            self.attention_backend = None
 
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)

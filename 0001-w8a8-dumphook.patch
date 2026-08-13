@@ -1,0 +1,139 @@
+From 45b46317d57743167e9ff16bc845e7fadc4b9e85 Mon Sep 17 00:00:00 2001
+From: sunbaosong <13793883820@163.com>
+Date: Thu, 13 Aug 2026 22:36:29 +0800
+Subject: [PATCH] fix(glm5_next): W8A8 dump hook for per-layer bf16-vs-w8a8
+ alignment
+
+Three fixes to enable per-layer hidden-state dumps for locating the W8A8
+quantization divergence (bf16 reference vs w8a8 engine, TP4/TP8):
+
+- Glm5NextMLP.process_weights_after_loading: recurse into gate_up_proj /
+  down_proj so each QLinear's _w8a8 submodule runs its int8 weight transpose
+  ([out,in] -> [in,out] for quant_matmul). Was latent (forward aborted on
+  dim mismatch) until real w8a8 checkpoints exercised the dynamic path.
+- _install_dump_hooks: split output into per-rank subdir (rank{N}) so TP
+  ranks don't clobber a single tensors.safetensors; guard shared_experts /
+  experts with a None check (dense layers have experts=None).
+- Glm5NextVLModel: install the dump hooks too. The engine instantiates
+  Glm5NextVLModel for model_type=glm5_next, but it deliberately skips
+  Glm5NextForCausalLM.__init__, so the hooks were never attached.
+
+Verified: 10L bf16-vs-w8a8 layer-by-layer dump localizes divergence to the
+mHC/KDA rotation blindspots; after the msmodelslim quarot rotation fixes,
+8-card TP8 45L w8a8 outputs correct answers (Tokyo/Beijing/2) matching bf16.
+---
+ xllm/python/models/glm5_next.py    | 33 ++++++++++++++++++++++--------
+ xllm/python/models/glm5_next_vl.py | 16 +++++++++++++++
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/xllm/python/models/glm5_next.py b/xllm/python/models/glm5_next.py
+index 3c813131..fdcba4a6 100644
+--- a/xllm/python/models/glm5_next.py
++++ b/xllm/python/models/glm5_next.py
+@@ -1182,6 +1182,19 @@ class Glm5NextMLP(nn.Module):
+             dtype=dtype, kind="dynamic", row_parallel=True,
+         )
+ 
++    def process_weights_after_loading(self) -> None:
++        # W8A8: each QLinear's ``_w8a8`` submodule must run its
++        # ``W8A8DynamicLinear.process_weights_after_loading`` transpose, which
++        # flips the loaded ``[out, in]`` weight into ``[in, out]`` that
++        # ``quant_matmul`` (transpose2=False) consumes. ``_call_process_weights``
++        # is non-recursive, so without this forward Glm5NextMLP leaves the
++        # ``gate_up_proj`` / ``down_proj`` int8 weights untransposed and the
++        # matmul aborts on a dim mismatch (hidden vs 2*inter_local). The bf16
++        # path is a no-op (QLinear.process_weights_after_loading guards on
++        # ``use_w8a8``), so this is safe for both.
++        _call_process_weights_after_loading(self.gate_up_proj)
++        _call_process_weights_after_loading(self.down_proj)
++
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         gate_up = self.gate_up_proj(x)
+         gate, up = gate_up.chunk(2, dim=-1)
+@@ -1480,7 +1493,7 @@ class Glm5NextDecoderLayer(nn.Module):
+     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor,
+                 attention_mask: torch.Tensor,
+                 prev_topk_indices: Optional[torch.Tensor] = None,
+-                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+         # hidden_states: [B, S, hc_mult, D] (4 residual streams).
+         residual = hidden_states
+         post, comb, hidden_states = self.attn_hc(hidden_states)   # collapsed -> [B,S,D]
+@@ -1555,11 +1568,7 @@ class Glm5NextModel(nn.Module):
+         prev_topk: Optional[torch.Tensor] = None
+         _trace = os.environ.get("GLM5_NEXT_TRACE")
+         for i, layer in enumerate(self.layers):
+-            if _trace:
+-                print(f"[trace] layer{i} IN  seq_len={seq_len}", flush=True)
+             hidden, prev_topk = layer(hidden, position_ids, attention_mask, prev_topk)
+-            if _trace:
+-                print(f"[trace] layer{i} OUT", flush=True)
+         if _trace:
+             print("[trace] final_norm", flush=True)
+         # Final collapse: unweighted mean over the streams, then RMSNorm
+@@ -1568,7 +1577,8 @@ class Glm5NextModel(nn.Module):
+         # ``hidden.index_select(0, selected_idxes)`` where selected_idxes are
+         # token ids in the flattened sequence, so a 3-D output would select the
+         # wrong (batch) axis and gather out of range for multi-token prefill.
+-        return self.norm(self.hc_head(hidden)).view(-1, self.cfg.hidden_size)
++        h = self.norm(self.hc_head(hidden)).view(-1, self.cfg.hidden_size)
++        return h
+ 
+ 
+ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
+@@ -1640,9 +1650,9 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
+         handles.append(layer.post_attention_layernorm.register_forward_hook(_cap(p + "post_attention_layernorm")))
+         handles.append(layer.ffn_hc.register_forward_hook(_cap(p + "ffn_hc.collapse", 2)))
+         handles.append(layer.mlp.register_forward_hook(_cap(p + "mlp")))
+-        if hasattr(layer.mlp, "shared_experts"):
++        if hasattr(layer.mlp, "shared_experts") and getattr(layer.mlp, "shared_experts", None) is not None:
+             handles.append(layer.mlp.shared_experts.register_forward_hook(_cap(p + "mlp.shared_experts")))
+-        if hasattr(layer.mlp, "experts"):
++        if hasattr(layer.mlp, "experts") and getattr(layer.mlp, "experts", None) is not None:
+             handles.append(layer.mlp.experts.register_forward_hook(_cap(p + "mlp.experts")))
+             def _moe_cur(_m, _i, _o, _l=layer, _p=p):
+                 cs = getattr(_l.mlp.experts, "_debug_current_sum", None)
+@@ -1778,6 +1788,13 @@ class Glm5NextForCausalLM(PyModelBase):
+         self.to(device=device, dtype=dtype)
+         _dump_dir = os.environ.get("GLM5_NEXT_DUMP_DIR")
+         if _dump_dir:
++            # TP4: each rank writes the SAME filename -> they clobber each other.
++            # Split into a per-rank subdir so all 4 ranks' views survive.
++            try:
++                _rk = distributed.tp_rank(device)
++            except Exception:
++                _rk = 0
++            _dump_dir = os.path.join(_dump_dir, f"rank{_rk}")
+             _install_dump_hooks(self.model, self.lm_head, _dump_dir)
+ 
+     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
+diff --git a/xllm/python/models/glm5_next_vl.py b/xllm/python/models/glm5_next_vl.py
+index 3c6c2e66..65250620 100644
+--- a/xllm/python/models/glm5_next_vl.py
++++ b/xllm/python/models/glm5_next_vl.py
+@@ -888,6 +888,22 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
+         # (which default to float32 inside Glm5NextModel) are bf16 like the rest.
+         self.to(device=device, dtype=dtype)
+ 
++        # Install per-layer dump hooks. Glm5NextForCausalLM.__init__ installs
++        # these too, but VLModel deliberately skips that __init__, so the
++        # engine (which instantiates Glm5NextVLModel for model_type=glm5_next)
++        # would otherwise never install them. Mirrors the ForCausalLM logic incl.
++        # the per-rank subdir split (TP4 ranks clobber a single file otherwise).
++        _dump_dir = os.environ.get("GLM5_NEXT_DUMP_DIR")
++        if _dump_dir:
++            try:
++                from xllm.python import distributed
++                _rk = distributed.tp_rank(device)
++            except Exception:
++                _rk = 0
++            _dump_dir = os.path.join(_dump_dir, f"rank{_rk}")
++            from xllm.python.models.glm5_next import _install_dump_hooks
++            _install_dump_hooks(self.model, self.lm_head, _dump_dir)
++
+     # ------------------------------------------------------------------
+     # Connection logic: ViT → LLM
+     # ------------------------------------------------------------------
+-- 
+2.34.1
+
