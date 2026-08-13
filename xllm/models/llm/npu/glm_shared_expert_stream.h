@@ -19,8 +19,8 @@ limitations under the License.
 #include <atb/atb_infer.h>
 #include <glog/logging.h>
 
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -43,8 +43,7 @@ class GlmSharedExpertStreamOwner {
       return;
     }
 
-    constexpr const char* kAllocatorEnv =
-        "ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE";
+    constexpr const char* kAllocatorEnv = "ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE";
     const char* allocator = std::getenv(kAllocatorEnv);
     if (allocator == nullptr || std::string_view(allocator) != "3") {
       LOG(WARNING) << "GLM EPLv2 is enabled, but " << kAllocatorEnv << " is "
