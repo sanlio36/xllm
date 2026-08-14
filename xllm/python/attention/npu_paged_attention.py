@@ -457,47 +457,41 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     )
         else:
             # Flattened multi-sequence: mixed_qkv is [1, conv_dim, T] (T = sum
-            # of per-seq token counts). Reshape to [num_seqs, conv_dim, S_q] so
-            # the conv1d runs batched over all sequences at once (conv_state is
-            # already [num_seqs, conv_dim, state_len]). Requires uniform
-            # per-seq length (the decode case: every sequence 1 token); variable
-            # lengths would need padding + masking (not exercised here since
-            # chunked prefill is off — multi-seq batches are decode-only).
+            # of per-seq token counts). Variable-length (MTP/spec decode: each
+            # sequence may carry a different token count) is supported by a
+            # per-sequence conv1d loop (pure-torch F.conv1d is batched and
+            # requires equal lengths) followed by a single varlen recurrent_kda
+            # call (cu_seqlens does the per-seq split inside the kernel).
             q_cu = metadata.q_cu_seq_lens
             assert q_cu is not None, (
                 "multi-sequence linear attention needs q_cu_seq_lens")
-            per_seq = int(q_cu[1].item()) - int(q_cu[0].item())
-            for s in range(1, num_seqs):
-                if int(q_cu[s + 1].item()) - int(q_cu[s].item()) != per_seq:
-                    raise NotImplementedError(
-                        "variable-length multi-sequence KDA not supported")
-            # mixed_qkv is [1, conv_dim, T] with the time axis LAST. A direct
-            # reshape(num_seqs, -1, per_seq) would scramble channels across
-            # sequences (row-major flattening interleaves [c0t0,c0t1,c1t0,...]),
-            # giving each seq a different channel subset and corrupting conv1d
-            # even for identical prompts. Transpose the time axis to dim 1 so
-            # the reshape splits sequences cleanly, then transpose back to the
-            # [num_seqs, conv_dim, per_seq] layout conv1d expects.
-            mixed_qkv = (mixed_qkv.transpose(1, 2)
-                         .reshape(num_seqs, per_seq, -1)
-                         .transpose(1, 2).contiguous())
-            seq_len = per_seq
-            hidden_shape = (num_seqs, seq_len, -1, head_dim)
-            if seq_len == 1:
-                mixed_qkv = _causal_conv1d_update(
-                    mixed_qkv, conv_state, conv_weight, activation
-                )
-            else:
-                conv_in = torch.cat([conv_state, mixed_qkv], dim=-1)
-                mixed_qkv = _causal_conv1d_fn(
-                    conv_in, conv_weight, activation
-                )[:, :, -seq_len:]
-                conv_state = conv_in[..., -conv_state_len:]
-                if conv_state.shape[-1] < conv_state_len:
-                    conv_state = F.pad(
-                        conv_state,
-                        (conv_state_len - conv_state.shape[-1], 0), value=0,
-                    )
+            q_cu = q_cu.to(torch.int64)
+            q_cu_list = q_cu.tolist()
+            outs = []
+            for s in range(num_seqs):
+                t0, t1 = q_cu_list[s], q_cu_list[s + 1]
+                seg = mixed_qkv[:, :, t0:t1]   # [1, conv_dim, seg_len]
+                cs = conv_state[s:s + 1]       # [1, conv_dim, state_len]
+                seg_len = t1 - t0
+                if seg_len == 1:
+                    outs.append(_causal_conv1d_update(
+                        seg, cs, conv_weight, activation
+                    ))
+                else:
+                    cin = torch.cat([cs, seg], dim=-1)
+                    outs.append(_causal_conv1d_fn(
+                        cin, conv_weight, activation
+                    )[:, :, -seg_len:])
+                    conv_state[s] = cin[0, :, -conv_state_len:]
+                    if conv_state.shape[-1] < conv_state_len:
+                        conv_state[s] = F.pad(
+                            conv_state[s],
+                            (conv_state_len - conv_state.shape[-1], 0), value=0,
+                        )
+            mixed_qkv = torch.cat(outs, dim=-1)   # [1, conv_dim, T]
+            # TND packed layout for recurrent_kda: [T, nh, hd] per channel group.
+            seq_len = int(q_cu_list[-1])
+            hidden_shape = (1, seq_len, -1, head_dim)
 
         query, key, value = torch.split(
             mixed_qkv.transpose(1, 2), [qkv_dim] * 3, dim=-1
@@ -512,30 +506,44 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # upcasts them); the model hands them in bf16.
         g = g.to(torch.float32)
         b = b.to(torch.float32)
-        # cu_seqlens for fla_npu varlen: [0, 1, 2, ..., num_seqs] for the
-        # equal-length multi-seq decode (or [0, seq_len] single-seq path).
-        device = mixed_qkv.device
-        cu_seqlens = (
-            torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
-            if seq_len == 1
-            else torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-        )
         scale = 1.0 / (head_dim ** 0.5)
-        if seq_len == 1:
+        # Route on metadata, not seq_len: MTP/spec decode can carry multiple
+        # tokens per sequence (seq_len > 1) but is still a decode step; the
+        # seq_len heuristic would wrongly send it to the chunked prefill path.
+        is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
+        device = mixed_qkv.device
+        if not is_prefill:
+            # decode (incl. MTP multi-token-per-seq varlen): recurrent_kda on
+            # packed TND [T, nh, hd] with cu_seqlens.
+            q_tnd = query.reshape(-1, num_heads_local, head_dim).to(torch.bfloat16).contiguous()
+            k_tnd = key.reshape(-1, num_heads_local, head_dim).to(torch.bfloat16).contiguous()
+            v_tnd = value.reshape(-1, num_heads_local, head_dim).to(torch.bfloat16).contiguous()
+            g_tnd = g.reshape(-1, num_heads_local, head_dim).contiguous()
+            b_tnd = b.reshape(-1, num_heads_local).contiguous()
+            if num_seqs != batch_size:
+                cu_seqlens = q_cu.to(torch.int32)
+            elif seq_len == 1:
+                # B independent single-token sequences.
+                cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
+            else:
+                cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
             core_attn_out, final_state = recurrent_kda(
-                query, key, value, g, b,
+                q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
                 initial_state=ssm_state,
                 cu_seqlens=cu_seqlens,
-                layout="BSND", scale=scale,
+                layout="TND", scale=scale,
                 output_final_state=True, inplace_final_state=False,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=False,
                 use_beta_sigmoid_in_kernel=False,
             )
+            core_attn_out = core_attn_out.to(query.dtype)
         else:
             q_in = _l2norm(query.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
             k_in = _l2norm(key.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
             v_in = value.to(torch.bfloat16).contiguous()
+            cu_seqlens = q_cu.to(torch.int32) if num_seqs != batch_size else \
+                torch.tensor([0, seq_len], dtype=torch.int32, device=device)
             result = chunk_kda_fwd(
                 q_in, k_in, v_in, g, b, scale,
                 chunk_size=64, layout="BSND",
