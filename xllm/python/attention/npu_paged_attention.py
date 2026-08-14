@@ -257,11 +257,17 @@ class NpuPagedAttentionBackend(AttentionBackend):
         layer_cache = self._kv_caches[layer_id]
         # MLA reuses the K/V slots for the latent (nope) and rope caches.
         nope_cache, rope_cache = layer_cache.key, layer_cache.value
-        if nope_cache is None or rope_cache is None:
+        if nope_cache is None:
             raise RuntimeError(f"MLA latent cache is missing for layer {layer_id}")
         # NoPE (qk_rope_head_dim==0): skip rope cache write + pass None to SFA.
+        # The rope/value slot may be empty (a 0-dim tensor) or absent (None) in
+        # NoPE models — it is never read, so do not require it.
         rope_dim = getattr(layer, "qk_rope_head_dim", None)
         if rope_dim and rope_dim > 0:
+            if rope_cache is None:
+                raise RuntimeError(
+                    f"MLA rope cache is missing for layer {layer_id} "
+                    f"(qk_rope_head_dim={rope_dim})")
             torch.ops.xllm_ops.reshape_paged_cache(
                 metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
             )
