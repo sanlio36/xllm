@@ -395,11 +395,20 @@ class W8A8DynamicLinear(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_int8, pertoken = kernels.dynamic_quant(x)
-        return kernels.quant_matmul(
+        # aclnnQuantMatmulV4 (EZ1001) requires pertoken_scale to be 1-D. A 3-D
+        # input ``[batch, seq, hidden]`` makes ``dynamic_quant`` produce a 2-D
+        # pertoken ``[batch, seq]`` -> crash. Flatten to ``[-1, in_features]``
+        # (pertoken becomes 1-D ``[batch*seq]``), run the fused matmul, then
+        # reshape the output back to the original leading dims.
+        leading = x.shape[:-1]
+        in_features = x.shape[-1]
+        x_flat = x.reshape(-1, in_features)
+        x_int8, pertoken = kernels.dynamic_quant(x_flat)
+        out = kernels.quant_matmul(
             x_int8, self.weight, False, self.weight_scale, None,
             pertoken, None, torch.bfloat16,
         )
+        return out.reshape(*leading, out.shape[-1])
 
 
 class W8A8WeightLoader:
