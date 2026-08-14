@@ -382,9 +382,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
         from xllm.python.models.glm5_next import (
             _causal_conv1d_fn,
             _causal_conv1d_update,
-            chunk_kimi_delta_attention,
-            recurrent_kimi_delta_attention,
+            _l2norm,
         )
+        from fla_npu.ops.ascendc import chunk_kda_fwd, recurrent_kda
 
         metadata = self._metadata
         assert metadata is not None, "execute_linear called before prepare()"
@@ -433,7 +433,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     ssm_i,
                     torch.zeros_like(ssm_i),
                 )
-            conv_state, ssm_state = conv_i, ssm_i
+            conv_state, ssm_state = conv_i, ssm_i.contiguous()
 
         conv_weight = layer.conv1d.weight.squeeze(1)
         activation = layer.activation
@@ -508,18 +508,45 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         g = gate if num_seqs == batch_size else gate.view(hidden_shape)
         b = beta if num_seqs == batch_size else beta.view(num_seqs, seq_len, num_heads_local)
+        # fla_npu KDA ops require fp32 gate/beta (the pure-torch reference also
+        # upcasts them); the model hands them in bf16.
+        g = g.to(torch.float32)
+        b = b.to(torch.float32)
+        # cu_seqlens for fla_npu varlen: [0, 1, 2, ..., num_seqs] for the
+        # equal-length multi-seq decode (or [0, seq_len] single-seq path).
+        device = mixed_qkv.device
+        cu_seqlens = (
+            torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
+            if seq_len == 1
+            else torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+        )
+        scale = 1.0 / (head_dim ** 0.5)
         if seq_len == 1:
-            core_attn_out, final_state = recurrent_kimi_delta_attention(
+            core_attn_out, final_state = recurrent_kda(
                 query, key, value, g, b,
-                initial_state=ssm_state, output_final_state=True,
+                initial_state=ssm_state,
+                cu_seqlens=cu_seqlens,
+                layout="BSND", scale=scale,
+                output_final_state=True, inplace_final_state=False,
                 use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=False,
+                use_beta_sigmoid_in_kernel=False,
             )
         else:
-            core_attn_out, final_state = chunk_kimi_delta_attention(
-                query, key, value, g, b,
-                chunk_size=64, initial_state=ssm_state,
-                output_final_state=True, use_qk_l2norm_in_kernel=True,
+            q_in = _l2norm(query.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
+            k_in = _l2norm(key.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
+            v_in = value.to(torch.bfloat16).contiguous()
+            result = chunk_kda_fwd(
+                q_in, k_in, v_in, g, b, scale,
+                chunk_size=64, layout="BSND",
+                initial_state=ssm_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_gate_in_kernel=False,
+                return_intermediate_states=False,
             )
+            core_attn_out = result[0].to(query.dtype)
+            final_state = result[1]
 
         if idx is not None:
             conv_cache.index_copy_(
