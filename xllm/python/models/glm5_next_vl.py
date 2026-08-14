@@ -140,6 +140,10 @@ class Glm5NextVisionConfig:
     # GLM-5-Next override: merger context dim. None = fall back to
     # out_hidden_size * in_channels (base GlmOcr / GLM-OCR behavior).
     projection_intermediate_size: Optional[int] = None
+    # GLM-5-Next SwiGLU clamp limit. HF's Glm5NextConfig injects this into the
+    # vision config from text_config.swiglu_limit (always 10.0 for this
+    # checkpoint). Applied to gate/up projections in VisionMLP + VisionPatchMerger.
+    swiglu_limit: Optional[float] = 10.0
     tp_size: int = 1
     tp_rank: int = 0
 
@@ -178,6 +182,7 @@ class Glm5NextVisionConfig:
                 # C++ side hasn't been extended yet.
                 default=10240,
             ),
+            swiglu_limit=pick("swiglu_limit", "mm_swiglu_limit", default=10.0),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
         )
@@ -407,9 +412,17 @@ class VisionMLP(nn.Module):
             self.act_fn = lambda x: F.gelu(x, approximate="tanh")
         else:
             raise ValueError(f"Unsupported hidden_act: {cfg.hidden_act}")
+        # GLM-5-Next SwiGLU clamp (HF Glm5NextVisionMLP): clamp gate/up before
+        # the gated multiply. gate is upper-clamped only; up is +/- clamped.
+        self.swiglu_limit = cfg.swiglu_limit
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        if self.swiglu_limit is not None:
+            gate = gate.clamp(min=None, max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class VisionBlock(nn.Module):
@@ -463,6 +476,7 @@ class VisionPatchMerger(nn.Module):
         hidden_act: str,
         bias: bool = False,
         tp_size: int = 1,
+        swiglu_limit: Optional[float] = 10.0,
     ) -> None:
         super().__init__()
         assert context_dim % tp_size == 0, (
@@ -481,11 +495,18 @@ class VisionPatchMerger(nn.Module):
             self.act_fn = F.gelu
         else:
             raise ValueError(f"Unsupported hidden_act: {hidden_act}")
+        # GLM-5-Next SwiGLU clamp (HF Glm5NextVisionPatchMerger).
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         hidden_state = self.proj(hidden_state)
         hidden_state = self.act1(self.post_projection_norm(hidden_state))
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        if self.swiglu_limit is not None:
+            gate = gate.clamp(min=None, max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +574,7 @@ class Glm5NextVisionModel(nn.Module):
             hidden_act=cfg.hidden_act,
             bias=False,
             tp_size=cfg.tp_size,
+            swiglu_limit=cfg.swiglu_limit,
         )
         self.downsample = nn.Conv2d(
             in_channels=cfg.hidden_size,
