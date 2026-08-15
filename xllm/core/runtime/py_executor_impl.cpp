@@ -236,6 +236,42 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object py_metadata =
       py::cast(AttentionMetadataView(attn_metadata, params));
 
+  // --- VLM: vision encode + embedding merge on image prefill steps ---
+  // On steps carrying multimodal input, ``params.multimodal.mm_data`` holds the
+  // batched ``pixel_values`` + ``image_grid_thw`` (same accessors the C++
+  // Qwen3-VL base uses in qwen3_vl_base.h). Drive the Python model's
+  // ``encode`` -> ``get_input_embeddings`` pipeline: the latter scatters the
+  // image embeddings at the image-token positions and sets
+  // ``model._inputs_embeds``, which Glm5NextModel.forward consumes at the start
+  // of forward (then clears). Decode steps carry no mm_data, so the attribute
+  // stays clear and the regular embed path is used.
+  //
+  // NOTE: this scatters the FULL image embedding into the current forward's
+  // tokens, so it assumes every image token is in this batch
+  // (enable_chunked_prefill=False). Chunked prefill — where a chunk boundary
+  // can land inside an item's token span — is not yet supported.
+  auto& mm_data = params.multimodal.mm_data;
+  if (mm_data.valid()) {
+    torch::Tensor pixel_values;
+    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values")) {
+      pixel_values = res.value();
+    }
+    torch::Tensor image_grid_thw;
+    if (const auto& res = mm_data.get<torch::Tensor>("image_grid_thw")) {
+      image_grid_thw = res.value();
+    }
+
+    if (pixel_values.defined() && image_grid_thw.defined()) {
+      py::object top_model = py_causal_lm_->python_model();
+      // encode() adjusts dtype internally; tensors are already on device
+      // (MultiModalInput::to moved mm_data onto the worker device).
+      py::object image_embeds =
+          top_model.attr("encode")(pixel_values, image_grid_thw);
+      // Sets model.model._inputs_embeds for the runner-driven forward.
+      top_model.attr("get_input_embeddings")(tokens, image_embeds);
+    }
+  }
+
   py::object py_sync = py::none();
 #if defined(USE_NPU)
   if (params.parallel.layer_synchronizer) {

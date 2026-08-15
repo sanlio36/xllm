@@ -155,11 +155,27 @@ class Glm5NextVisionConfig:
                     return d[k]
             return default
 
+        # The C++ ModelArgs default (``PROPERTY(float, swiglu_limit) = 0.0f``,
+        # model_args.h) leaks into the flat config dict because the C++ side
+        # does not carry the nested ``vision_config.swiglu_limit``. A picked
+        # 0/0.0 is therefore the unset default, not a real limit — and a limit
+        # of 0 would zero the SwiGLU gate/up (clamp(max=0) kills all positive
+        # values), collapsing the whole ViT output to zeros. Fall back to the
+        # HF default 10.0 (config.json vision_config.swiglu_limit).
+        swiglu_limit = pick("swiglu_limit", "mm_swiglu_limit", default=10.0)
+        if not swiglu_limit:
+            swiglu_limit = 10.0
+
         return cls(
             depth=int(pick("mm_num_hidden_layers", "depth", default=24)),
             hidden_size=int(pick("mm_hidden_size", "hidden_size", default=1024)),
             hidden_act=str(pick("mm_hidden_act", "hidden_act", default="silu")),
-            attention_bias=bool(pick("attention_bias", default=True)),
+            # NOTE: only the ``mm_``-prefixed key is honored. The C++ flat
+            # config dict carries the TEXT model's ``attention_bias = false``
+            # (ModelArgs default), which would silently disable every vision
+            # bias (qkv/proj/mlp) even though the checkpoint ships them —
+            # shape checks can't catch a missing bias.
+            attention_bias=bool(pick("mm_attention_bias", default=True)),
             attention_dropout=float(pick("mm_dropout", "attention_dropout", default=0.0)),
             num_heads=int(pick("mm_num_attention_heads", "num_heads", default=16)),
             in_channels=int(pick("mm_num_channels", "in_channels", "in_chans", default=3)),
@@ -182,7 +198,7 @@ class Glm5NextVisionConfig:
                 # C++ side hasn't been extended yet.
                 default=10240,
             ),
-            swiglu_limit=pick("swiglu_limit", "mm_swiglu_limit", default=10.0),
+            swiglu_limit=swiglu_limit,
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
         )
@@ -942,6 +958,22 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # (which default to float32 inside Glm5NextModel) are bf16 like the rest.
         self.to(device=device, dtype=dtype)
 
+        # Rotation-quantized checkpoints (QuaRot-style) fold a hidden-space
+        # orthogonal transform T into every LLM weight (embed/lm_head/linear
+        # matrices; norm weights are invariant), leaving the model functionally
+        # identical for TEXT but changing the hidden basis. The ViT is NOT
+        # rotated, so its image embeddings must be mapped into the rotated
+        # basis (image_embeds @ T) before being scattered into the LLM input —
+        # without this the LLM receives basis-mismatched image features and
+        # hallucinates. The transform is loaded from an explicit safetensors
+        # file (GLM5_HIDDEN_ROT, "hidden_rot.weight" [hidden, hidden]).
+        self._hidden_rot = None
+        _rot_path = os.environ.get("GLM5_HIDDEN_ROT")
+        if _rot_path:
+            from safetensors.torch import load_file as _load_sf
+            _t = _load_sf(_rot_path)["hidden_rot.weight"].to(device=device, dtype=dtype)
+            self._hidden_rot = _t
+
         # Install per-layer dump hooks. Glm5NextForCausalLM.__init__ installs
         # these too, but VLModel deliberately skips that __init__, so the
         # engine (which instantiates Glm5NextVLModel for model_type=glm5_next)
@@ -1049,6 +1081,10 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
                     f"Image features and image tokens do not match: "
                     f"tokens={n_image_tokens}, features={expected}"
                 )
+            if self._hidden_rot is not None:
+                # Map the (unrotated) ViT output into the rotation-quantized
+                # LLM's hidden basis — see __init__ for the full rationale.
+                image_embeds = image_embeds @ self._hidden_rot
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask, image_embeds.to(inputs_embeds.dtype)
