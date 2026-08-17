@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
@@ -138,6 +139,9 @@ py::dict PyCausalLM::build_config_dict(
   visit_properties(parallel_args, visitor);
   d["dtype"] = dtype_to_string(options_);
   d["device"] = c10::str(device_);
+  // Checkpoint directory: python models use it to discover side-car files
+  // shipped with the weights (e.g. optional/quarot.safetensors).
+  d["model_path"] = FLAGS_model;
   d["tp_size"] = tp_size_;
   d["tp_rank"] = tp_rank_;
   d["dp_size"] = dp_size_;

@@ -965,14 +965,24 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # rotated, so its image embeddings must be mapped into the rotated
         # basis (image_embeds @ T) before being scattered into the LLM input —
         # without this the LLM receives basis-mismatched image features and
-        # hallucinates. The transform is loaded from an explicit safetensors
-        # file (GLM5_HIDDEN_ROT, "hidden_rot.weight" [hidden, hidden]).
+        # hallucinates. The transform ships with the checkpoint itself
+        # (optional/quarot.safetensors, key "global_rotation"): its presence
+        # declares the checkpoint rotation-quantized. Unrotated checkpoints
+        # (bf16) have no such file and skip this.
         self._hidden_rot = None
-        _rot_path = os.environ.get("GLM5_HIDDEN_ROT")
-        if _rot_path:
+        _model_dir = config.get("model_path")
+        _rot_path = (
+            os.path.join(_model_dir, "optional", "quarot.safetensors")
+            if _model_dir else None
+        )
+        if _rot_path and os.path.exists(_rot_path):
             from safetensors.torch import load_file as _load_sf
-            _t = _load_sf(_rot_path)["hidden_rot.weight"].to(device=device, dtype=dtype)
-            self._hidden_rot = _t
+            _sd = _load_sf(_rot_path)
+            if "global_rotation" not in _sd:
+                raise RuntimeError(
+                    f"{_rot_path} has no 'global_rotation' key")
+            self._hidden_rot = _sd["global_rotation"].to(device=device,
+                                                         dtype=dtype)
 
         # Install per-layer dump hooks. Glm5NextForCausalLM.__init__ installs
         # these too, but VLModel deliberately skips that __init__, so the

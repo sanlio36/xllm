@@ -1285,31 +1285,14 @@ class Glm5NextMoE(nn.Module):
         )
 
         # --- W8A8 int8 experts (照搬 DeepseekV3MoE, deepseek_v32.py:755-796) ---
-        self.experts_w13 = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.inter_local, self.hidden,
-                       dtype=torch.int8, device=device),
-            requires_grad=False,
-        )
-        self.register_buffer("experts_w13_scale", torch.empty(
-            self.num_experts, 2 * self.inter_local, 1, dtype=torch.float32, device=device))
-        # Offsets must be zero: the int8-grouped path needs symmetric experts
-        # (process_weights_after_loading asserts offset == 0).
-        self.register_buffer("experts_w13_offset", torch.zeros(
-            self.num_experts, 2 * self.inter_local, 1, dtype=torch.float32, device=device))
-        self.experts_w2 = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden, self.inter_local,
-                       dtype=torch.int8, device=device),
-            requires_grad=False,
-        )
-        self.register_buffer("experts_w2_scale", torch.empty(
-            self.num_experts, self.hidden, 1, dtype=torch.float32, device=device))
-        self.register_buffer("experts_w2_offset", torch.zeros(
-            self.num_experts, self.hidden, 1, dtype=torch.float32, device=device))
-
-        # --- bf16 experts branch: LAZY (built only in _load_experts_bf16).
+        # LAZY: the int8 params are registered in _load_experts_w8a8 (the
+        # per-layer loader probes the checkpoint first). Eager allocation here
+        # costs ~17GB/card at TP16 of idle int8 on the bf16 path, which together
+        # with the bf16 experts OOMs the card (KV-cache estimation aborts with
+        # 0 available bytes).
+        # --- bf16 experts branch: LAZY too (built only in _load_experts_bf16).
         # Eagerly building Glm5NextExperts' 3D bf16 params (~38GB/card at TP8)
-        # alongside the int8 experts OOMs the 60GB card. Only the bf16 checkpoint
-        # path constructs self.experts; the W8A8 path never touches it.
+        # alongside the int8 experts OOMs the 60GB card.
         self.experts: Optional[Glm5NextExperts] = None
 
         self.shared_experts = Glm5NextMLP(
@@ -1998,6 +1981,34 @@ class Glm5NextForCausalLM(PyModelBase):
         unset (the W8A8 forward branch never reads them).
         """
         se = mlp + "experts."
+        # Lazily register the int8 expert params on first W8A8 layer (they are
+        # NOT allocated in __init__ — see the lazy-allocation note there).
+        layer_idx = int(mlp.split("layers.")[1].split(".")[0])
+        moe_mod = self.model.layers[layer_idx].mlp
+        ref = moe_mod.gate.weight
+        num_experts, inter_local, hidden = (
+            moe_mod.num_experts, moe_mod.inter_local, moe_mod.hidden)
+        if not hasattr(moe_mod, "experts_w13"):
+            moe_mod.experts_w13 = nn.Parameter(
+                torch.empty(num_experts, 2 * inter_local, hidden,
+                            dtype=torch.int8, device=ref.device),
+                requires_grad=False)
+            # Offsets must be zero: the int8-grouped path needs symmetric
+            # experts (process_weights_after_loading asserts offset == 0).
+            moe_mod.register_buffer("experts_w13_scale", torch.empty(
+                num_experts, 2 * inter_local, 1,
+                dtype=torch.float32, device=ref.device))
+            moe_mod.register_buffer("experts_w13_offset", torch.zeros(
+                num_experts, 2 * inter_local, 1,
+                dtype=torch.float32, device=ref.device))
+            moe_mod.experts_w2 = nn.Parameter(
+                torch.empty(num_experts, hidden, inter_local,
+                            dtype=torch.int8, device=ref.device),
+                requires_grad=False)
+            moe_mod.register_buffer("experts_w2_scale", torch.empty(
+                num_experts, hidden, 1, dtype=torch.float32, device=ref.device))
+            moe_mod.register_buffer("experts_w2_offset", torch.zeros(
+                num_experts, hidden, 1, dtype=torch.float32, device=ref.device))
         w13 = self.get_parameter(mlp + "experts_w13")
         w2 = self.get_parameter(mlp + "experts_w2")
         w13s = self.get_buffer(mlp + "experts_w13_scale")
@@ -2038,11 +2049,11 @@ class Glm5NextForCausalLM(PyModelBase):
         layer_idx = int(mlp.split("layers.")[1].split(".")[0])
         moe_mod = self.model.layers[layer_idx].mlp
         if moe_mod.experts is None:
-            # bf16 experts — use the shared_experts' dtype (bf16), NOT the int8
-            # experts_w13 dtype. Construct on the same device as the int8 params.
-            bf16_dtype = moe_mod.shared_experts.gate_up_proj.weight.dtype
+            # bf16 experts — dtype/device from the shared experts (the int8
+            # params are lazily created only on the W8A8 path).
+            ref = moe_mod.shared_experts.gate_up_proj.weight
             moe_mod.experts = Glm5NextExperts(
-                self.cfg, bf16_dtype, moe_mod.experts_w13.device)
+                self.cfg, ref.dtype, ref.device)
         # Build per-expert [2*inter, hidden] gate_up as [n_exp, 2*inter, hidden]
         # with layout [gate | up] along dim 1. Shard gate/up SEPARATELY then cat
         # (see _load_mlp comment: a contiguous shard of the cat'd tensor crosses

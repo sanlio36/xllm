@@ -501,7 +501,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         value = value.view(hidden_shape)
 
         g = gate if num_seqs == batch_size else gate.view(hidden_shape)
-        b = beta if num_seqs == batch_size else beta.view(num_seqs, seq_len, num_heads_local)
+        # ``beta`` arrives as [B, S, nh] and is already correct for both
+        # layouts: per-sequence [num_seqs, per_seq_len, nh] when the batch rows
+        # map 1:1 to sequences, and flattened [1, T, nh] (T = sum of q_cu) for
+        # the varlen multi-sequence path. Re-viewing it as
+        # (num_seqs, seq_len, nh) assumes a uniform per-seq length == the
+        # flattened total and crashes on multi-sequence decode batches
+        # (e.g. 2 concurrent requests: view [2, 2, 4] on 8 elements).
+        b = beta
         # fla_npu KDA ops require fp32 gate/beta (the pure-torch reference also
         # upcasts them); the model hands them in bf16.
         g = g.to(torch.float32)
@@ -537,7 +544,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 use_gate_in_kernel=False,
                 use_beta_sigmoid_in_kernel=False,
             )
-            core_attn_out = core_attn_out.to(query.dtype)
+            # recurrent_kda returns the packed TND [T, nh, hd] layout of its
+            # inputs; restore the [B, S, nh, hd] grouping the model layer
+            # expects (o_norm gates per head). For T == 1 the flat layout
+            # happens to broadcast identically, which masked this for
+            # single-stream decode; a multi-sequence decode batch (2
+            # concurrent requests flattened to [1, 2, ...]) surfaced it.
+            core_attn_out = core_attn_out.to(query.dtype).reshape(hidden_shape)
         else:
             q_in = _l2norm(query.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
             k_in = _l2norm(key.float(), dim=-1, eps=1e-6).to(torch.bfloat16).contiguous()
