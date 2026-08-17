@@ -742,6 +742,27 @@ class Glm5NextKdaAttention(Attention):
             distributed.all_reduce_(o)
         return o
 
+
+def _current_q_seq_lens(num_seqs: int, num_tokens: int) -> list[int]:
+    """Per-sequence query lengths of the current forward's varlen batch.
+
+    The engine flattens every batch to ``[1, T, ...]``; the real sequence
+    boundaries live in the attention metadata's ``q_cu_seq_lens`` (cumulative
+    offsets, same source the KDA layers use).
+    """
+    q_cu = get_forward_context().metadata.q_cu_seq_lens
+    if q_cu is None:
+        raise RuntimeError(
+            f"varlen batch without q_cu_seq_lens: cannot split "
+            f"num_tokens={num_tokens} across num_seqs={num_seqs}")
+    ends = q_cu[1:].cpu().tolist()
+    if len(ends) != num_seqs or ends[-1] != num_tokens:
+        raise RuntimeError(
+            f"q_cu_seq_lens does not describe this batch: ends={ends}, "
+            f"num_seqs={num_seqs}, num_tokens={num_tokens}")
+    return [ends[0]] + [ends[i] - ends[i - 1] for i in range(1, len(ends))]
+
+
 # ---------------------------------------------------------------------------
 # kPool DSA indexer (assembled from small ops, faithful to transformers)
 # ---------------------------------------------------------------------------
@@ -972,21 +993,56 @@ class Glm5NextIndexer(nn.Module):
             )
         packed_history = backend.gather_index_history(layer, batch_size)
         num_seqs = packed_history.shape[0]
-        if num_seqs != batch_size:
-            assert num_tokens % num_seqs == 0
-            per_seq = num_tokens // num_seqs
-            qr_bsd = qr.view(num_seqs, per_seq, -1)
-            hidden_bsd = hidden_states.view(num_seqs, per_seq, -1)
-            mask_bsd = attention_mask.view(num_seqs, per_seq)
+        if num_seqs == 1:
+            q_lens = [num_tokens]
+        elif num_tokens == num_seqs:
+            q_lens = [1] * num_seqs
         else:
-            qr_bsd = qr.view(batch_size, seq_len, -1)
-            hidden_bsd = hidden_states
-            mask_bsd = attention_mask
+            q_lens = _current_q_seq_lens(num_seqs, num_tokens)
+        max_q = max(q_lens)
+        is_varlen = max_q * num_seqs != num_tokens
+        if not is_varlen:
+            # Uniform per-sequence lengths (single sequence, packed
+            # one-token decode, equal-length batch): a plain view is exact
+            # and allocation-free — the decode hot path stays untouched.
+            qr_bsd = qr.view(num_seqs, max_q, -1)
+            hidden_bsd = hidden_states.view(num_seqs, max_q, -1)
+            mask_bsd = attention_mask.view(num_seqs, max_q)
+        else:
+            # Varlen batch (unequal prompts prefilled together): the engine
+            # flattens the batch to [1, T, D]; scatter tokens to a padded
+            # [num_seqs, max_q, ...] layout by the real sequence boundaries
+            # and mask the pad rows; the top-k rows are gathered back to the
+            # flat [T, ...] order below.
+            starts = [0]
+            for seq_len_i in q_lens[:-1]:
+                starts.append(starts[-1] + seq_len_i)
+            device = qr.device
+            starts_t = torch.tensor(starts, device=device, dtype=torch.int64)
+            lens_t = torch.tensor(q_lens, device=device, dtype=torch.int64)
+            q_offsets = torch.arange(max_q, device=device, dtype=torch.int64)
+            src = starts_t[:, None] + q_offsets[None, :]
+            valid = q_offsets[None, :] < lens_t[:, None]
+            src_flat = src.clamp(max=num_tokens - 1).reshape(-1)
+            qr_bsd = qr.index_select(0, src_flat).view(num_seqs, max_q, -1)
+            hidden_bsd = (
+                hidden_states.reshape(num_tokens, -1)
+                .index_select(0, src_flat)
+                .view(num_seqs, max_q, -1)
+            )
+            mask_bsd = (
+                attention_mask.reshape(-1)
+                .index_select(0, src_flat)
+                .view(num_seqs, max_q)
+                & valid
+            )
         kv_len = packed_history.shape[1]
         topk_indices = self.select_topk(
             qr_bsd, hidden_bsd, packed_history, mask_bsd,
             kv_len=kv_len, current_length=kv_len,
         )
+        if is_varlen:
+            topk_indices = topk_indices[valid]
         return topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
 
 
