@@ -359,6 +359,7 @@ class WorkerImpl {
   // an output to store the result of last step
   ForwardOutput last_step_output_;
   bool last_step_output_valid_ = false;
+  uint64_t debug_dp_mtp_overlap_step_id_ = 0;
   std::mutex mtx_;
   std::condition_variable cv_;
   bool is_recorded_ = false;

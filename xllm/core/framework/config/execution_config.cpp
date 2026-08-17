@@ -62,6 +62,11 @@ DEFINE_int32(acl_graph_decode_batch_size_limit,
              "When actual decode batch_size > this value, ACL graph decode "
              "falls back to eager mode to avoid OOM.");
 
+DEFINE_bool(debug_sync_dp_mtp_overlap,
+            false,
+            "Synchronize each NPU DP MTP schedule-overlap step and log its "
+            "batch metadata and input addresses. For debugging only.");
+
 DEFINE_bool(enable_shm,
             false,
             "Whether to enable shared memory for executing model.");
@@ -100,6 +105,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_vmm_pool);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_tokens_for_graph_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(acl_graph_decode_batch_size_limit);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_sync_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(input_shm_size);
@@ -116,6 +122,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_vmm_pool);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_tokens_for_graph_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(acl_graph_decode_batch_size_limit);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(debug_sync_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(input_shm_size);
@@ -141,6 +148,8 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, max_tokens_for_graph_mode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, acl_graph_decode_batch_size_limit);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, debug_sync_dp_mtp_overlap);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_shm);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

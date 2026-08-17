@@ -915,7 +915,18 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
       std::max<int32_t>(1,
                         ::xllm::ExecutionConfig::get_instance()
                             .acl_graph_decode_batch_size_limit()));
+  const bool debug_sync_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_sync_dp_mtp_overlap();
   if (global_batch_size > decode_batch_size_limit) {
+    if (debug_sync_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] executor=eager, reason="
+                   "decode_batch_limit, global_batch_size="
+                << global_batch_size
+                << ", local_batch_size=" << local_batch_size
+                << ", graph_token_count=" << graph_num_tokens
+                << ", local_token_count=" << n_tokens
+                << ", limit=" << decode_batch_size_limit;
+    }
     LOG_FIRST_N(WARNING, 1)
         << "Falling back to eager mode because decode batch_size (global="
         << global_batch_size << ", local=" << local_batch_size << ") > "
@@ -928,6 +939,14 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   const uint32_t bucket_num_tokens = get_bucket_num_tokens(graph_num_tokens);
+  if (debug_sync_dp_mtp_overlap) {
+    LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] executor=acl_graph"
+              << ", global_batch_size=" << global_batch_size
+              << ", local_batch_size=" << local_batch_size
+              << ", graph_token_count=" << graph_num_tokens
+              << ", local_token_count=" << n_tokens
+              << ", bucket_token_count=" << bucket_num_tokens;
+  }
 
   // Check if conditions are suitable for graph execution (replay or capture)
   const auto max_seq_len = args_.max_position_embeddings();

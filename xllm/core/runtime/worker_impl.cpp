@@ -191,6 +191,12 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
                                   device);
 }
 
+#if defined(USE_NPU)
+const void* tensor_data_address(const torch::Tensor& tensor) {
+  return tensor.defined() ? tensor.data_ptr() : nullptr;
+}
+#endif
+
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA) || \
     defined(USE_MUSA)
 struct LinearStateInputRows {
@@ -1192,8 +1198,65 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
         input = update_input_by_last_step_output_for_schedule_overlap(input);
       }
 
+#if defined(USE_NPU)
+      const bool debug_sync_dp_mtp_overlap =
+          ::xllm::ExecutionConfig::get_instance().debug_sync_dp_mtp_overlap() &&
+          options_.enable_speculative_decode() && parallel_args_.dp_size() > 1;
+      uint64_t debug_step_id = 0;
+      if (debug_sync_dp_mtp_overlap) {
+        debug_step_id = ++debug_dp_mtp_overlap_step_id_;
+        const ParallelInput& parallel = input.input_params.parallel;
+        LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] begin step=" << debug_step_id
+                  << ", rank=" << parallel_args_.rank() << ", batch_type="
+                  << input.input_params.meta.batch_forward_type.to_string()
+                  << ", num_sequences=" << input.input_params.meta.num_sequences
+                  << ", token_count=" << input.token_ids.numel()
+                  << ", dp_tokens=" << parallel.dp_global_token_nums
+                  << ", raw_dp_tokens=" << parallel.raw_dp_global_token_nums
+                  << ", dp_is_decode=" << parallel.dp_is_decode
+                  << ", token_ids_addr=" << tensor_data_address(input.token_ids)
+                  << ", positions_addr=" << tensor_data_address(input.positions)
+                  << ", input_buffer_addr="
+                  << tensor_data_address(input.device_input_buffer)
+                  << ", embedding_addr="
+                  << tensor_data_address(
+                         input.input_params.embedding.input_embedding)
+                  << ", kv_lens_addr="
+                  << tensor_data_address(
+                         input.input_params.attention.device.kv_seq_lens)
+                  << ", block_tables_addr="
+                  << tensor_data_address(
+                         input.input_params.attention.device.block_tables)
+                  << ", previous_output_valid=" << last_step_output_valid_
+                  << ", previous_retained_inputs="
+                  << last_step_output_.retained_inputs.size();
+      }
+#endif
       const auto output = this->step_for_schedule_overlap(input);
 #if defined(USE_NPU)
+      if (debug_sync_dp_mtp_overlap) {
+        const size_t retained_input_count =
+            output.has_value() ? output->retained_inputs.size() : 0;
+        const bool has_ready_event =
+            output.has_value() && output->ready_event != nullptr;
+        LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] queued step=" << debug_step_id
+                  << ", rank=" << parallel_args_.rank()
+                  << ", has_output=" << output.has_value()
+                  << ", has_ready_event=" << has_ready_event
+                  << ", retained_inputs=" << retained_input_count;
+        if (has_ready_event) {
+          CHECK(output->ready_event->synchronize())
+              << "failed to synchronize debug DP MTP overlap step "
+              << debug_step_id;
+        } else {
+          const int32_t ret = compute_stream_->synchronize();
+          CHECK_EQ(ret, 0) << "failed to synchronize debug DP MTP overlap "
+                              "compute stream at step "
+                           << debug_step_id;
+        }
+        LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] completed step=" << debug_step_id
+                  << ", rank=" << parallel_args_.rank();
+      }
       if (output.has_value() && !output->sample_output.next_tokens.defined() &&
           output->ready_event != nullptr && !output->retained_inputs.empty()) {
         CHECK(output->ready_event->synchronize())

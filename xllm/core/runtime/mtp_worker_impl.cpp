@@ -34,6 +34,7 @@ limitations under the License.
 #endif
 #include "core/framework/block/block_utils.h"
 #include "core/framework/config/disagg_pd_config.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
@@ -347,8 +348,33 @@ std::optional<ForwardOutput> run_llm_no_sync_impl(
       prepare_stream,
       /*record_ready_event=*/&prepare_stream != &compute_stream);
   worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
-  return worker.execute_no_sync_on_stream(
+  std::optional<ForwardOutput> output = worker.execute_no_sync_on_stream(
       processed_input, compute_stream, /*record_ready_event=*/false);
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_sync_dp_mtp_overlap()) {
+    static thread_local uint64_t debug_leaf_forward_id = 0;
+    ++debug_leaf_forward_id;
+    LOG(INFO)
+        << "[DP_MTP_OVERLAP_DEBUG] leaf_queued id=" << debug_leaf_forward_id
+        << ", batch_type="
+        << processed_input.input_params.meta.batch_forward_type.to_string()
+        << ", num_sequences=" << processed_input.input_params.meta.num_sequences
+        << ", token_count=" << processed_input.token_ids.numel()
+        << ", dp_tokens="
+        << processed_input.input_params.parallel.dp_global_token_nums
+        << ", raw_dp_tokens="
+        << processed_input.input_params.parallel.raw_dp_global_token_nums
+        << ", retained_inputs="
+        << (output.has_value() ? output->retained_inputs.size() : 0);
+    const aclError ret = aclrtSynchronizeDevice();
+    CHECK_EQ(ret, ACL_SUCCESS)
+        << "failed to synchronize debug DP MTP leaf forward "
+        << debug_leaf_forward_id;
+    LOG(INFO) << "[DP_MTP_OVERLAP_DEBUG] leaf_completed id="
+              << debug_leaf_forward_id;
+  }
+#endif
+  return output;
 }
 
 torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
