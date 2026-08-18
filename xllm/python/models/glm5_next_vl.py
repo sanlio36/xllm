@@ -143,7 +143,7 @@ class Glm5NextVisionConfig:
     # GLM-5-Next SwiGLU clamp limit. HF's Glm5NextConfig injects this into the
     # vision config from text_config.swiglu_limit (always 10.0 for this
     # checkpoint). Applied to gate/up projections in VisionMLP + VisionPatchMerger.
-    swiglu_limit: Optional[float] = 10.0
+    swiglu_limit: float = 10.0
     tp_size: int = 1
     tp_rank: int = 0
 
@@ -435,9 +435,8 @@ class VisionMLP(nn.Module):
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(hidden_state)
         up = self.up_proj(hidden_state)
-        if self.swiglu_limit is not None:
-            gate = gate.clamp(min=None, max=self.swiglu_limit)
-            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(self.act_fn(gate) * up)
 
 
@@ -492,7 +491,7 @@ class VisionPatchMerger(nn.Module):
         hidden_act: str,
         bias: bool = False,
         tp_size: int = 1,
-        swiglu_limit: Optional[float] = 10.0,
+        swiglu_limit: float = 10.0,
     ) -> None:
         super().__init__()
         assert context_dim % tp_size == 0, (
@@ -519,9 +518,8 @@ class VisionPatchMerger(nn.Module):
         hidden_state = self.act1(self.post_projection_norm(hidden_state))
         gate = self.gate_proj(hidden_state)
         up = self.up_proj(hidden_state)
-        if self.swiglu_limit is not None:
-            gate = gate.clamp(min=None, max=self.swiglu_limit)
-            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(self.act_fn(gate) * up)
 
 

@@ -25,8 +25,8 @@ This is a faithful pure-torch port of the transformers implementation
 that per-tensor alignment against the reference is exact (same ops, same fp32
 cast points, same eps, same interleaved RoPE, same scatter-based mask).
 
-KDA goes through the stable ``recurrent_kimi_delta_attention`` /
-``chunk_kimi_delta_attention`` interfaces (same signatures as the transformers
+KDA goes through the stable ``fused_recurrent_kda`` /
+``chunk_kda`` interfaces (same signatures as the transformers
 ``@use_kernel_func_from_hub``-decorated functions). Today those run the faithful
 pure-torch delta-rule bodies (matching transformers' recurrent/chunk paths for
 alignment); an NPU small-kernel implementation can later be swapped in behind
@@ -300,17 +300,17 @@ def _causal_conv1d_update_graph(mixed_qkv: torch.Tensor, conv_state: torch.Tenso
     return out.to(mixed_qkv.dtype)
 
 
-def recurrent_kimi_delta_attention(
+def fused_recurrent_kda(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     g: torch.Tensor, beta: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """KDA recurrent delta-rule (single-token decode path).
+    """KDA fused recurrent delta-rule (single-token decode path).
 
-    Stable interface matching transformers ``recurrent_kimi_delta_attention``
-    (``@use_kernel_func_from_hub``-decorated); the pure-torch body is the
+    Stable interface matching transformers ``fused_recurrent_kda``
+    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
     faithful port of the reference fallback. An NPU small kernel can be swapped
     in behind this interface without changing the layer.
     """
@@ -354,7 +354,7 @@ def recurrent_kimi_delta_attention(
     return core_attn_out.to(initial_dtype), final_state
 
 
-def chunk_kimi_delta_attention(
+def chunk_kda(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     g: torch.Tensor, beta: torch.Tensor,
     chunk_size: int = 64,
@@ -364,8 +364,8 @@ def chunk_kimi_delta_attention(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """KDA chunked delta-rule (multi-token prefill path).
 
-    Stable interface matching transformers ``chunk_kimi_delta_attention``
-    (``@use_kernel_func_from_hub``-decorated); the pure-torch body is the
+    Stable interface matching transformers ``chunk_kda``
+    (``@use_kernel_func_from_hub_with_fallback``-decorated); the pure-torch body is the
     faithful port of the reference fallback. An NPU small kernel can be swapped
     in behind this interface without changing the layer.
     """
@@ -483,6 +483,7 @@ class Glm5NextConfig:
     kda_head_dim: int = 128
     short_conv_kernel_size: int = 4
     linear_lower_bound: Optional[float] = -5.0
+    swiglu_limit: float = 10.0
     # MoE
     moe_intermediate_size: int = 2048
     n_routed_experts: int = 288
@@ -579,6 +580,7 @@ class Glm5NextConfig:
             kda_head_dim=kda_dim,
             short_conv_kernel_size=conv_k,
             linear_lower_bound=lower_bound,
+            swiglu_limit=float(pick("swiglu_limit", default=10.0)) or 10.0,
             moe_intermediate_size=int(pick("moe_intermediate_size", default=2048)),
             n_routed_experts=int(
                 pick("n_routed_experts", "num_local_experts", "num_experts", default=288)
@@ -710,8 +712,8 @@ class Glm5NextKdaAttention(Attention):
     ssm_cache: ``[num_slots, nh, k_hd, v_hd]`` fp32) and the per-sequence
     slot/cold-start view (``linear_state_indices`` / ``has_initial_state``).
 
-    The KDA math goes through the stable ``recurrent_kimi_delta_attention`` /
-    ``chunk_kimi_delta_attention`` interfaces (or fla_npu fused ops when
+    The KDA math goes through the stable ``fused_recurrent_kda`` /
+    ``chunk_kda`` interfaces (or fla_npu fused ops when
     ``GLM5NEXT_KDA_BACKEND=fla_npu``); see their docstrings.
     """
 
@@ -1315,6 +1317,7 @@ class Glm5NextMLP(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.skip_tp_reduce = skip_tp_reduce
+        self.swiglu_limit = cfg.swiglu_limit
         # TP: column-parallel SwiGLU (gate_up sharded on the intermediate dim)
         # + row-parallel down_proj (sharded on the input dim, summed via
         # all_reduce_ in forward). At tp==1 inter_local == intermediate_size so
@@ -1346,6 +1349,9 @@ class Glm5NextMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.chunk(2, dim=-1)
+        # GLM-5-Next SwiGLU clamp (matches HF Glm5NextTextMLP).
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         out = self.down_proj(F.silu(gate) * up)
         if self.cfg.tp_size > 1 and not self.skip_tp_reduce:
             distributed.all_reduce_(out)
@@ -1366,6 +1372,7 @@ class Glm5NextExperts(nn.Module):
         super().__init__()
         self.num_experts = cfg.n_routed_experts
         self.tp = cfg.tp_size
+        self.swiglu_limit = cfg.swiglu_limit
         # Local shard of the expert intermediate (inter // tp).
         self.intermediate_dim = cfg.moe_intermediate_size // cfg.tp_size
         self.hidden_dim = cfg.hidden_size
@@ -1400,6 +1407,9 @@ class Glm5NextExperts(nn.Module):
             top_k_pos, token_idx = torch.where(mask[expert_idx])
             gate_up = F.linear(hidden_states[token_idx], self.gate_up_proj[expert_idx])
             gate, up = gate_up.chunk(2, dim=-1)
+            # GLM-5-Next SwiGLU clamp (matches HF Glm5NextTextExperts).
+            gate = gate.clamp(min=None, max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             current = F.linear(F.silu(gate) * up, self.down_proj[expert_idx])
             current = current * top_k_weights[token_idx, top_k_pos, None]
             final_f32[token_idx, top_k_pos] += current.float()
