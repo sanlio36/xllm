@@ -1030,9 +1030,16 @@ class Glm5NextIndexer(nn.Module):
             # pool0 a candidate for tok0..kpool-2; the per-position causal filter
             # below then keeps only the slots the query can actually see.
             pool_start = pool_indices[..., 0].clamp(0, kv_len - 1)
-            batch_idx = torch.arange(batch_size, device=device)[:, None, None]
-            query_idx = torch.arange(seq_len, device=device)[None, :, None]
-            pool_visible = token_visible[batch_idx, query_idx, pool_start[:, None, :]]
+            # AICore-native gather replaces fancy indexing
+            # token_visible[batch_idx, query_idx, pool_start[:, None, :]] which
+            # falls back to aclnnIndex on AI_CPU. token_visible is
+            # [B, S_q, kv_len]; index dim=2 by pool_start [B, n_pools],
+            # broadcast over S_q -> [B, S_q, n_pools]. bool is cast uint8 for
+            # gather (no bool kernel) then restored.
+            pool_idx_expand = pool_start[:, None, :].expand(batch_size, seq_len, -1)
+            pool_visible = token_visible.to(torch.uint8).gather(
+                2, pool_idx_expand
+            ).to(torch.bool)
             candidate_valid = (pool_visible & pool_valid[:, None]).to(torch.bool)
             pool_scores = pool_scores.masked_fill(
                 ~candidate_valid, torch.finfo(pool_scores.dtype).min
@@ -1048,9 +1055,21 @@ class Glm5NextIndexer(nn.Module):
             )
         else:
             selected = pool_scores.topk(select_k, dim=-1).indices
-            batch_pool_idx = torch.arange(batch_size, device=device)[:, None, None]
             selected_valid = candidate_valid.gather(-1, selected)
-            selected_indices = pool_indices[batch_pool_idx, selected]
+            # AICore-native gather replaces fancy indexing
+            # pool_indices[batch_pool_idx, selected] which falls back to
+            # aclnnIndex on AI_CPU. pool_indices is [B, n_pools, rate]; index
+            # dim=1 by selected [B, S_q, select_k] -> [B, S_q, select_k, rate].
+            # Flatten (n_pools*rate) rows and gather, matching the
+            # get_pooled_states pattern.
+            rate = self.index_kpool
+            rate_off = torch.arange(rate, device=device)
+            sel_flat = (selected[..., None] * rate + rate_off).reshape(
+                batch_size, -1
+            )
+            selected_indices = pool_indices.reshape(batch_size, -1).gather(
+                1, sel_flat
+            ).reshape(batch_size, seq_len, select_k, rate)
             topk_indices = selected_indices.flatten(-2)
             topk_indices = topk_indices.masked_fill(
                 ~selected_valid[..., None].expand_as(selected_indices).flatten(-2),
@@ -1062,9 +1081,12 @@ class Glm5NextIndexer(nn.Module):
             # of a prefill). Drop any selected position the query cannot
             # causally see, so tok0 -> {0}, tok1 -> {0,1}, ... (matches ref).
             safe_pos = topk_indices.clamp(0, kv_len - 1)
-            b_idx = torch.arange(batch_size, device=device)[:, None, None]
-            q_idx = torch.arange(seq_len, device=device)[None, :, None]
-            pos_visible = token_visible[b_idx, q_idx, safe_pos]
+            # AICore-native gather replaces fancy indexing
+            # token_visible[b_idx, q_idx, safe_pos] which falls back to
+            # aclnnIndex on AI_CPU. token_visible is [B, S_q, kv_len]; index
+            # dim=2 by safe_pos [B, S_q, select_k*rate]. bool cast uint8 for
+            # gather then restored.
+            pos_visible = token_visible.to(torch.uint8).gather(2, safe_pos).to(torch.bool)
             topk_indices = topk_indices.masked_fill(~pos_visible, -1)
 
         output_width = self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
