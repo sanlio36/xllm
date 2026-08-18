@@ -36,6 +36,11 @@ class SpeculativeEngine : public Engine {
 
   bool init(MasterStatus master_status) override;
 
+  // VLM masters initialize the engine via the no-arg Engine::init(); without
+  // this override the call would hit the base no-op and the speculative
+  // engine would never initialize under VLMMaster.
+  bool init() override { return init(MasterStatus(MasterStatus::WAKEUP)); }
+
   // step the engine forward
   ForwardOutput step(std::vector<Batch>& batch) override;
 
@@ -106,7 +111,7 @@ class SpeculativeEngine : public Engine {
   const runtime::Options options_;
 
   // engine
-  std::unique_ptr<LLMEngine> engine_;
+  std::unique_ptr<Engine> engine_;
 
   // draft engine
   std::unique_ptr<LLMEngine> draft_engine_;

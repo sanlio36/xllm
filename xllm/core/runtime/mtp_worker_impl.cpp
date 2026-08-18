@@ -533,6 +533,14 @@ bool is_qwen3_5_draft_model_type(const std::string& model_type) {
          mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
 }
 
+// The GLM-5-Next python MTP draft checkpoint carries its own embed_tokens /
+// lm_head copies (the exporter materializes them), so it needs no
+// target->draft weight sharing (the python CausalLM set_lm_head path is not
+// implemented for PyCausalLM).
+bool is_glm5_next_mtp_draft_model_type(const std::string& model_type) {
+  return model_type == "glm5_next_mtp";
+}
+
 }  // namespace
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
@@ -585,12 +593,15 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
   if (draft_impl_ != nullptr &&
       draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
     const bool draft_owns_shared_weights =
-        options_.enable_mtp_draft_body_tp1() &&
-        is_qwen3_5_draft_model_type(
+        (options_.enable_mtp_draft_body_tp1() &&
+         is_qwen3_5_draft_model_type(
+             draft_impl_->context_.get_model_args().model_type())) ||
+        is_glm5_next_mtp_draft_model_type(
             draft_impl_->context_.get_model_args().model_type());
-    // Qwen3.5 draft checkpoints contain complete embedding and LMHead weights.
-    // Other MTP drafts retain their existing target-weight sharing contract;
-    // only their transformer body is replicated with TP1 parallel arguments.
+    // Qwen3.5 and GLM-5-Next draft checkpoints contain complete embedding and
+    // LMHead weights. Other MTP drafts retain their existing target-weight
+    // sharing contract; only their transformer body is replicated with TP1
+    // parallel arguments.
     if (!draft_owns_shared_weights) {
 #if defined(USE_NPU)
       if (::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
@@ -1066,6 +1077,12 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
   prefill_input = input.to(device_, dtype_);
   prefill_input.sampling_params.return_probs = true;
   clear_ready_events(prefill_input);
+  // The draft model feeds on the target's hidden states (input_embedding set
+  // below), never on raw multimodal input: strip the copied mm_data so the
+  // draft executor does not drive vision encode on the text-only draft model
+  // (whose python object has no ``encode``) and skips the device copy of
+  // pixel_values it would never consume.
+  prefill_input.input_params.multimodal.mm_data = MMBatchData();
   auto& input_params = prefill_input.input_params;
   auto& extra_token_ids = input_params.embedding.extra_token_ids;
 

@@ -102,5 +102,7 @@ def _register_builtin_models() -> None:
 _register_builtin_models()
 
 from xllm.python.models.glm5_next_vl import Glm5NextVLModel
+from xllm.python.models.glm5_next_mtp import Glm5NextMtpForCausalLM
 
 register_model("glm5_next")(Glm5NextVLModel)
+register_model("glm5_next_mtp")(Glm5NextMtpForCausalLM)

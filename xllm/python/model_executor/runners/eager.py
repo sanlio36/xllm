@@ -72,6 +72,38 @@ class EagerRunner(BaseRunner):
                 cp_context=cp_context,
             )
         ):
-            if input_embedding is None:
-                return self.model(input_ids, positions)
-            return self.model(input_ids, positions, input_embedding)
+            # Draft-MTP steps carry the target's (or previous draft step's)
+            # hidden state as input_embedding; the MTP body fuses it with the
+            # token embedding. Regular steps take the 2-arg path.
+            try:
+                if input_embedding is None:
+                    return self.model(input_ids, positions)
+                return self.model(input_ids, positions, input_embedding)
+            except Exception:
+                # Crash forensics: pybind11 swallows the python traceback when
+                # the exception crosses into C++ (only what() survives), so
+                # persist the full stack + input shapes to a file first.
+                import os
+                import traceback
+                with open("/tmp/mtp_py_crash.log", "a") as fh:
+                    fh.write(f"\n=== pid={os.getpid()} ===\n")
+                    fh.write(
+                        f"ids={tuple(input_ids.shape)} "
+                        f"pos={tuple(positions.shape)} "
+                        f"emb={tuple(input_embedding.shape) if input_embedding is not None else None}\n"
+                    )
+                    fh.write(f"contig emb={input_embedding.is_contiguous() if input_embedding is not None else None}\n")
+                    try:
+                        fh.write(
+                            f"meta: prefill={metadata.is_prefill} "
+                            f"chunked={metadata.is_chunked_prefill} "
+                            f"q_cu={metadata.q_cu_seq_lens.tolist() if metadata.q_cu_seq_lens is not None else None} "
+                            f"kv={metadata.kv_seq_lens.tolist() if metadata.kv_seq_lens is not None else None} "
+                            f"lsi={metadata.linear_state_indices.tolist() if metadata.linear_state_indices is not None else None} "
+                            f"bt={tuple(metadata.block_table.shape) if metadata.block_table is not None else None}\n"
+                        )
+                    except Exception:
+                        pass
+                    traceback.print_exc(file=fh)
+                    fh.flush()
+                raise

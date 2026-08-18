@@ -112,6 +112,13 @@ void ServiceImplFactory::create(
   };
 
   ServingMode mode = to_serving_mode(master->engine_type());
+  // A VLMMaster keeps its multimodal request services even when its engine
+  // is upgraded to the speculative (SSM) type for MTP decoding: the VLM
+  // services key off the master (mm processing lives in VLMMaster), while
+  // the LLM branch would dynamic_cast the VLMMaster to nullptr and crash.
+  if (dynamic_cast<VLMMaster*>(master) != nullptr) {
+    mode = ServingMode::VLM;
+  }
   auto it = kRegistry.find(static_cast<int8_t>(mode));
   if (it != kRegistry.end()) {
     it->second(service, master, model_names);

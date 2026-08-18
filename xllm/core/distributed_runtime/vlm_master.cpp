@@ -61,10 +61,21 @@ std::vector<Message> build_user_messages_from_image_urls(
   return messages;
 }
 
+// Mirror of llm_master.cpp's should_use_ssm_engine: a draft model (or the
+// suffix speculative mode) upgrades the engine to the speculative (SSM)
+// path so VLM requests also benefit from MTP decoding.
+bool should_use_ssm_engine(const Options& options) {
+  return !options.draft_model_path().value_or("").empty() ||
+         (options.speculative_algorithm() == "Suffix" &&
+          options.num_speculative_tokens() > 0);
+}
+
 }  // namespace
 
 VLMMaster::VLMMaster(const Options& options)
-    : Master(options, EngineType::VLM) {
+    : Master(
+          options,
+          should_use_ssm_engine(options) ? EngineType::SSM : EngineType::VLM) {
   CHECK(engine_->init());
 
   model_args_ = engine_->model_args();
@@ -509,7 +520,9 @@ std::shared_ptr<Request> VLMMaster::generate_request(
 volatile bool VLMAssistantMaster::running_ = false;
 
 VLMAssistantMaster::VLMAssistantMaster(const Options& options)
-    : Master(options, EngineType::VLM) {
+    : Master(
+          options,
+          should_use_ssm_engine(options) ? EngineType::SSM : EngineType::VLM) {
   auto master_node_addr = options_.master_node_addr().value_or("");
   if (master_node_addr.empty()) {
     LOG(FATAL)

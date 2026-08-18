@@ -341,6 +341,10 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
+      // Mounts the per-sequence EMBEDDING resource leaf under speculative
+      // decoding; without it MTP prefill writes the target context with
+      // embedding id -1 and crashes (llm_engine.cpp always passes this).
+      .num_speculative_tokens(options_.num_speculative_tokens())
       // DECODE-side prefix cache participation is per-leaf and gated by the
       // predicate in composite_block_manager.cpp; mirror llm_engine so a
       // linear-attention VLM decode instance disables the LINEAR prefix cache.

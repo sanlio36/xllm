@@ -305,6 +305,23 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
   }
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
+  // MTP spec-verify expands one logical sequence into multiple active rows
+  // (bonus + drafted tokens) that share ONE linear state slot. cache_ops are
+  // built per logical sequence while the restore contract is one op per
+  // active row (validity_mask is indexed by row); replicate each op across
+  // its contiguous row group, mirroring build_linear_state_mask's layout.
+  auto& cache_ops = input_params.linear_state_cache_ops;
+  const size_t row_count = input_params.linear_state_validity_mask.size();
+  if (!cache_ops.empty() && row_count > cache_ops.size() &&
+      row_count % cache_ops.size() == 0) {
+    const size_t repeat = row_count / cache_ops.size();
+    std::vector<LinearStateCacheOp> expanded;
+    expanded.reserve(row_count);
+    for (const LinearStateCacheOp& cache_op : cache_ops) {
+      expanded.insert(expanded.end(), repeat, cache_op);
+    }
+    cache_ops = std::move(expanded);
+  }
 }
 #endif
 
@@ -917,13 +934,22 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA)
     if (has_linear_attention_layers(context_.get_model_args())) {
       prepare_input_params_for_linear_attention(input_params);
+      // A composite worker (e.g. MTPWorkerImpl) carries the TARGET model args
+      // but never allocates its own kv_caches_ — its inner impls each own
+      // caches and run their own restore. Skip the restore when this worker
+      // holds no recurrent cache; restoring into an unallocated pool is a
+      // hard CHECK inside restore_linear_state_slots.
+      const bool owns_recurrent_cache = std::any_of(
+          kv_caches_.begin(), kv_caches_.end(), [](const KVCache& kv_cache) {
+            return kv_cache.get_ssm_cache().defined();
+          });
       // Under schedule_overlap chunked prefill the previous chunk's forward
       // runs on compute_stream_ from a worker thread that may not have
       // enqueued its kernels yet when this prepare runs on the main thread.
       // Defer the slot-restore copy to step_for_schedule_overlap (worker
       // thread, on compute_stream_) so stream ordering between chunk N-1
       // writes and chunk N restore is automatic.
-      if (!enable_schedule_overlap()) {
+      if (!enable_schedule_overlap() && owns_recurrent_cache) {
         restore_linear_state_slots(kv_caches_,
                                    input_params.linear_state_cache_ops,
                                    input_params.linear_state_validity_mask);

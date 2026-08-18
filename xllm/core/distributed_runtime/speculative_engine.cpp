@@ -26,6 +26,7 @@ limitations under the License.
 #include "runtime/forward_params.h"
 #include "util/timer.h"
 #include "util/utils.h"
+#include "vlm_engine.h"
 
 namespace xllm {
 
@@ -46,7 +47,13 @@ SpeculativeEngine::SpeculativeEngine(const runtime::Options& options,
   runtime::Options target_engine_options = options_;
   target_engine_options.num_decoding_tokens(options.num_speculative_tokens() +
                                             1);
-  engine_ = std::make_unique<LLMEngine>(target_engine_options, dist_manager_);
+  // The target engine follows the requested backend so a multimodal model
+  // keeps its vision prefill path; the draft engine is always text-only.
+  if (options_.backend() == "vlm") {
+    engine_ = std::make_unique<VLMEngine>(target_engine_options, dist_manager_);
+  } else {
+    engine_ = std::make_unique<LLMEngine>(target_engine_options, dist_manager_);
+  }
 
   if (use_draft_engine_) {
     // draft engine

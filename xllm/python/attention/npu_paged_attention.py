@@ -21,7 +21,7 @@ Prefill uses FIA TND with causal mask; decode uses FIA TND with block_table.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
@@ -46,6 +46,23 @@ from xllm.python.model_executor.forward_context import (
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
     from xllm.python.model_executor.cp_utils import CpContext
+
+# Spec-verify state-commit scheme: "lazy" (default) commits exactly the
+# confirmed tokens - each verify step stashes its raw qkv/gate rows and the
+# next step advances the live state by the kv delta (the count the C++
+# actually committed: draft on accept, corrected argmax on reject), so the
+# linear state tracks the true token stream exactly (verified offline
+# against a plain-decode oracle: per-step output divergence decays to zero,
+# vs a persistent ~6e-3 error for the alternative). "full"
+# (GLM5_MTP_COMMIT=full) commits both verify rows every step - the
+# re-processed row0 write is near-idempotent under the delta rule, but a
+# rejected draft leaves a phantom write, a persistent per-step error.
+
+_MTP_FULL_COMMIT = os.environ.get("GLM5_MTP_COMMIT", "lazy") == "full"
+# Spec-verify acceptance instrumentation (MTP_TRACE=1): layer-0 counts
+# verify steps and non-prefill plain steps (each reject inserts one plain
+# bootstrap step, so the plain share of decode steps is the reject rate).
+_MTP_TRACE = os.environ.get("MTP_TRACE", "") == "1"
 
 # Ascend FIA sparse_mode values (see CANN aclnnFusedInferAttentionScore docs).
 # 0: no compressed mask; used for single-query decode where no causal mask is
@@ -691,6 +708,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
         qkv_dim = layer.qkv_dim
         hidden_shape = (batch_size, seq_len, -1, head_dim)
 
+        # Raw (pre-conv) projections for the lazy-commit stash, kept alive
+        # across the branches below (mixed_qkv is reassigned post-conv), and
+        # the per-seq read-only chain bookkeeping for plain steps (see the
+        # non-verify branch).
+        raw_mixed, raw_gate, raw_beta = mixed_qkv, gate, beta
+        chain_seqs: dict = {}
+
         idx = metadata.linear_state_indices
         num_seqs = idx.shape[0] if idx is not None else batch_size
         # ACL-graph decode with a flattened batch: the model forward unsqueezes
@@ -730,6 +754,239 @@ class NpuPagedAttentionBackend(AttentionBackend):
         else:
             if idx.dtype != torch.int64:
                 idx = idx.to(torch.int64)
+            # MTP spec-verify expands one logical sequence into consecutive
+            # batch rows (bonus + drafted tokens, e.g. q_cu=[0,1,2,3,4] for
+            # two k=1 sequences, kv=[n,n+1,m,m+1] per row) while
+            # linear_state_indices stays per SEQUENCE (one slot id per
+            # sequence, e.g. [s1,s2] for the four rows above). Expand each
+            # sequence's slot across its contiguous row group, then merge the
+            # same-slot rows back into single sequences: the recurrent state
+            # must chain bonus -> draft inside one sequence, and the cache
+            # read/write needs one row per slot. Mapping rows to sequences by
+            # position instead (rows==seqs) silently drops the tail rows of
+            # every sequence past the first and corrupts the view/layout
+            # downstream.
+            merged_q_cu: Optional[torch.Tensor] = None
+            merged_row0: list = []
+            q_cu_raw = metadata.q_cu_seq_lens
+            q_rows = int(q_cu_raw.numel()) - 1 if q_cu_raw is not None else 0
+            per_row_idx = None
+            if q_rows == idx.numel() and idx.numel() > 1 and bool(
+                    (idx[1:] == idx[:-1]).any().item()):
+                # Defensive: indices already duplicated per row.
+                per_row_idx = idx
+            elif q_rows > idx.numel() and q_rows % idx.numel() == 0:
+                # Spec-verify expansion (uniform rows per sequence = k+1).
+                per_row_idx = idx.repeat_interleave(q_rows // idx.numel())
+            elif q_rows > idx.numel():
+                raise RuntimeError(
+                    f"unaligned linear-state batch: {q_rows} rows vs "
+                    f"{idx.numel()} sequences with non-uniform expansion")
+            if per_row_idx is not None:
+                row_lengths = (q_cu_raw[1:] - q_cu_raw[:-1]).tolist()
+                merged_lengths: list = []
+                merged_slots: list = []
+                for row, (slot, length) in enumerate(
+                        zip(per_row_idx.tolist(), row_lengths)):
+                    if merged_slots and slot == merged_slots[-1]:
+                        merged_lengths[-1] += length
+                    else:
+                        merged_slots.append(slot)
+                        merged_lengths.append(length)
+                        merged_row0.append(row)
+                merged_cu = [0]
+                for length in merged_lengths:
+                    merged_cu.append(merged_cu[-1] + length)
+                merged_q_cu = torch.tensor(
+                    merged_cu, dtype=torch.int64, device=idx.device)
+                idx = torch.tensor(
+                    merged_slots, dtype=torch.int64, device=idx.device)
+                num_seqs = idx.shape[0]
+            else:
+                # Non-verify path (plain decode / prefill): states are
+                # committed wholesale the regular way, plus lazy-commit
+                # handshakes - but ONLY once this backend has seen a
+                # spec-verify batch, so a pure-decode engine (no MTP) keeps
+                # its exact pre-MTP behavior. (1) A reject interrupts the
+                # verify chain with a bootstrap plain step while the chain's
+                # last confirmed token is still stashed un-advanced - consume
+                # that stash FIRST (advance the live caches), or the token is
+                # silently lost from the linear state at every rejection.
+                # (2) A plain step with an open chain is processed
+                # READ-ONLY: its row is stashed and committed by the next
+                # verify's advance, so both its own output and the re-
+                # processed row0 in the next verify match a plain decode
+                # exactly (committing here would make the next verify's row0
+                # run from a state already containing it). (3) Other plain
+                # steps record a coverage marker (kv length, empty stash) so
+                # the next verify does not re-advance them. Prefill resets
+                # the chain (the slot restarts from a fresh state).
+                if not _MTP_FULL_COMMIT:
+                    _pending = getattr(self, "_mtp_pending", None)
+                    if _pending is None:
+                        _pending = {}
+                        self._mtp_pending = _pending
+                    _lp = _pending.setdefault(layer.layer_id, {})
+                    _kv_list = (metadata.kv_seq_lens.tolist()
+                                if metadata.kv_seq_lens is not None else None)
+                    _active = getattr(self, "_mtp_seen_verify", False)
+                    _is_pf = (metadata.is_prefill
+                              or metadata.is_chunked_prefill)
+                    if (_MTP_TRACE and layer.layer_id == 0 and not _is_pf
+                            and getattr(self, "_mtp_stats", None) is not None):
+                        # Non-prefill plain steps inside the decode phase are
+                        # the rejection bootstraps - their share of all steps
+                        # is the acceptance-rate signal.
+                        self._mtp_stats["plain"] += num_seqs
+                    _cw = layer.conv1d.weight.squeeze(1)
+                    for s, slot in enumerate(idx.tolist()):
+                        slot = int(slot)
+                        if _is_pf or _kv_list is None or s >= len(_kv_list):
+                            _lp.pop(slot, None)
+                            continue
+                        prev = _lp.get(slot)
+                        if not _active or prev is None:
+                            _lp[slot] = (
+                                int(_kv_list[s]), mixed_qkv[:, :, 0:0],
+                                gate[:, 0:0], beta[:, 0:0],
+                                _cw, layer.activation)
+                            continue
+                        (prev_base, prev_seg, prev_g, prev_b,
+                         _pw, _pact) = prev
+                        _m = int(_kv_list[s]) - 1 - prev_base
+                        if 0 < _m <= prev_seg.shape[2]:
+                            _cs = (conv_cache[slot]
+                                   .transpose(0, 1).unsqueeze(0)
+                                   .contiguous())
+                            _cin = torch.cat(
+                                [_cs, prev_seg[:, :, :_m]], dim=-1)
+                            _adv_qkv = _causal_conv1d_fn(
+                                _cin, _cw, layer.activation,
+                            )[:, :, -_m:]
+                            conv_cache[slot] = _cin[
+                                0, :, -conv_state_len:].transpose(0, 1)
+                            _sp = torch.split(
+                                _adv_qkv.transpose(1, 2),
+                                [qkv_dim] * 3, dim=-1)
+                            _, _st = recurrent_kda(
+                                _sp[0].reshape(
+                                    -1, num_heads_local, head_dim
+                                ).to(torch.bfloat16).contiguous(),
+                                _sp[1].reshape(
+                                    -1, num_heads_local, head_dim
+                                ).to(torch.bfloat16).contiguous(),
+                                _sp[2].reshape(
+                                    -1, num_heads_local, head_dim
+                                ).to(torch.bfloat16).contiguous(),
+                                prev_g[:, :_m].reshape(
+                                    -1, num_heads_local, head_dim
+                                ).to(torch.float32).contiguous(),
+                                prev_b[:, :_m].reshape(
+                                    -1, num_heads_local
+                                ).to(torch.float32).contiguous(),
+                                initial_state=ssm_cache[slot].unsqueeze(0),
+                                cu_seqlens=torch.tensor(
+                                    [0, _m], dtype=torch.int32,
+                                    device=mixed_qkv.device),
+                                layout="TND",
+                                scale=1.0 / (head_dim ** 0.5),
+                                output_final_state=True,
+                                inplace_final_state=False,
+                                use_qk_l2norm_in_kernel=True,
+                                use_gate_in_kernel=False,
+                                use_beta_sigmoid_in_kernel=False,
+                            )
+                            ssm_cache[slot] = _st[0].to(ssm_cache.dtype)
+                        if 0 <= _m <= prev_seg.shape[2]:
+                            # Open chain: read-only plain; stash at the
+                            # tail write-back.
+                            _lp.pop(slot, None)
+                            chain_seqs[s] = slot
+                            continue
+                        _lp[slot] = (
+                            int(_kv_list[s]), mixed_qkv[:, :, 0:0],
+                            gate[:, 0:0], beta[:, 0:0],
+                            _cw, layer.activation)
+            if (not _MTP_FULL_COMMIT and merged_q_cu is not None
+                    and getattr(self, "_mtp_pending", None)
+                    and layer.layer_id == min(self._mtp_pending.keys())):
+                # Batched cross-layer lazy advance. Every KDA layer's
+                # verify-step advance is independent (own weights/states,
+                # same confirmed-token count), so the FIRST KDA layer of the
+                # step advances them ALL here - one conv per layer plus ONE
+                # recurrent_kda for the whole batch - instead of one extra
+                # recurrent call inside each layer (~33 extra kernel
+                # launches per step otherwise). The coordinator runs before
+                # any layer reads the caches, so every layer (including this
+                # one) reads its already-advanced state below. Non-consumable
+                # entries (coverage markers, m == 0 open chains) are left in
+                # place for the per-layer logic.
+                _slot_base = {}
+                _kv_all = (metadata.kv_seq_lens.tolist()
+                           if metadata.kv_seq_lens is not None else None)
+                if _kv_all is not None:
+                    for _si, _sl in enumerate(idx.tolist()):
+                        _slot_base.setdefault(
+                            int(_sl), _kv_all[merged_row0[_si]] - 1)
+                _bq, _bk, _bv, _bg, _bb = [], [], [], [], []
+                _b_init, _b_scatter = [], []
+                _b_cu = [0]
+                for _lid, _lp2 in self._mtp_pending.items():
+                    _lc = self._kv_caches[_lid]
+                    for _sl, (_pb, _seg, _pg, _pbeta,
+                              _pw, _pact) in list(_lp2.items()):
+                        _base = _slot_base.get(_sl)
+                        if _base is None:
+                            continue
+                        _bm = _base - _pb
+                        if not (0 < _bm <= _seg.shape[2]):
+                            continue
+                        del _lp2[_sl]
+                        _cs = (_lc.conv[_sl]
+                               .transpose(0, 1).unsqueeze(0).contiguous())
+                        _cin = torch.cat([_cs, _seg[:, :, :_bm]], dim=-1)
+                        _cout = _causal_conv1d_fn(
+                            _cin, _pw, _pact)[:, :, -_bm:]
+                        _lc.conv[_sl] = _cin[
+                            0, :, -conv_state_len:].transpose(0, 1)
+                        _sp = torch.split(
+                            _cout.transpose(1, 2), [qkv_dim] * 3, dim=-1)
+                        _bq.append(_sp[0].reshape(
+                            -1, num_heads_local, head_dim
+                        ).to(torch.bfloat16))
+                        _bk.append(_sp[1].reshape(
+                            -1, num_heads_local, head_dim
+                        ).to(torch.bfloat16))
+                        _bv.append(_sp[2].reshape(
+                            -1, num_heads_local, head_dim
+                        ).to(torch.bfloat16))
+                        _bg.append(_pg[:, :_bm].reshape(
+                            -1, num_heads_local, head_dim).to(torch.float32))
+                        _bb.append(_pbeta[:, :_bm].reshape(
+                            -1, num_heads_local).to(torch.float32))
+                        _b_init.append(_lc.ssm[_sl].unsqueeze(0))
+                        _b_scatter.append((_lid, _sl))
+                        _b_cu.append(_b_cu[-1] + _bm)
+                if _bq:
+                    _, _bst = recurrent_kda(
+                        torch.cat(_bq).contiguous(),
+                        torch.cat(_bk).contiguous(),
+                        torch.cat(_bv).contiguous(),
+                        torch.cat(_bg).contiguous(),
+                        torch.cat(_bb).contiguous(),
+                        initial_state=torch.cat(_b_init, dim=0).contiguous(),
+                        cu_seqlens=torch.tensor(
+                            _b_cu, dtype=torch.int32,
+                            device=mixed_qkv.device),
+                        layout="TND", scale=1.0 / (head_dim ** 0.5),
+                        output_final_state=True, inplace_final_state=False,
+                        use_qk_l2norm_in_kernel=True,
+                        use_gate_in_kernel=False,
+                        use_beta_sigmoid_in_kernel=False,
+                    )
+                    for _bi, (_lid, _sl) in enumerate(_b_scatter):
+                        self._kv_caches[_lid].ssm[_sl] = _bst[_bi].to(
+                            self._kv_caches[_lid].ssm.dtype)
             conv_i = conv_cache.index_select(0, idx)
             conv_i = conv_i.transpose(1, 2).contiguous()
             ssm_i = ssm_cache.index_select(0, idx)
@@ -760,10 +1017,32 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     f"beta_in={beta.abs().sum().item():.6e}",
                     flush=True,
                 )
+            if chain_seqs:
+                # Entry snapshots (post consume-advance) for the read-only
+                # plain chain rows: restored at the tail write-back so this
+                # step's own token is not committed here.
+                _entry_conv = {i: conv_state[i].clone() for i in chain_seqs}
+                _entry_ssm = {i: ssm_state[i].clone() for i in chain_seqs}
 
         conv_weight = layer.conv1d.weight.squeeze(1)
         activation = layer.activation
-        if num_seqs == batch_size:
+        scale = 1.0 / (head_dim ** 0.5)
+        # Route on metadata, not seq_len: MTP/spec decode can carry multiple
+        # tokens per sequence (seq_len > 1) but is still a decode step; the
+        # seq_len heuristic would wrongly send it to the chunked prefill path.
+        is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
+        device = mixed_qkv.device
+        # Spec-verify (merged same-slot rows) commits lazily via the
+        # kv-delta scheme in the flattened branch; see the comments there.
+        commit_first_only = False
+        # A merged spec-verify batch must take the flattened branch even when
+        # it collapses to ONE sequence (single-stream verify: 2 rows -> 1
+        # merged seq == batch_size): the simple path full-commits both rows,
+        # which inserts a phantom draft token into the state on every
+        # rejection (the corrected token overwrites the draft's position, so
+        # only the bonus row of the previous step is confirmable here - see
+        # the lazy-commit scheme below).
+        if num_seqs == batch_size and merged_q_cu is None:
             # Simple path: mixed_qkv is already [B, conv_dim, S] (one sequence
             # per batch row, or a single flattened sequence).
             if seq_len == 1:
@@ -798,33 +1077,195 @@ class NpuPagedAttentionBackend(AttentionBackend):
             # per-sequence conv1d loop (pure-torch F.conv1d is batched and
             # requires equal lengths) followed by a single varlen recurrent_kda
             # call (cu_seqlens does the per-seq split inside the kernel).
-            q_cu = metadata.q_cu_seq_lens
+            q_cu = merged_q_cu if merged_q_cu is not None else (
+                metadata.q_cu_seq_lens)
             assert q_cu is not None, (
                 "multi-sequence linear attention needs q_cu_seq_lens")
             q_cu = q_cu.to(torch.int64)
             q_cu_list = q_cu.tolist()
-            outs = []
-            for s in range(num_seqs):
-                t0, t1 = q_cu_list[s], q_cu_list[s + 1]
-                seg = mixed_qkv[:, :, t0:t1]   # [1, conv_dim, seg_len]
-                cs = conv_state[s:s + 1]       # [1, conv_dim, state_len]
-                seg_len = t1 - t0
-                if seg_len == 1:
-                    outs.append(_causal_conv1d_update(
-                        seg, cs, conv_weight, activation
-                    ))
-                else:
+            commit_first_only = merged_q_cu is not None
+            if commit_first_only:
+                # First spec-verify batch arms the plain-step handshakes (a
+                # pure-decode backend never sets this and keeps the exact
+                # pre-MTP plain-path behavior).
+                self._mtp_seen_verify = True
+                if _MTP_TRACE and layer.layer_id == 0:
+                    _st = getattr(self, "_mtp_stats", None)
+                    if _st is None:
+                        _st = {"verify": 0, "plain": 0}
+                        self._mtp_stats = _st
+                    _st["verify"] += num_seqs
+                    if _st["verify"] >= 50:
+                        _mh = getattr(self, "_mtp_mhist", {})
+                        _mh_str = " ".join(
+                            f"m{k}={v}" for k, v in sorted(_mh.items()))
+                        with open("/tmp/mtp_accept.log", "a") as _fh:
+                            _fh.write(
+                                f"[accept] pid={os.getpid()} "
+                                f"verify={_st['verify']} "
+                                f"plain(reject)={_st['plain']} "
+                                f"accept_rate="
+                                f"{_st['verify'] / max(1, _st['verify'] + _st['plain']):.2f} "
+                                f"{_mh_str}\n")
+                        _st["verify"] = 0
+                        _st["plain"] = 0
+                        self._mtp_mhist = {}
+                # ---- MTP spec-verify steps (observed layout, k=1) ----
+                # Rows are [last-confirmed token (re-processed each step to
+                # judge the next draft), drafted token]; the C++ commits
+                # exactly one token per step (the draft on accept, the
+                # corrected argmax on reject) and the next step's row0 is
+                # that token at the previous row1's position, so kv grows
+                # +1 per step. Alternative scheme (full,
+                # GLM5_MTP_COMMIT=full): commit BOTH rows every step - the
+                # row0 re-write is near-idempotent under the delta rule but
+                # a rejected draft leaves a persistent phantom write.
+                #
+                # Default scheme (lazy, see _MTP_FULL_COMMIT): commit
+                # NOTHING here; (1) ADVANCE the live state by the PREVIOUS
+                # step's confirmed tokens - their count m (kv_seq_lens
+                # growth over the previous verify) with the stashed raw
+                # qkv/gate rows; (2) process the current rows read-only
+                # (outputs only); (3) stash the current rows for the next
+                # step's advance. The state then tracks the true token
+                # stream exactly, independent of accept/reject.
+                kv_rows = metadata.kv_seq_lens.tolist()
+                pending = getattr(self, "_mtp_pending", None)
+                if pending is None:
+                    pending = {}
+                    self._mtp_pending = pending
+                # The stash is PER LAYER: all KDA layers of a model share this
+                # backend instance, and each layer's stashed qkv/gate rows are
+                # only valid for that layer's own conv/recurrent advance.
+                # Keying by slot alone made every layer overwrite the others'
+                # stashes (layer N's advance consumed the last layer's rows -
+                # total state corruption under multi-layer models).
+                pending = pending.setdefault(layer.layer_id, {})
+                live_slots = {int(x) for x in idx.tolist()}
+                for slot in list(pending.keys()):
+                    if slot not in live_slots:
+                        del pending[slot]
+                gate_raw = gate.view(1, -1, -1) if gate.dim() == 2 else gate
+                beta_raw = beta.view(1, -1, -1) if beta.dim() == 2 else beta
+                adv_seg: list = []       # raw qkv [1, conv_dim, m]
+                adv_g: list = []
+                adv_b: list = []
+                adv_seq: list = []       # merged-seq index per segment
+                for s in range(num_seqs):
+                    slot = int(idx[s])
+                    t0, t1 = q_cu_list[s], q_cu_list[s + 1]
+                    base_now = int(kv_rows[merged_row0[s]]) - 1
+                    prev = pending.get(slot)
+                    lead = 0
+                    if prev is not None and not _MTP_FULL_COMMIT:
+                        (prev_base, prev_seg, prev_g, prev_b,
+                         _pw, _pact) = prev
+                        m = base_now - prev_base
+                        if _MTP_TRACE and layer.layer_id == 0:
+                            _mh = getattr(self, "_mtp_mhist", None)
+                            if _mh is None:
+                                _mh = {}
+                                self._mtp_mhist = _mh
+                            _mh[m] = _mh.get(m, 0) + 1
+                        if 0 < m <= prev_seg.shape[2]:
+                            adv_seg.append(prev_seg[:, :, :m])
+                            adv_g.append(prev_g[:, :m])
+                            adv_b.append(prev_b[:, :m])
+                            adv_seq.append(s)
+                        # Rows already covered by the recorded coverage
+                        # (e.g. the plain step before the first verify) must
+                        # not be stashed again - trim them off the front.
+                        lead = max(0, min(prev_base - base_now, t1 - t0))
+                    if not _MTP_FULL_COMMIT:
+                        pending[slot] = (
+                            base_now + lead,
+                            mixed_qkv[:, :, t0 + lead:t1].clone(),
+                            gate_raw[:, t0 + lead:t1].clone(),
+                            beta_raw[:, t0 + lead:t1].clone(),
+                            conv_weight, activation,
+                        )
+                if adv_seg:
+                    # conv-advance each segment sequentially (per slot) and
+                    # collect post-conv qkv for the recurrent advance.
+                    adv_conv_out = []
+                    for s, seg_raw in zip(adv_seq, adv_seg):
+                        cs = conv_state[s:s + 1]
+                        cin = torch.cat([cs, seg_raw], dim=-1)
+                        adv_conv_out.append(_causal_conv1d_fn(
+                            cin, conv_weight, activation
+                        )[:, :, -seg_raw.shape[2]:])
+                        conv_state[s] = cin[0, :, -conv_state_len:]
+                    adv_qkv = torch.cat(adv_conv_out, dim=-1)
+                    a_lengths = [seg.shape[2] for seg in adv_seg]
+                    a_cu = [0]
+                    for length in a_lengths:
+                        a_cu.append(a_cu[-1] + length)
+                    a_total = a_cu[-1]
+                    a_split = torch.split(
+                        adv_qkv.transpose(1, 2), [qkv_dim] * 3, dim=-1)
+                    aq = a_split[0].reshape(-1, num_heads_local,
+                                            head_dim).to(torch.bfloat16).contiguous()
+                    ak = a_split[1].reshape(-1, num_heads_local,
+                                            head_dim).to(torch.bfloat16).contiguous()
+                    av = a_split[2].reshape(-1, num_heads_local,
+                                            head_dim).to(torch.bfloat16).contiguous()
+                    ag = torch.cat(adv_g, dim=1).reshape(
+                        -1, num_heads_local, head_dim).to(torch.float32).contiguous()
+                    ab = torch.cat(adv_b, dim=1).reshape(
+                        -1, num_heads_local).to(torch.float32).contiguous()
+                    adv_idx = torch.tensor(adv_seq, dtype=torch.long,
+                                           device=ssm_state.device)
+                    _, adv_state = recurrent_kda(
+                        aq, ak, av, ag, ab,
+                        initial_state=ssm_state.index_select(0, adv_idx),
+                        cu_seqlens=torch.tensor(
+                            a_cu, dtype=torch.int32, device=device),
+                        layout="TND", scale=scale,
+                        output_final_state=True, inplace_final_state=False,
+                        use_qk_l2norm_in_kernel=True,
+                        use_gate_in_kernel=False,
+                        use_beta_sigmoid_in_kernel=False,
+                    )
+                    ssm_state[adv_idx] = adv_state.to(ssm_state.dtype)
+                outs = []
+                for s in range(num_seqs):
+                    t0, t1 = q_cu_list[s], q_cu_list[s + 1]
+                    seg = mixed_qkv[:, :, t0:t1]
+                    cs = conv_state[s:s + 1]
                     cin = torch.cat([cs, seg], dim=-1)
                     outs.append(_causal_conv1d_fn(
-                        cin, conv_weight, activation
-                    )[:, :, -seg_len:])
-                    conv_state[s] = cin[0, :, -conv_state_len:]
-                    if conv_state.shape[-1] < conv_state_len:
-                        conv_state[s] = F.pad(
-                            conv_state[s],
-                            (conv_state_len - conv_state.shape[-1], 0), value=0,
-                        )
-            mixed_qkv = torch.cat(outs, dim=-1)   # [1, conv_dim, T]
+                        cin, conv_weight, activation,
+                    )[:, :, -(t1 - t0):])
+                    if _MTP_FULL_COMMIT:
+                        # Full-commit scheme keeps the live conv state at the
+                        # tail of BOTH rows (mirrors the pre-merge simple
+                        # path); lazy mode leaves it at the advance boundary.
+                        conv_state[s] = cin[0, :, -conv_state_len:]
+                mixed_qkv = torch.cat(outs, dim=-1)
+            else:
+                outs = []
+                for s in range(num_seqs):
+                    t0, t1 = q_cu_list[s], q_cu_list[s + 1]
+                    seg = mixed_qkv[:, :, t0:t1]   # [1, conv_dim, seg_len]
+                    cs = conv_state[s:s + 1]       # [1, conv_dim, state_len]
+                    seg_len = t1 - t0
+                    if seg_len == 1:
+                        outs.append(_causal_conv1d_update(
+                            seg, cs, conv_weight, activation
+                        ))
+                    else:
+                        cin = torch.cat([cs, seg], dim=-1)
+                        outs.append(_causal_conv1d_fn(
+                            cin, conv_weight, activation
+                        )[:, :, -seg_len:])
+                        conv_state[s] = cin[0, :, -conv_state_len:]
+                        if conv_state.shape[-1] < conv_state_len:
+                            conv_state[s] = F.pad(
+                                conv_state[s],
+                                (conv_state_len - conv_state.shape[-1], 0),
+                                value=0,
+                            )
+                mixed_qkv = torch.cat(outs, dim=-1)   # [1, conv_dim, T]
             # TND packed layout for recurrent_kda: [T, nh, hd] per channel group.
             seq_len = int(q_cu_list[-1])
             hidden_shape = (1, seq_len, -1, head_dim)
@@ -849,12 +1290,6 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # upcasts them); the model hands them in bf16.
         g = g.to(torch.float32)
         b = b.to(torch.float32)
-        scale = 1.0 / (head_dim ** 0.5)
-        # Route on metadata, not seq_len: MTP/spec decode can carry multiple
-        # tokens per sequence (seq_len > 1) but is still a decode step; the
-        # seq_len heuristic would wrongly send it to the chunked prefill path.
-        is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
-        device = mixed_qkv.device
         if not is_prefill:
             # decode (incl. MTP multi-token-per-seq varlen): recurrent_kda on
             # packed TND [T, nh, hd] with cu_seqlens.
@@ -881,16 +1316,36 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
             else:
                 cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-            core_attn_out, final_state = recurrent_kda(
-                q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
-                initial_state=ssm_state,
-                cu_seqlens=cu_seqlens,
-                layout="TND", scale=scale,
-                output_final_state=True, inplace_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=False,
-                use_beta_sigmoid_in_kernel=False,
-            )
+            if commit_first_only and not is_prefill and not _MTP_FULL_COMMIT:
+                # Spec-verify: the state was already ADVANCED by the
+                # previous step's confirmed tokens (see the flattened
+                # branch). Chain the current rows read-only from that state
+                # for their outputs; the tail write-back persists exactly
+                # the advanced state (never the drafted rows).
+                ro = recurrent_kda(
+                    q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
+                    initial_state=ssm_state,
+                    cu_seqlens=cu_seqlens,
+                    layout="TND", scale=scale,
+                    output_final_state=False, inplace_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=False,
+                    use_beta_sigmoid_in_kernel=False,
+                )
+                # fla_npu returns a tuple even with output_final_state=False.
+                core_attn_out = ro[0] if isinstance(ro, tuple) else ro
+                final_state = ssm_state
+            else:
+                core_attn_out, final_state = recurrent_kda(
+                    q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
+                    initial_state=ssm_state,
+                    cu_seqlens=cu_seqlens,
+                    layout="TND", scale=scale,
+                    output_final_state=True, inplace_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=False,
+                    use_beta_sigmoid_in_kernel=False,
+                )
             # recurrent_kda returns the packed TND [T, nh, hd] layout of its
             # inputs; restore the [B, S, nh, hd] grouping the model layer
             # expects (o_norm gates per head). For T == 1 the flat layout
@@ -917,6 +1372,29 @@ class NpuPagedAttentionBackend(AttentionBackend):
             final_state = result[1]
 
         if idx is not None:
+            if chain_seqs:
+                # Read-only plain chain rows: restore the entry (post
+                # consume-advance) state and stash this step's own raw rows;
+                # the next verify's advance commits them exactly once.
+                _pend = self._mtp_pending[layer.layer_id]
+                _kv_tail = (metadata.kv_seq_lens.tolist()
+                            if metadata.kv_seq_lens is not None else None)
+                for i, slot in chain_seqs.items():
+                    conv_state[i] = _entry_conv[i]
+                    final_state[i] = _entry_ssm[i]
+                    if num_seqs != batch_size:
+                        t0, t1 = q_cu_list[i], q_cu_list[i + 1]
+                        seg = raw_mixed[:, :, t0:t1]
+                        gseg = raw_gate[:, t0:t1]
+                        bseg = raw_beta[:, t0:t1]
+                    else:
+                        seg = raw_mixed[i:i + 1]
+                        gseg = raw_gate[i:i + 1]
+                        bseg = raw_beta[i:i + 1]
+                    _pend[slot] = (
+                        int(_kv_tail[i]) - seg.shape[2],
+                        seg.clone(), gseg.clone(), bseg.clone(),
+                        layer.conv1d.weight.squeeze(1), layer.activation)
             conv_cache.index_copy_(
                 0, idx, conv_state.transpose(1, 2).contiguous()
             )

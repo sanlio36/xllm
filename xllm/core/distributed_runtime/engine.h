@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
@@ -39,6 +40,19 @@ class Engine {
   virtual ForwardOutput step(std::vector<Batch>& batch) = 0;
 
   virtual void update_last_step_result(std::vector<Batch>& batch) = 0;
+
+  // Model/KV-cache lifecycle used by engine wrappers (SpeculativeEngine).
+  // Concrete engines override; the defaults keep plain Engine subclasses
+  // and wrapper-internal engines (e.g. the text-only draft engine) working.
+  virtual bool init_model() { return true; }
+
+  virtual KVCacheCapacity estimate_kv_cache_capacity() { return {}; }
+
+  virtual bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
+    return true;
+  }
+
+  virtual void init_eplb_manager() {}
 
   // return the tokenizer
   virtual const Tokenizer* tokenizer() const { return tokenizer_.get(); }
