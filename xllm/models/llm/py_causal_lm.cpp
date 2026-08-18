@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "models/llm/py_causal_lm.h"
 
+#include <Python.h>
 #include <glog/logging.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -25,6 +26,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/state_dict/state_dict.h"
@@ -33,6 +35,36 @@ limitations under the License.
 namespace py = pybind11;
 
 namespace xllm {
+namespace detail {
+
+void share_python_model_weights(py::object& draft_model,
+                                const py::object& target_model) {
+  draft_model.attr("lm_head") = target_model.attr("lm_head");
+  py::object draft_body = draft_model.attr("model");
+  py::object target_body = target_model.attr("model");
+  draft_body.attr("embed_tokens") = target_body.attr("embed_tokens");
+}
+
+}  // namespace detail
+
+namespace {
+
+void clear_python_object(py::object& object) {
+  if (!object) {
+    return;
+  }
+  if (!Py_IsInitialized()) {
+    // CPython has already torn down its GIL. Avoid decref during C++ static
+    // destruction; the process is exiting and the reference cannot be safely
+    // released anymore.
+    (void)object.release();
+    return;
+  }
+  py::gil_scoped_acquire gil;
+  object = py::object();
+}
+
+}  // namespace
 
 PyCausalLM::PyCausalLM(const ModelContext& context)
     : model_args_(context.get_model_args()),
@@ -43,6 +75,14 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
 
   const ParallelArgs& parallel_args = context.get_parallel_args();
   tp_group_ = parallel_args.tp_group_;
+  cp_size_ = parallel_args.cp_size();
+  cp_rank_ = parallel_args.cp_rank();
+  // tp_group_ and cp_group_ are already the final, orthogonally-split groups:
+  // the collective communicator narrows tp_group_ to world/(dp*cp) and builds a
+  // separate cp_group_ over the cp-strided ranks. Read each dimension from its
+  // own group instead of carving CP back out of tp_group_. TP and CP are
+  // orthogonal: a rank can shard both attention heads (TP) and sequence tokens
+  // (CP) at once, so both dimensions may be > 1 simultaneously.
   tp_size_ = (tp_group_ != nullptr) ? tp_group_->world_size() : 1;
   tp_rank_ = (tp_group_ != nullptr) ? tp_group_->rank() : 0;
   ProcessGroup* dp_group = parallel_args.dp_local_process_group_;
@@ -114,6 +154,26 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
                        global_world_size,
                        global_rank % moe_tp_size_);
   }
+  if (cp_size_ > 1) {
+    // CP shards sequence tokens; its group is strided by tp_size -- ranks with
+    // the same (dp, tp) slot but different cp_rank. The group index selects
+    // that (dp, tp) slot: dp block (global_rank / (cp_size*tp_size)) times
+    // tp_size, plus the tp offset within it. TP and CP are orthogonal, so both
+    // groups may be initialized on the same device off the shared rendezvous
+    // endpoint.
+    const int32_t cp_group_index =
+        (global_rank / (cp_size_ * tp_size_)) * tp_size_ +
+        global_rank % tp_size_;
+    init_process_group("cp",
+                       parallel_args.python_rendezvous_host_,
+                       parallel_args.python_rendezvous_port_,
+                       cp_rank_,
+                       cp_size_,
+                       c10::str(device_),
+                       global_rank,
+                       global_world_size,
+                       cp_group_index);
+  }
   const std::string module_name = context.get_model_args().model_type().empty()
                                       ? std::string("Qwen3ForCausalLM")
                                       : context.get_model_args().model_type();
@@ -126,9 +186,8 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
 }
 
 PyCausalLM::~PyCausalLM() {
-  py::gil_scoped_acquire gil;
-  py_model_ = py::object();
-  config_dict_ = py::object();
+  clear_python_object(py_model_);
+  clear_python_object(config_dict_);
 }
 
 py::dict PyCausalLM::build_config_dict(
@@ -150,9 +209,15 @@ py::dict PyCausalLM::build_config_dict(
   d["moe_tp_rank"] = moe_tp_rank_;
   d["ep_size"] = ep_size_;
   d["ep_rank"] = ep_rank_;
+  // cp_size is a reflected ParallelArgs PROPERTY (already in d), but cp_rank is
+  // a derived member function, so pass it explicitly for the Python executor.
+  d["cp_rank"] = cp_rank_;
   d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
+#if defined(USE_NPU)
+  d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+#endif
   return d;
 }
 
@@ -190,6 +255,17 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
                             : py::object(py::none());
   py::object out = py_model_.attr("compute_logits")(hidden_states, selected);
   return out.cast<torch::Tensor>();
+}
+
+bool PyCausalLM::share_weights_from(CausalLM& source) {
+  auto* source_model = dynamic_cast<PyCausalLM*>(&source);
+  if (source_model == nullptr) {
+    return false;
+  }
+
+  py::gil_scoped_acquire gil;
+  detail::share_python_model_weights(py_model_, source_model->py_model_);
+  return true;
 }
 
 }  // namespace xllm

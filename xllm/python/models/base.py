@@ -55,17 +55,16 @@ class PyModelBase(nn.Module):
             raise ValueError(f"Unknown dtype: {dtype!r}")
         return resolved
 
-    def compute_logits(
-        self, hidden: torch.Tensor, selected_idxes: Optional[torch.Tensor]
-    ) -> torch.Tensor:
+    def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        return logits
 
     # -- weight loading -------------------------------------------------------
     def load_weights(
         self,
-        state_dicts: List["StateDict"],
+        state_dicts: list[StateDict],
         tp_rank: int,
         tp_size: int,
     ) -> None:

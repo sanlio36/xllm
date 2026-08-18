@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -47,6 +49,7 @@ def _create_attention_backend(
         from xllm.python.attention.npu_paged_attention import (
             NpuPagedAttentionBackend,
         )
+
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -58,6 +61,7 @@ def _create_attention_backend(
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend
+
         return FlashInferBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -67,9 +71,7 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
         )
-    raise NotImplementedError(
-        f"No attention backend available for device type '{device.type}'"
-    )
+    raise NotImplementedError(f"No attention backend available for device type '{device.type}'")
 
 
 class ModelExecutor:
@@ -81,39 +83,51 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        # Diagnostic (XLLM_ACL_GRAPH_LAZY_CAPTURE=1): hold the decode graph
+        # runner back until the engine starts serving real requests (the C++
+        # graph warmup's synthetic decode steps then fall back to eager), so
+        # the first REAL decode lazily captures its bucket with real metadata
+        # — its capture-warmup forwards are then dumpable/comparable. The
+        # warmup runs exactly one prefill before its decode steps, so the
+        # second prefill marks the first real request.
+        self._lazy_graph_capture = os.environ.get("XLLM_ACL_GRAPH_LAZY_CAPTURE") == "1"
+        self._prefill_count = 0
 
-        attention_layers = [
-            module for module in model.modules() if isinstance(module, Attention)
-        ]
+        attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
             raise ValueError("Python model does not contain an Attention layer")
 
         # GLM-Next mixes DSA (MLA) and KDA (linear-attention) layers with
         # different head/dim configs; the paged backend only serves the DSA
         # layers, so it is built from the first DSA layer and the "identical
-        # config across all layers" check is skipped. A pure-KDA model (no DSA
-        # layer) runs without a paged backend; KDA layers dispatch their own
-        # ``execute_linear`` through ``None`` (they self-contain the linear
-        # state when there is no backend to own it).
+        # config across all layers" check is skipped. Non-GLM-Next models keep
+        # the upstream behavior: backend from the first layer plus the
+        # identical-config check.
         from xllm.python.models.glm5_next import Glm5NextMlaAttention
         dsa_layers = [
             layer for layer in attention_layers
             if isinstance(layer, Glm5NextMlaAttention)
         ]
-        first_attention = dsa_layers[0] if dsa_layers else attention_layers[0]
+        if dsa_layers:
+            first_attention = dsa_layers[0]
+        else:
+            first_attention = attention_layers[0]
+            expected_config = self._attention_config(first_attention)
+            for layer in attention_layers[1:]:
+                if self._attention_config(layer) != expected_config:
+                    raise ValueError("Attention backend requires identical attention configuration across all layers")
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
         self._num_attention_layers = len(attention_layers)
-        if dsa_layers:
-            self.attention_backend = _create_attention_backend(
-                first_attention, device, first_parameter.dtype
-            )
-        else:
-            self.attention_backend = None
+        self.attention_backend = _create_attention_backend(first_attention, device, first_parameter.dtype)
 
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
+        # Context-Parallel: shard prefill sequences across the CP group. Decode
+        # stays on the non-CP path (CP is prefill-only, eager-only in v1).
+        self.eager_runner.cp_size = int(config.get("cp_size", 1))
+        self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
         self.decode_graph_runner = None
         self.inductor_runner = None
 
@@ -126,16 +140,16 @@ class ModelExecutor:
             "none",
             "0",
             "cudagraphs",
+            "aclgraph",
         ):
-            raise NotImplementedError(
-                "Python data parallel graph execution supports cudagraphs only"
-            )
+            raise NotImplementedError("Python data parallel graph execution supports cudagraphs and aclgraph only")
         if graph_backend in ("", "off", "none", "0"):
             pass
         elif graph_backend == "cudagraphs":
             from xllm.python.model_executor.runners.decode_cuda_graph import (
                 DecodeCudaGraphRunner,
             )
+
             self.decode_graph_runner = DecodeCudaGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -149,18 +163,30 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
+
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
                 device,
                 max_seqs_per_batch,
                 int(config["max_position_embeddings"]),
+                dp_size,
+                dp_rank,
             )
         else:
+            if self.eager_runner.cp_size > 1:
+                # CP is prefill-only and lives on eager_runner; a compile
+                # backend serves prefill through InductorRunner, which carries
+                # no cp_context, so CP would silently no-op. Reject rather than
+                # run without the requested sharding.
+                raise NotImplementedError(
+                    "Context-Parallel (cp_size > 1) is not supported with the "
+                    f"'{graph_backend}' graph backend; CP is eager-only. Use "
+                    "graph_backend=off/aclgraph, or set cp_size=1."
+                )
             from xllm.python.model_executor.runners.inductor import InductorRunner
-            self.inductor_runner = InductorRunner(
-                execution_model, self.attention_backend, device, graph_backend
-            )
+
+            self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
 
     @staticmethod
     def _attention_config(layer: Attention) -> tuple[int, int, int, float, int]:
@@ -174,15 +200,9 @@ class ModelExecutor:
 
     def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
         layer_caches = normalize_layer_caches(kv_caches)
-        required_layers = max(
-            layer.layer_id
-            for layer in self.model.modules()
-            if isinstance(layer, Attention)
-        ) + 1
+        required_layers = max(layer.layer_id for layer in self.model.modules() if isinstance(layer, Attention)) + 1
         if len(layer_caches) < required_layers:
-            raise ValueError(
-                "cache layer count does not match the model layer layout"
-            )
+            raise ValueError("cache layer count does not match the model layer layout")
         if self._kv_bound:
             return
         self.attention_backend.bind_kv_caches(layer_caches)
@@ -193,29 +213,43 @@ class ModelExecutor:
             self.inductor_runner.bind_layer_caches(layer_caches)
         self._kv_bound = True
 
+    def _lazy_capture_blocked(self) -> bool:
+        return self._lazy_graph_capture and self._prefill_count < 2
+
     @torch.inference_mode()
     def execute(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
 
+        if metadata.is_prefill or metadata.is_chunked_prefill:
+            self._prefill_count += 1
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None:
-            graph_runner.warmup(input_ids.device, input_ids.dtype)
-            # The graph runner only serves pure-decode steps (can_execute rejects
-            # prefill/chunked-prefill), while the layer synchronizer only drives
-            # KV-cache push during prefill, so decode has nothing to record.
-            if graph_runner.can_execute(input_ids, metadata):
-                return graph_runner.execute(input_ids, positions, metadata)
+        if (
+            graph_runner is not None
+            and not self._lazy_capture_blocked()
+            and graph_runner.can_execute(input_ids, metadata, input_embedding)
+        ):
+            graph_runner.warmup(input_ids.device, input_ids.dtype, input_embedding)
+            return graph_runner.execute(input_ids, positions, metadata, input_embedding)
         if self.inductor_runner is not None:
             return self.inductor_runner.execute(
-                input_ids, positions, metadata, layer_synchronizer
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                layer_synchronizer,
             )
         return self.eager_runner.execute(
-            input_ids, positions, metadata, layer_synchronizer
+            input_ids,
+            positions,
+            metadata,
+            input_embedding,
+            layer_synchronizer,
         )

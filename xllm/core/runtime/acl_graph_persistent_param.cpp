@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/runtime/mtp_async_state.h"
 #include "core/util/utils.h"
 
@@ -274,7 +275,6 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
       torch::zeros({max_graph_tokens, max_block_table_len},
                    torch::dtype(torch::kInt).device(device));
 
-  // Output tensor for hidden states
   torch::Dtype dtype = util::parse_dtype(args.dtype(), device);
   if (args.dtype() == "float" || args.dtype() == "float32") {
     LOG(WARNING)
@@ -282,9 +282,6 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
            "dtype: float32. This should not happen in production but for test.";
     dtype = torch::kFloat32;
   }
-  hidden_states_ = torch::zeros({max_tokens_per_batch, args.hidden_size()},
-                                torch::dtype(dtype).device(device));
-
   // Initialize persistent_mask_ only for model types that need to update an
   // explicit attention mask in graph mode. Unlike generic token buffers, the
   // mask is only consumed by decode / spec-verify graphs, so size it by graph
@@ -537,36 +534,6 @@ GraphPersistentParam::~GraphPersistentParam() {
   if (context_for_plan_ != nullptr) {
     atb::DestroyContext(context_for_plan_);
     context_for_plan_ = nullptr;
-  }
-}
-
-void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
-  if (!value.defined()) {
-    return;
-  }
-  const uint32_t result_tokens = value.size(0);
-  if (aux_hidden_states_.numel() == 0) {
-    // Lazy initialization: create aux_hidden_states tensor if not already
-    // created
-    const int64_t graph_token_capacity =
-        get_decode_graph_token_capacity(options_);
-    auto shape = value.sizes().vec();
-    shape[0] = graph_token_capacity;
-    torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
-    if (args_.dtype() == "float" || args_.dtype() == "float32") {
-      dtype = torch::kFloat32;
-    }
-    aux_hidden_states_ =
-        torch::zeros(shape, torch::dtype(dtype).device(device_));
-  }
-  CHECK_LE(result_tokens, aux_hidden_states_.size(0))
-      << "aux hidden state output exceeds graph token capacity";
-  // Slice to match the actual shape
-  auto slice =
-      aux_hidden_states_.slice(/*dim=*/0, /*start=*/0, /*end=*/result_tokens);
-  // Reshape slice if needed to match value shape
-  if (slice.sizes() == value.sizes()) {
-    slice.copy_(value, /*non_blocking=*/true);
   }
 }
 
@@ -1318,14 +1285,15 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           static_cast<uint32_t>(padded_batch_size));
     }
     if (use_expanded_spec_decode_attention) {
-      graph_params->graph.use_expanded_decode_for_spec_verify_attention = true;
-      graph_params->graph.expanded_kv_seq_lens = expanded_kv_seq_lens_.slice(
-          /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
-      graph_params->graph.expanded_block_tables =
-          expanded_block_tables_for_graph();
+      layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+          *graph_params,
+          expanded_kv_seq_lens_.slice(
+              /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens),
+          expanded_block_tables_for_graph(),
+          expanded_kv_seq_lens_vec,
+          options_.block_size());
       graph_params->graph.expanded_tiling_data =
           uses_paged_attention_tiling() ? tiling_data() : torch::Tensor();
-      graph_params->graph.expanded_kv_seq_lens_vec = expanded_kv_seq_lens_vec;
     }
     if (params.attention.device.q_cu_seq_lens.defined()) {
       const bool use_hybrid_query_start_loc = is_hybrid_linear_attention_;

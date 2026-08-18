@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -49,6 +50,13 @@ class AclGraphTask:
 
 
 @dataclass(slots=True)
+class AclGraphExecutionState:
+    """Persistent tensors owned by one model-execution graph entry."""
+
+    persistent_buffers: dict[tuple[object, ...], object]
+
+
+@dataclass(slots=True)
 class AclGraphCaptureContext:
     stream: object
     tasks: list[AclGraphTask]
@@ -62,11 +70,14 @@ class ForwardContext:
     layer_caches: list[LayerCache]
     acl_graph: AclGraphCaptureContext | None = None
     layer_synchronizer: LayerSynchronizer | None = None
+    execution_state: AclGraphExecutionState | None = None
+    # Context-Parallel sharding plan for this forward, or None when CP is off
+    # (cp_size <= 1) or the step is decode (CP is prefill-only in v1). Typed as
+    # object to avoid a circular import with model_executor.cp_utils.CpContext.
+    cp_context: object | None = None
 
 
-_current_context: ContextVar[ForwardContext | None] = ContextVar(
-    "_current_context", default=None
-)
+_current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)
 
 
 @contextmanager
@@ -98,3 +109,17 @@ def record_layer_event(layer_id: int) -> None:
     ctx = _current_context.get()
     if ctx is not None and ctx.layer_synchronizer is not None:
         ctx.layer_synchronizer.record_event(layer_id)
+
+
+def get_execution_buffer(key: tuple[object, ...], factory: Callable[[], torch.Tensor]) -> torch.Tensor:
+    """Get a tensor owned by the active model execution graph entry."""
+    state = get_forward_context().execution_state
+    if state is None:
+        return factory()
+    buffer = state.persistent_buffers.get(key)
+    if buffer is None:
+        buffer = factory()
+        state.persistent_buffers[key] = buffer
+    if not isinstance(buffer, torch.Tensor):
+        raise TypeError("execution buffer must be a torch.Tensor")
+    return buffer

@@ -19,12 +19,20 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LayerCache
+from xllm.python.attention.backend import (
+    AttentionBackend,
+    AttentionMetadata,
+    LayerCache,
+)
+from xllm.python.model_executor.forward_context import LayerSynchronizer
 
 
 class BaseRunner(ABC):
     def __init__(
-        self, model: nn.Module, attention_backend: AttentionBackend, device: torch.device,
+        self,
+        model: nn.Module,
+        attention_backend: AttentionBackend,
+        device: torch.device,
     ) -> None:
         self.model = model
         self.attention_backend = attention_backend
@@ -40,5 +48,7 @@ class BaseRunner(ABC):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
+        layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor:
         pass

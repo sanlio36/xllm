@@ -33,10 +33,12 @@ from __future__ import annotations
 # FakeTensor implementations of the C++ operators. Imported first so that a
 # graph capture reaching any kernel below finds a registered fake.
 from . import _custom_op  # noqa: F401
-from .activation import silu_and_mul
+from .activation import dequant_swiglu_quant, silu_and_mul
 from .attention import (
+    batch_matmul_transpose,
     reshape_paged_cache,
     update_decode_graph_metadata,
+    vision_fusion_attention,
 )
 from .causal_conv1d import (
     causal_conv1d_decode,
@@ -48,17 +50,33 @@ from .gated_delta_net import (
     fused_recurrent_gated_delta_rule_packed_decode,
     resolve_gdn_prefill_backend,
 )
-from .linear import prepare_row_parallel_weight
+from .linear import (
+    prepare_quant_weight,
+    prepare_row_parallel_weight,
+)
+from .mla import (
+    deepseek_mla_preprocess_decode,
+    deepseek_mla_preprocess_decode_v2,
+    has_mla_preprocess_v2,
+    prepare_mla_preprocess_v2_q_b,
+    prepare_mla_preprocess_v2_qkv,
+)
 from .moe import (
     cutlass_fused_moe,
     fused_moe,
     grouped_moe,
+    moe_expert_compute,
     moe_fused_topk,
+    moe_gate_routing,
+    moe_gmm1,
+    moe_gmm2_combine,
+    moe_token_dispatch,
     prepare_grouped_moe_weights,
     supports_cutlass_moe,
 )
 from .normalization import (
     fused_add_rms_norm,
+    fused_add_rms_norm_dynamic_quant,
     l2_norm,
     rms_norm,
     rms_norm_gated,
@@ -70,37 +88,66 @@ from .quantization import (
 )
 from .rotary_embedding import (
     fused_qk_norm_rope,
+    inplace_partial_rotary_mul,
     interleaved_rotary_embedding,
+    mrope,
+    vision_rotary_mul,
 )
 from .sparse_attention import (
     lightning_indexer,
+    lightning_indexer_out,
+    quant_lightning_indexer,
+    quant_lightning_indexer_metadata,
     scatter_nd_update,
     sparse_flash_attention,
+    sparse_flash_attention_out,
 )
 
 __all__ = [
     "rms_norm",
     "fused_add_rms_norm",
+    "fused_add_rms_norm_dynamic_quant",
     "l2_norm",
     "rms_norm_gated",
     "silu_and_mul",
+    "dequant_swiglu_quant",
     "reshape_paged_cache",
     "update_decode_graph_metadata",
+    "vision_fusion_attention",
+    "batch_matmul_transpose",
     "fused_qk_norm_rope",
+    "inplace_partial_rotary_mul",
     "interleaved_rotary_embedding",
+    "mrope",
+    "vision_rotary_mul",
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",
     "grouped_moe",
+    "moe_gate_routing",
+    "moe_expert_compute",
+    "moe_token_dispatch",
+    "moe_gmm1",
+    "moe_gmm2_combine",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
+    "prepare_quant_weight",
+    "deepseek_mla_preprocess_decode",
+    "deepseek_mla_preprocess_decode_v2",
+    "has_mla_preprocess_v2",
+    "prepare_mla_preprocess_v2_q_b",
+    "prepare_mla_preprocess_v2_qkv",
     "quant_matmul",
     "quantize_per_tensor",
     "dynamic_quant",
     "lightning_indexer",
+    "lightning_indexer_out",
+    "quant_lightning_indexer",
+    "quant_lightning_indexer_metadata",
     "scatter_nd_update",
     "sparse_flash_attention",
+    "sparse_flash_attention_out",
     "causal_conv1d_prefill",
     "causal_conv1d_decode",
     "resolve_gdn_prefill_backend",

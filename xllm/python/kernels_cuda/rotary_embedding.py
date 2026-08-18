@@ -102,4 +102,52 @@ def interleaved_rotary_embedding(
     )
 
 
-__all__ = ["fused_qk_norm_rope", "interleaved_rotary_embedding"]
+def mrope(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
+    *,
+    mrope_section: list[int],
+    rotary_mode: str = "half",
+    cache_mode: str = "interleave",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply multi-dimensional RoPE (mRoPE) to query and key tensors."""
+    del positions, q, k, cos_sin_cache, head_dim, mrope_section
+    del rotary_mode, cache_mode
+    raise NotImplementedError("mrope has no CUDA kernel; models on CUDA use the standard RoPE path")
+
+
+def vision_rotary_mul(
+    value: torch.Tensor,
+    cos_full: torch.Tensor,
+    sin_full: torch.Tensor,
+) -> torch.Tensor:
+    """Apply RoPE via npu_rotary_mul (neox/half mode)."""
+    del value, cos_full, sin_full
+    raise NotImplementedError("vision_rotary_mul has no CUDA kernel; CUDA models use FlashInfer RoPE")
+
+
+def inplace_partial_rotary_mul(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    start: int,
+    end: int,
+) -> None:
+    """Apply interleaved RoPE to one slice of ``value`` in place."""
+    del value, cosine, sine, start, end
+    raise NotImplementedError(
+        "inplace_partial_rotary_mul has no CUDA kernel; models on CUDA use "
+        "the non-interleaved rotary path in xllm.python.layers.rotary_embedding"
+    )
+
+
+__all__ = [
+    "fused_qk_norm_rope",
+    "inplace_partial_rotary_mul",
+    "interleaved_rotary_embedding",
+    "mrope",
+    "vision_rotary_mul",
+]

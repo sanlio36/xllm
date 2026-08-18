@@ -31,11 +31,14 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed import ProcessGroup
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep"))
-# ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp`` and
-# ``moe_ep`` stride across those blocks. Both layouts follow from how the caller
-# derives a rank within each group, so a group's full membership is determined
-# by its own size and needs no extra information from the caller.
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp"))
+# ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
+# ``moe_ep`` and ``cp`` stride across those blocks. Both layouts follow from how
+# the caller derives a rank within each group, so a group's full membership is
+# determined by its own size and needs no extra information from the caller.
+# ``cp`` strides by the attention TP size: ranks sharing a (dp, tp) slot but
+# holding different sequence shards form one CP group, matching the C++
+# compute_cp_group_ranks layout (rank = dp*cp*tp + cp_rank*tp + tp_rank).
 _CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp"))
 
 _groups = {}
@@ -54,9 +57,7 @@ def _backend_for(device: torch.device) -> str:
     return "hccl"
 
 
-def _shared_store(
-    host: str, port: int, global_rank: int, global_world_size: int
-) -> dist.Store:
+def _shared_store(host: str, port: int, global_rank: int, global_world_size: int) -> dist.Store:
     store_key = (host, port)
     store = _stores.get(store_key)
     if store is None:
@@ -85,10 +86,7 @@ def _exchange_world_topology(
     local = {"hostname": socket.gethostname(), "device_index": device_index}
     key_prefix = "xllm/python_collectives/topology/v1"
     store.set(f"{key_prefix}/{global_rank}", json.dumps(local))
-    return [
-        json.loads(store.get(f"{key_prefix}/{rank}").decode("utf-8"))
-        for rank in range(global_world_size)
-    ]
+    return [json.loads(store.get(f"{key_prefix}/{rank}").decode("utf-8")) for rank in range(global_world_size)]
 
 
 def _ensure_world(
@@ -115,35 +113,22 @@ def _ensure_world(
         world_size=global_world_size,
         timeout=timedelta(minutes=5),
     )
-    _world_topology = _exchange_world_topology(
-        store, device, global_rank, global_world_size
-    )
+    _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
     _world_initialized = True
 
 
-def _group_memberships(
-    group_name: str, world_size: int, global_world_size: int
-) -> list[list[int]]:
+def _group_memberships(group_name: str, world_size: int, global_world_size: int) -> list[list[int]]:
     """Every group of this kind, in an order all ranks agree on.
 
     ``new_group`` is collective over the whole world, so each rank has to create
     all groups of a kind in the same order, not only the one it belongs to.
     """
     if world_size <= 0 or global_world_size % world_size:
-        raise ValueError(
-            f"{group_name} size {world_size} does not divide the world size "
-            f"{global_world_size}"
-        )
+        raise ValueError(f"{group_name} size {world_size} does not divide the world size {global_world_size}")
     count = global_world_size // world_size
     if group_name in _CONTIGUOUS_GROUPS:
-        return [
-            [index * world_size + offset for offset in range(world_size)]
-            for index in range(count)
-        ]
-    return [
-        [index + offset * count for offset in range(world_size)]
-        for index in range(count)
-    ]
+        return [[index * world_size + offset for offset in range(world_size)] for index in range(count)]
+    return [[index + offset * count for offset in range(world_size)] for index in range(count)]
 
 
 def _supports_symmetric_memory(device: torch.device, ranks: list[int]) -> bool:
@@ -198,9 +183,7 @@ def init_process_group(
     own_ranks = None
     memberships = _group_memberships(group_name, world_size, global_world_size)
     for index, ranks in enumerate(memberships):
-        candidate = dist.new_group(
-            ranks=ranks, timeout=timedelta(minutes=5), backend=backend
-        )
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
         if global_rank in ranks:
             own = candidate
             own_index = index
@@ -212,10 +195,7 @@ def init_process_group(
             f"{world_size}, got {None if own is None else own.rank()}"
         )
     if own_index != group_index:
-        raise RuntimeError(
-            f"derived {group_name} group index {own_index} does not match the "
-            f"caller's {group_index}"
-        )
+        raise RuntimeError(f"derived {group_name} group index {own_index} does not match the caller's {group_index}")
 
     assert own_ranks is not None
     _groups[group_key] = own
@@ -249,10 +229,7 @@ def init_tp_group(
 def _require_group(x: torch.Tensor, group_name: str) -> ProcessGroup:
     group = _groups.get((group_name, str(x.device)))
     if group is None:
-        raise RuntimeError(
-            f"{group_name} collective called before its process group was "
-            f"initialized for {x.device}"
-        )
+        raise RuntimeError(f"{group_name} collective called before its process group was initialized for {x.device}")
     return group
 
 
@@ -260,6 +237,22 @@ def tp_rank(device: torch.device | str) -> int:
     """Rank in the TP group for ``device`` (0 when no TP group exists)."""
     group = _groups.get(("tp", str(torch.device(device))))
     return group.rank() if group is not None else 0
+
+
+def cp_rank(device: torch.device | str) -> int:
+    """Rank in the CP group for ``device`` (0 when no CP group exists)."""
+    group = _groups.get(("cp", str(torch.device(device))))
+    return group.rank() if group is not None else 0
+
+
+def cp_world_size(device: torch.device | str) -> int:
+    """Size of the CP group for ``device`` (1 when no CP group exists).
+
+    Lets the attention backend detect at runtime whether KV is sharded across a
+    CP group (DCP decode) without threading cp_size through the forward call.
+    """
+    group = _groups.get(("cp", str(torch.device(device))))
+    return group.size() if group is not None else 1
 
 
 # A one-shot symmetric-memory reduction is an ordinary kernel on the current
@@ -276,9 +269,7 @@ _SYMM_MEM_MAX_BUFFERS = 64
 _SYMM_MEM_DTYPES = frozenset((torch.float32, torch.bfloat16))
 
 
-def _symm_buffer(
-    group: ProcessGroup, group_name: str, x: torch.Tensor
-) -> torch.Tensor | None:
+def _symm_buffer(group: ProcessGroup, group_name: str, x: torch.Tensor) -> torch.Tensor | None:
     """Return a symmetric-memory staging buffer for ``x``, or None.
 
     Allocation and rendezvous are collective and cannot run inside a graph
@@ -318,9 +309,7 @@ def all_reduce_(x: torch.Tensor, group_name: str = "tp") -> None:
         return
     flat = x.view(-1)
     buffer.copy_(flat)
-    torch.ops.symm_mem.one_shot_all_reduce_out(
-        buffer, "sum", group.group_name, flat
-    )
+    torch.ops.symm_mem.one_shot_all_reduce_out(buffer, "sum", group.group_name, flat)
 
 
 @all_reduce_.register_fake
@@ -329,20 +318,17 @@ def _(x: torch.Tensor, group_name: str = "tp") -> None:
 
 
 @torch.library.custom_op("xllm_ops::all_gather", mutates_args=())
-def all_gather(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
-    group = _require_group(x, "tp")
+def all_gather(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
+    group = _require_group(x, group_name)
     if group.size() != world_size:
-        raise RuntimeError(
-            f"TP world-size mismatch: expected {world_size}, "
-            f"got {group.size()}"
-        )
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
     chunks = [torch.empty_like(x) for _ in range(world_size)]
     dist.all_gather(chunks, x, group=group)
     return torch.cat(chunks, dim=dim)
 
 
 @all_gather.register_fake
-def _(x: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
+def _(x: torch.Tensor, dim: int, world_size: int, group_name: str = "tp") -> torch.Tensor:
     shape = list(x.shape)
     shape[dim] *= world_size
     return x.new_empty(shape)
@@ -366,9 +352,7 @@ def all_gather_variable(
 
     local_tokens = token_counts[rank]
     if local_tokens < 0 or local_tokens > x.shape[0]:
-        raise RuntimeError(
-            f"invalid local token count {local_tokens} for input with {x.shape[0]} rows"
-        )
+        raise RuntimeError(f"invalid local token count {local_tokens} for input with {x.shape[0]} rows")
     padded_tokens = max(max(token_counts, default=0), 1)
     padded_shape = list(x.shape)
     padded_shape[0] = padded_tokens
@@ -378,9 +362,7 @@ def all_gather_variable(
 
     chunks = [torch.empty_like(padded) for _ in token_counts]
     dist.all_gather(chunks, padded, group=group)
-    valid_chunks = [
-        chunk[:count] for chunk, count in zip(chunks, token_counts) if count
-    ]
+    valid_chunks = [chunk[:count] for chunk, count in zip(chunks, token_counts) if count]
     if not valid_chunks:
         empty_shape = list(x.shape)
         empty_shape[0] = 0
@@ -405,6 +387,8 @@ __all__ = [
     "init_process_group",
     "init_tp_group",
     "tp_rank",
+    "cp_rank",
+    "cp_world_size",
     "all_reduce_",
     "all_gather",
     "all_gather_variable",

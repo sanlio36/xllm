@@ -71,6 +71,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
 
+  bool share_weights_from(CausalLM& source) override;
+
   pybind11::object& python_model() { return py_model_; }
   const pybind11::object& config_dict() const { return config_dict_; }
 
@@ -90,6 +92,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   int64_t moe_tp_rank_ = 0;
   int64_t ep_size_ = 1;
   int64_t ep_rank_ = 0;
+  int64_t cp_size_ = 1;
+  int64_t cp_rank_ = 0;
   ProcessGroup* tp_group_ = nullptr;
 
   pybind11::object py_model_;

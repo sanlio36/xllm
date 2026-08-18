@@ -123,9 +123,26 @@ class AclGraph {
   bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
                                       const c10_npu::NPUStream& signal_stream);
 
-  // Get the hidden states from the last capture
+  // Outputs are graph-owned tensors retained from capture so replay does not
+  // need to copy them into a separate persistent buffer.
   torch::Tensor get_hidden_states(uint32_t actual_num_tokens = 0) const {
-    return persistent_param_.hidden_states(actual_num_tokens);
+    if (actual_num_tokens > 0) {
+      return graph_hidden_states_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens);
+    }
+    return graph_hidden_states_;
+  }
+
+  torch::Tensor get_aux_hidden_states(uint32_t actual_num_tokens = 0) const {
+    if (!graph_aux_hidden_states_.defined() ||
+        graph_aux_hidden_states_.numel() == 0) {
+      return graph_aux_hidden_states_;
+    }
+    if (actual_num_tokens > 0) {
+      return graph_aux_hidden_states_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens);
+    }
+    return graph_aux_hidden_states_;
   }
 
  private:
@@ -134,8 +151,6 @@ class AclGraph {
 
   // Initialize capture stream if not already initialized
   void initialize_capture_stream(c10::DeviceIndex device_index);
-  void make_graph_wait_for_current_stream(aclrtStream current_stream);
-  void make_current_stream_wait_for_graph(aclrtStream current_stream);
   void prepare_model_graph_metadata(CausalLM* model,
                                     const torch::Tensor& positions,
                                     ModelInputParams& params);
@@ -159,8 +174,6 @@ class AclGraph {
   // Fallback non-default stream for capture when callers are on default stream.
   std::optional<c10_npu::NPUStream> capture_stream_;
   aclrtStream graph_stream_ = nullptr;
-  aclrtEvent replay_input_ready_event_ = nullptr;
-  aclrtEvent replay_done_event_ = nullptr;
   c10::DeviceIndex device_index_;
   std::shared_ptr<AclGraphTaskUpdateContext> graph_task_context_;
   std::optional<c10_npu::NPUStream> update_stream_;
@@ -173,6 +186,8 @@ class AclGraph {
       spec_verify_paged_attention_tiling_layout_;
   int64_t spec_verify_block_size_ = 0;
   int64_t spec_verify_kv_split_core_count_ = 0;
+  torch::Tensor graph_hidden_states_;
+  torch::Tensor graph_aux_hidden_states_;
 };
 
 // Executor implementation using ACL graph optimization

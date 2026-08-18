@@ -89,6 +89,30 @@ except Exception:  # pragma: no cover - stub-loader path
             super().__init__()
 
 
+def _use_acl_graph(config: dict) -> bool:
+    """Whether this run captures decode ACL graphs (mirrors deepseek_v32)."""
+    graph_backend = str(config.get("python_graph_backend", "off")).lower()
+    if graph_backend == "aclgraph":
+        return True
+    return graph_backend in ("", "off", "none", "0") and bool(
+        config.get("enable_graph", False)
+    )
+
+
+def _in_acl_graph() -> bool:
+    """Whether the current forward runs under ACL graph warmup/capture."""
+    ctx = get_forward_context_or_none()
+    return ctx is not None and (
+        ctx.acl_graph is not None or ctx.execution_state is not None
+    )
+
+
+def _capturing_acl_graph() -> bool:
+    """Whether the current forward is being recorded by NPUGraph capture."""
+    ctx = get_forward_context_or_none()
+    return ctx is not None and ctx.acl_graph is not None
+
+
 # ---------------------------------------------------------------------------
 # Small faithful helpers (mirror transformers modeling_glm5_next exactly).
 # ---------------------------------------------------------------------------
@@ -220,6 +244,57 @@ def _causal_conv1d_update(mixed_qkv: torch.Tensor, conv_state: torch.Tensor,
         hidden_states_new, weight=weight.unsqueeze(1), bias=None, padding=0,
         groups=hidden_size,
     )[:, :, -seq_len:]
+    if activation == "silu":
+        out = F.silu(out)
+    return out.to(mixed_qkv.dtype)
+
+
+def _round_mantissa_rne(x: torch.Tensor, keep_bits: int = 11) -> torch.Tensor:
+    """Round fp32 to ``keep_bits`` explicit mantissa bits (round-to-nearest-even).
+
+    Pure integer-op transform (ACL-graph capturable; ``view(dtype)`` is a
+    metadata-only reinterpret). Standard RNE: add ``0x7FF + lsb`` then mask.
+    """
+    keep = 23 - keep_bits
+    xi = x.contiguous().view(torch.int32)
+    xi = xi + (((1 << (keep - 1)) - 1) + ((xi >> keep) & 1))
+    return (xi & ~((1 << keep) - 1)).view(torch.float32)
+
+
+def _causal_conv1d_update_graph(mixed_qkv: torch.Tensor, conv_state: torch.Tensor,
+                                weight: torch.Tensor, activation: str = "silu"
+                                ) -> torch.Tensor:
+    """Graph-capturable twin of ``_causal_conv1d_update`` (ACL-graph decode).
+
+    F.conv1d lowers to the aclop Conv2D, which NPUGraph cannot capture (and
+    ``allow_internal_format=False`` would break the MoE W8A8 NZ weights), so
+    the depthwise width-K conv is unrolled into elementwise multiply-adds
+    reproducing the aclop kernel's numeric contract bit for bit (see the
+    accumulate block below). Only called on the graph decode path; eager
+    keeps the F.conv1d original byte-for-byte. NOTE the engine's conv weight
+    is bf16 (checkpoint overrides the fp32 init), so the eager conv runs in
+    bf16 — emulating the fp32 conv contract here returns a wrong-SHAPE
+    tensor (bf16 view(int32) halves the last dim) and crashes capture.
+    """
+    _, hidden_size, seq_len = mixed_qkv.shape
+    state_len = conv_state.shape[-1]
+    hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1).to(weight.dtype)
+    conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    k_size = weight.shape[-1]
+    # Unified aclop conv contract (reverse-engineered bitwise on NPU): operands
+    # are rounded RNE to 11 explicit mantissa bits (a no-op for bf16/fp16
+    # sources), per-tap products are exact in fp32, taps accumulate in fp32 in
+    # ascending order, and the result rounds ONCE to the conv's output dtype
+    # (= weight dtype; bf16 for the real checkpoint). Ascending order matters:
+    # a pairwise-tree variant mismatches on adversarial magnitude mixes while
+    # ascending is exact (0/2.5M elements). fp32-in (align harness) and
+    # bf16-in (engine) are the same kernel with different final rounding.
+    h_r = _round_mantissa_rne(hidden_states_new.float())
+    w_r = _round_mantissa_rne(weight.float())
+    out = w_r[:, 0:1].unsqueeze(0) * h_r[:, :, 0:seq_len]
+    for k in range(1, k_size):
+        out = out + w_r[:, k:k + 1].unsqueeze(0) * h_r[:, :, k:k + seq_len]
+    out = out.to(weight.dtype)
     if activation == "silu":
         out = F.silu(out)
     return out.to(mixed_qkv.dtype)
@@ -435,6 +510,10 @@ class Glm5NextConfig:
     indexer_types: list = field(default_factory=list)  # "full" / "shared"
     tp_size: int = 1
     tp_rank: int = 0
+    # Load-time static flag: decode ACL graph capture is enabled, so graph
+    # branches (fixed-shape indexer pooling etc.) may be taken at runtime when
+    # the forward context confirms capture/warmup (_in_acl_graph()).
+    use_acl_graph: bool = False
 
     @property
     def qk_head_dim(self) -> int:
@@ -521,6 +600,7 @@ class Glm5NextConfig:
             ),
             tp_size=int(pick("tp_size", default=1)),
             tp_rank=int(pick("tp_rank", default=0)),
+            use_acl_graph=_use_acl_graph(d),
             # mHC fields: ModelArgs may emit a 0 default (un-plumbed); treat 0
             # /None as unset and fall back to the real 300B defaults.
             hc_mult=(int(pick("hc_mult", default=4)) or 4),
@@ -779,6 +859,7 @@ class Glm5NextIndexer(nn.Module):
         self.topk = cfg.index_topk
         self.index_kpool = cfg.index_kpool
         self.index_kpool_always_select_tail = cfg.index_kpool_always_select_tail
+        self.use_acl_graph = cfg.use_acl_graph
         self.softmax_scale = self.head_dim ** -0.5
         self.wq_b = nn.Linear(cfg.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False)
@@ -836,6 +917,15 @@ class Glm5NextIndexer(nn.Module):
         weights = torch.nan_to_num(logits.softmax(2)).to(grouped_keys.dtype)
         pool_keys = (weights * grouped_keys).sum(2)
         pool_indices = pool_indices.masked_fill(~slot_valid, -1)
+        if self.use_acl_graph and _in_acl_graph():
+            # Graph branch (fixed shapes): keep ALL pools. The boolean
+            # ``pool_keys[:, keep]`` filter below produces a data-dependent
+            # output shape (aclnnNonzeroV2) that ACL graph capture cannot
+            # record. It was only a compaction: select_topk masks invalid
+            # pools to -inf via candidate_valid before the topk and fills
+            # their slots with -1 after it, so retaining them changes neither
+            # the selected valid indices nor the output width.
+            return pool_keys, pool_indices, pool_valid
         keep = pool_valid.any(0)
         return pool_keys[:, keep], pool_indices[:, keep], pool_valid[:, keep]
 
@@ -898,7 +988,13 @@ class Glm5NextIndexer(nn.Module):
         scores = torch.matmul(
             q.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1)
         )
-        scores = F.relu(scores) * self.softmax_scale
+        # In-place relu/scale: bit-identical elementwise math, but avoids a
+        # second [B, S, n_heads, n_pools] fp32 allocation. The full-length
+        # prefill warmup (10k tokens) otherwise peaks ~3.1 GiB here per copy
+        # and OOMs once the graph runner's startup reservations shrink the
+        # activation headroom under NPU_MEMORY_FRACTION.
+        scores = torch.relu_(scores)
+        scores *= self.softmax_scale
         weights = self.weights_proj(
             hidden_states.to(self.weights_proj.weight.dtype)
         ).float()
@@ -985,12 +1081,8 @@ class Glm5NextIndexer(nn.Module):
         num_tokens = batch_size * seq_len
         packed = self.get_packed_states(hidden_states, attention_mask)
         if ctx.index_cache is not None and ctx.slot_mapping is not None:
-            k_view = ctx.index_cache.view(-1, ctx.index_cache.size(-1))
-            kernels.scatter_nd_update(
-                k_view,
-                ctx.slot_mapping.reshape(-1, 1).clamp_min(0),
-                packed.reshape(num_tokens, -1),
-            )
+            # kPool index cache is unquantized (no scale side-channel).
+            ctx.update_index_cache(packed.reshape(num_tokens, -1), None)
         packed_history = backend.gather_index_history(layer, batch_size)
         num_seqs = packed_history.shape[0]
         if num_seqs == 1:
@@ -1369,13 +1461,17 @@ class Glm5NextMoE(nn.Module):
         assert torch.all(self.experts_w2_offset == 0), (
             "Glm5NextMoE int8-grouped path needs symmetric int8 experts "
             "(experts_w2_offset == 0)")
-        self.experts_w13.data = self.experts_w13.data.transpose(1, 2).contiguous()
-        self.experts_w2.data = self.experts_w2.data.transpose(1, 2).contiguous()
-        self.experts_w13.data, self.experts_w2.data = (
-            kernels.prepare_grouped_moe_weights(
-                self.experts_w13.data, self.experts_w2.data,
-            )
-        )
+        # Transpose + NZ format-cast with the raw layout released before the
+        # cast (mirrors DeepseekV3MoE._format_and_release_expert_weight): ACL
+        # graph capture must see the NZ tensor as the sole allocation, not an
+        # NCL allocation overlaid by a format view — otherwise the GMM kernel
+        # aborts at capture with "weight Format expect FRACTAL_NZ, but got
+        # [NCL]". Numerically identical to the previous transpose + cast.
+        for param in (self.experts_w13, self.experts_w2):
+            transposed = param.data.transpose(1, 2).contiguous()
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+            param.data = kernels.format_cast_nz(transposed)
+            del transposed
         self.experts_w13_scale.data = self.experts_w13_scale.data.view(
             self.num_experts, -1).contiguous()
         self.experts_w13_offset.data = self.experts_w13_offset.data.view(
@@ -1429,6 +1525,10 @@ class Glm5NextMoE(nn.Module):
                 self.e_score_correction_bias,
                 self.topk, self.topk_group, self.n_group,
                 self.cfg.norm_topk_prob,
+                # Kernel applies routed_scaling inside its fused top-k; pass
+                # 1.0 and keep the external multiply below (pre-graph
+                # behavior, numerically identical since scaling is linear).
+                routed_scaling_factor=1.0,
             )
             routed = routed * self.routed_scaling
             out = routed.view(*orig_shape)
@@ -1645,6 +1745,8 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
 
     def _cap(name: str, idx: int = 0):
         def fn(_m, _i, o):
+            if _capturing_acl_graph():
+                return
             t = o[idx] if isinstance(o, (tuple, list)) else o
             if t is None:
                 return
@@ -1656,6 +1758,8 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
 
     def _pre_cap(name: str):
         def fn(_m, inp):
+            if _capturing_acl_graph():
+                return
             t = inp[0] if isinstance(inp, (tuple, list)) else inp
             store[name] = t.detach().to(torch.float32).cpu()
         return fn
@@ -1708,6 +1812,10 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
     handles.append(model.norm.register_forward_hook(_cap("final_norm")))
 
     def _save(_m, _i, _o):
+        if _capturing_acl_graph():
+            # D2H dumps are illegal mid-capture; warmup forwards already
+            # saved the same static-input values.
+            return
         os.makedirs(outdir, exist_ok=True)
         _save_file = {k: v.contiguous().cpu() for k, v in store.items()}
         if step[0] == 0:

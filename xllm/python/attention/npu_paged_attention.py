@@ -20,9 +20,11 @@ Prefill uses FIA TND with causal mask; decode uses FIA TND with block_table.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 
 from xllm.python import kernels
@@ -31,14 +33,19 @@ from xllm.python.attention.backend import (
     AttentionMetadata,
     LayerCache,
     MlaIndexContext,
+    MlaPreprocessContext,
 )
+from xllm.python.model_executor.cp_utils import cp_gather_kv
 from xllm.python.model_executor.forward_context import (
     AclGraphTask,
+    get_execution_buffer,
     get_forward_context,
+    get_forward_context_or_none,
 )
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
+    from xllm.python.model_executor.cp_utils import CpContext
 
 # Ascend FIA sparse_mode values (see CANN aclnnFusedInferAttentionScore docs).
 # 0: no compressed mask; used for single-query decode where no causal mask is
@@ -49,6 +56,30 @@ if TYPE_CHECKING:
 #    only aligns when q_len == kv_len and would misalign on a cache hit).
 _SPARSE_MODE_NONE = 0
 _SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
+
+
+def _mla_graph_max_seqlen_k(
+    block_table: torch.Tensor,
+    page_size: int,
+) -> int:
+    """Return a replay-stable KV length bound for MLA graph metadata."""
+    max_seqlen_k = int(block_table.shape[1]) * int(page_size)
+    if max_seqlen_k <= 0:
+        raise RuntimeError("MLA graph block-table capacity must be positive")
+    return max_seqlen_k
+
+
+def _in_acl_graph() -> bool:
+    """Whether the current forward runs under ACL graph warmup/capture.
+
+    The decode graph runner always passes an ``execution_state`` (warmup and
+    capture) and an ``acl_graph`` capture context (capture only); the eager
+    runner sets neither, so eager paths stay byte-identical.
+    """
+    ctx = get_forward_context_or_none()
+    return ctx is not None and (
+        ctx.acl_graph is not None or ctx.execution_state is not None
+    )
 
 
 class NpuPagedAttentionBackend(AttentionBackend):
@@ -71,6 +102,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
         self.device = device
+        # MLA has separate dense/sparse-SFA execution paths, so the ordinary
+        # MHA graph buffers must not be initialized for an MLA instance. The
+        # pr2199 constructor heuristic (head_dim > 192 and num_kv_heads == 1)
+        # covers DS V3.2 / glm5_2 (head_dim == qk_nope + qk_rope == 576) but
+        # misses glm5_next, whose NoPE DSA layers report head_dim == 128 and
+        # the model-level n_kv_heads; bind_kv_caches therefore refines the
+        # flag from the actual cache layout (a latent-only key slot or a
+        # paged sparse-index cache implies MLA).
+        self._is_mla = head_dim > 192 and num_kv_heads == 1
+        self._uses_sparse_mla = False
 
         self._kv_caches: list[LayerCache] = []
         self._metadata: AttentionMetadata | None = None
@@ -79,8 +120,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._graph_lses: dict[int, torch.Tensor] = {}
         self._current_graph_output: torch.Tensor | None = None
         self._current_graph_lse: torch.Tensor | None = None
+        self._block_table_i32: torch.Tensor | None = None
+        self._actual_seq_lens: list[int] | None = None
+        self._actual_seq_q: list[int] = []
+        self._actual_seq_kv: list[int] = []
         self._mla_actual_seq_q: torch.Tensor | None = None
         self._mla_actual_seq_kv: torch.Tensor | None = None
+        self._mla_quant_indexer_metadata: dict[tuple[int, int, int, int], torch.Tensor] = {}
+        self._mla_max_seqlen_q = 0
+        self._mla_max_seqlen_k = 0
+        self._graph_index_history_max_kv: int | None = None
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1)
             .to(torch.int8)
@@ -90,20 +139,62 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
     @property
     def num_kv_blocks(self) -> int:
-        if not self._kv_caches:
-            return 0
-        key_cache = self._kv_caches[0].key
-        return key_cache.shape[0] if key_cache is not None else 0
+        # Hybrid models (glm5_next) interleave KDA layers (key is None) with
+        # DSA layers; scan for the first real KV cache instead of assuming
+        # layer 0 is full attention.
+        for cache in self._kv_caches:
+            if cache.key is not None:
+                return cache.key.shape[0]
+        return 0
 
     @property
     def page_size(self) -> int:
-        if not self._kv_caches:
-            return 1
-        key_cache = self._kv_caches[0].key
-        return key_cache.shape[1] if key_cache is not None else 1
+        for cache in self._kv_caches:
+            if cache.key is not None:
+                return cache.key.shape[1]
+        return 1
+
+    @property
+    def graph_index_history_max_kv(self) -> int:
+        """Static KV-length cap for the kPool graph gather.
+
+        The graph branch of ``gather_index_history`` densifies each sequence
+        to a fixed ``[num_seqs, max_kv, width]`` buffer; sizing it by the full
+        block-table capacity (max_position_embeddings can be 1M) is not
+        viable. Decode steps whose block table exceeds this cap fall back to
+        the eager runner (see DecodeAclGraphRunner), which keeps the dynamic
+        gather. Override with XLLM_GRAPH_INDEX_HISTORY_MAX_KV.
+        """
+        if self._graph_index_history_max_kv is None:
+            self._graph_index_history_max_kv = int(
+                os.environ.get("XLLM_GRAPH_INDEX_HISTORY_MAX_KV", "32768")
+            )
+        return self._graph_index_history_max_kv
+
+    @property
+    def is_mla(self) -> bool:
+        return self._is_mla
+
+    @property
+    def requires_host_kv_lengths(self) -> bool:
+        """Whether ACL Graph replay must update FIA's host KV-length list."""
+        return self._is_mla and not self._uses_sparse_mla
 
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         self._kv_caches = kv_caches
+        has_sparse_index = any(cache.index is not None for cache in kv_caches)
+        # glm5_next DSA layers are NoPE: the latent lives in the key slot and
+        # the value/rope slot is a 0-dim tensor normalized to None, while the
+        # kPool indexer adds a paged index cache. Either signal marks this
+        # backend instance as MLA even though the constructor heuristic
+        # (head_dim > 192 and num_kv_heads == 1) does not fire for it.
+        has_latent_only_cache = any(
+            cache.key is not None and cache.value is None and cache.conv is None
+            for cache in kv_caches
+        )
+        if has_sparse_index or has_latent_only_cache:
+            self._is_mla = True
+        self._uses_sparse_mla = self._is_mla and has_sparse_index
 
     def prepare(
         self,
@@ -113,9 +204,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
     ) -> None:
         self._metadata = metadata
         if metadata.q_cu_seq_lens is not None:
-            self._actual_seq_lens: list[int] | None = (
-                metadata.q_cu_seq_lens[1:].cpu().tolist()
-            )
+            self._actual_seq_lens = metadata.q_cu_seq_lens[1:].cpu().tolist()
         else:
             self._actual_seq_lens = None
 
@@ -136,12 +225,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
             kv_list = per_seq_kv[:real_batch].tolist()
 
-            self._actual_seq_q: list[int] = list(range(1, real_batch + 1))
-            self._actual_seq_kv: list[int] = kv_list
+            self._actual_seq_q = list(range(1, real_batch + 1))
+            self._actual_seq_kv = kv_list
         else:
             self._block_table_i32 = None
 
-        if graph_mode and self._block_table_i32 is not None:
+        if (
+            graph_mode
+            and self._block_table_i32 is not None
+            and not self._is_mla
+        ):
             graph_batch_size = self._block_table_i32.shape[0]
             if self._graph_workspace is None:
                 block_size = self.page_size
@@ -187,22 +280,71 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         # Pre-cache MLA (sparse SFA) seq-lens once per step; shared by
         # execute_mla / mla_index_context instead of re-derived per layer.
+        # Gated on kv_seq_lens (not _is_mla) so the eager path is unchanged
+        # for every model; the graph_mode sub-branches only swap the tensors
+        # into static execution buffers and derive replay-stable bounds.
+        self._mla_quant_indexer_metadata.clear()
         if metadata.kv_seq_lens is not None:
             kv_seq_lens = metadata.kv_seq_lens
             mla_device = kv_seq_lens.device
-            self._mla_actual_seq_kv = kv_seq_lens.to(torch.int32).to(mla_device)
+            actual_seq_kv = kv_seq_lens.to(torch.int32).to(mla_device)
             if metadata.q_cu_seq_lens is not None:
-                self._mla_actual_seq_q = metadata.q_cu_seq_lens[1:].to(
+                actual_seq_q = metadata.q_cu_seq_lens[1:].to(
                     torch.int32
                 ).to(mla_device)
             else:
                 batch = kv_seq_lens.size(0)
-                self._mla_actual_seq_q = torch.arange(
+                actual_seq_q = torch.arange(
                     1, batch + 1, dtype=torch.int32, device=mla_device
                 )
+            if graph_mode:
+                # ACL graph replay reuses the captured kernel arguments, so
+                # the seq-lens must live in static buffers that the runner
+                # rewrites before each replay.
+                graph_batch = int(actual_seq_kv.numel())
+                self._mla_actual_seq_q = get_execution_buffer(
+                    ("MLA_ACTUAL_SEQ_Q", graph_batch),
+                    lambda: torch.empty_like(actual_seq_q),
+                )
+                self._mla_actual_seq_kv = get_execution_buffer(
+                    ("MLA_ACTUAL_SEQ_KV", graph_batch),
+                    lambda: torch.empty_like(actual_seq_kv),
+                )
+                self._mla_actual_seq_q.copy_(actual_seq_q)
+                self._mla_actual_seq_kv.copy_(actual_seq_kv)
+            else:
+                self._mla_actual_seq_q = actual_seq_q
+                self._mla_actual_seq_kv = actual_seq_kv
+            if metadata.is_prefill or metadata.is_chunked_prefill:
+                q_seq_lens = getattr(metadata, "q_seq_lens", None)
+                if q_seq_lens is not None and q_seq_lens.numel() > 0:
+                    self._mla_max_seqlen_q = int(q_seq_lens.max().item())
+                else:
+                    seq_starts = torch.cat(
+                        [actual_seq_q.new_zeros(1), actual_seq_q[:-1]]
+                    )
+                    self._mla_max_seqlen_q = int(
+                        (actual_seq_q - seq_starts).max().item()
+                    )
+            else:
+                self._mla_max_seqlen_q = 1
+            if graph_mode and self._block_table_i32 is not None:
+                # QuantLightningIndexer metadata is captured into the ACL
+                # graph. Python scalar arguments are fixed at capture time,
+                # while the device KV lengths continue to grow on replay.
+                # Use the static graph block-table capacity as a safe bound so
+                # the captured tiling metadata remains valid for every replay.
+                self._mla_max_seqlen_k = _mla_graph_max_seqlen_k(
+                    self._block_table_i32,
+                    self.page_size,
+                )
+            else:
+                self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
         else:
             self._mla_actual_seq_q = None
             self._mla_actual_seq_kv = None
+            self._mla_max_seqlen_q = 0
+            self._mla_max_seqlen_k = 0
 
     def execute(
         self,
@@ -224,11 +366,22 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # Write KV to paged cache (kernel expects [T, kv_heads, head_dim]).
         k_3d = k.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
         v_3d = v.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
+        q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
+
+        # Context-Parallel prefill: q/k/v are this rank's sequence shard while
+        # the slot_mapping/metadata still describe the full global sequence
+        # (C++ does not pre-shard the Python path). All-gather K/V to the full
+        # sequence, persist this rank's KV shard, and attend over its causal
+        # prefix.
+        cp_context = get_forward_context().cp_context
+        if cp_context is not None:
+            return self._prefill_cp(
+                q_3d, k_3d, v_3d, metadata, cp_context, k_cache, v_cache
+            )
+
         kernels.reshape_paged_cache(
             metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache
         )
-
-        q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
 
         if metadata.is_prefill or metadata.is_chunked_prefill:
             return self._prefill(
@@ -240,10 +393,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self,
         q_latent: torch.Tensor,
         q_pe: torch.Tensor,
-        k_latent_3d: torch.Tensor,
-        k_pe_3d: torch.Tensor,
+        k_latent_3d: torch.Tensor | None,
+        k_pe_3d: torch.Tensor | None,
         layer: "Attention",
         topk: torch.Tensor | None = None,
+        cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
         metadata = self._metadata
@@ -268,35 +422,129 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 raise RuntimeError(
                     f"MLA rope cache is missing for layer {layer_id} "
                     f"(qk_rope_head_dim={rope_dim})")
-            torch.ops.xllm_ops.reshape_paged_cache(
-                metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
-            )
+            if not cache_is_preprocessed:
+                if k_latent_3d is None or k_pe_3d is None:
+                    raise RuntimeError("MLA cache inputs are required")
+                torch.ops.xllm_ops.reshape_paged_cache(
+                    metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
+                )
             return self._mla_sparse(
-                q_latent, q_pe, nope_cache, rope_cache, topk, metadata.block_table
+                q_latent, q_pe, nope_cache, rope_cache, topk,
+                self._block_table_i32, layer_id,
             )
         # NoPE path: latent only, no rope.
-        torch.ops.xllm_ops.reshape_paged_cache(
-            metadata.slot_mapping, k_latent_3d, k_latent_3d, nope_cache, nope_cache
-        )
+        if not cache_is_preprocessed:
+            if k_latent_3d is None:
+                raise RuntimeError("MLA cache inputs are required")
+            torch.ops.xllm_ops.reshape_paged_cache(
+                metadata.slot_mapping, k_latent_3d, k_latent_3d, nope_cache, nope_cache
+            )
         return self._mla_sparse(
-            q_latent, None, nope_cache, None, topk, metadata.block_table
+            q_latent, None, nope_cache, None, topk,
+            self._block_table_i32, layer_id,
+        )
+
+    def mla_preprocess_context(
+        self,
+        layer: "Attention",
+    ) -> MlaPreprocessContext | None:
+        metadata = self._metadata
+        if metadata is None or metadata.is_prefill or metadata.is_chunked_prefill:
+            return None
+        layer_cache = self._kv_caches[layer.layer_id]
+        kv_cache, rope_cache = layer_cache.key, layer_cache.value
+        if kv_cache is None or rope_cache is None:
+            raise RuntimeError(f"MLA latent cache is missing for layer {layer.layer_id}")
+        return MlaPreprocessContext(
+            kv_cache=kv_cache,
+            rope_cache=rope_cache,
+            slot_mapping=metadata.slot_mapping,
         )
 
     def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
         metadata = self._metadata
         assert metadata is not None, "mla_index_context called before prepare()"
-        index_cache = self._kv_caches[layer.layer_id].index
+        assert self._block_table_i32 is not None
+        assert self._mla_actual_seq_q is not None
+        assert self._mla_actual_seq_kv is not None
+        layer_cache = self._kv_caches[layer.layer_id]
+        index_cache = layer_cache.index
         if index_cache is None:
             raise RuntimeError(
                 f"MLA index cache is missing for layer {layer.layer_id}"
             )
+        index_cache_scale = layer_cache.index_scale
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=metadata.slot_mapping,
-            block_table=metadata.block_table,
+            block_table=self._block_table_i32,
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
+            index_cache_scale=index_cache_scale,
+            get_quant_indexer_metadata=lambda num_heads_q,
+            head_dim,
+            sparse_count,
+            cmp_ratio: self._get_quant_indexer_metadata(
+                num_heads_q,
+                index_cache.size(2),
+                head_dim,
+                sparse_count,
+                cmp_ratio,
+            ),
+            update_index_cache=lambda values, scales: self._update_mla_index_cache(
+                index_cache,
+                index_cache_scale,
+                metadata.slot_mapping,
+                values,
+                scales,
+            ),
         )
+
+    def _get_quant_indexer_metadata(
+        self,
+        num_heads_q: int,
+        num_heads_k: int,
+        head_dim: int,
+        sparse_count: int,
+        cmp_ratio: int,
+    ) -> torch.Tensor:
+        assert self._mla_actual_seq_q is not None
+        assert self._mla_actual_seq_kv is not None
+        cache_key = (num_heads_q, head_dim, sparse_count, cmp_ratio)
+        metadata = self._mla_quant_indexer_metadata.get(cache_key)
+        if metadata is None:
+            metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q,
+                num_heads_k,
+                head_dim,
+                self._mla_actual_seq_q,
+                self._mla_actual_seq_kv,
+                self._mla_max_seqlen_q,
+                self._mla_max_seqlen_k,
+                sparse_count,
+                cmp_ratio,
+            )
+            self._mla_quant_indexer_metadata[cache_key] = metadata
+        return metadata
+
+    @staticmethod
+    def _update_mla_index_cache(
+        index_cache: torch.Tensor,
+        index_cache_scale: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
+        values: torch.Tensor,
+        scales: torch.Tensor | None,
+    ) -> None:
+        cache_view = index_cache.view(-1, index_cache.size(-1))
+        scatter_indices = slot_mapping.reshape(-1, 1).clamp_min(0)
+        kernels.scatter_nd_update(
+            cache_view,
+            scatter_indices,
+            values,
+        )
+        if index_cache_scale is not None and scales is not None:
+            scale_view = index_cache_scale.view(-1, index_cache_scale.size(-1))
+            kernels.scatter_nd_update(scale_view, scatter_indices, scales)
 
     def gather_index_history(
         self, layer: "Attention", batch_size: int,
@@ -327,6 +575,47 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # for multi-sequence batches; the real sequence count is the block
         # table's first dim. Use it to gather every sequence's history.
         num_seqs = block_table.shape[0] if block_table is not None else batch_size
+
+        if _in_acl_graph():
+            # Graph branch: fixed shapes only (no .item()/host sync). Gather
+            # the block table in one vectorized index_select up to a static
+            # max_kv (replay-stable; capped by graph_index_history_max_kv —
+            # the runner falls back to eager beyond it). Rows past each
+            # sequence's live length are zeroed by an explicit kv_seq_lens
+            # mask: the valid channel alone cannot be trusted because a
+            # recycled block still carries a previous owner's valid=1 rows,
+            # and a padded block-table column points at block 0.
+            kv_lens_dev = metadata.kv_seq_lens
+            if kv_lens_dev is None:
+                raise RuntimeError(
+                    "gather_index_history graph mode needs device kv_seq_lens")
+            max_kv = min(
+                block_table.shape[1] * block_size,
+                self.graph_index_history_max_kv,
+            )
+            num_blocks = (max_kv + block_size - 1) // block_size
+            out = get_execution_buffer(
+                ("KPOOL_INDEX_HISTORY", num_seqs, max_kv, width),
+                lambda: torch.empty(
+                    num_seqs, max_kv, width,
+                    dtype=index_cache.dtype, device=device,
+                ),
+            )
+            flat = index_cache.view(-1, width)
+            bt = block_table[:num_seqs, :num_blocks].to(torch.int64)
+            block_offsets = torch.arange(block_size, device=device)
+            slot_ids = (
+                bt[:, :, None] * block_size + block_offsets[None, None, :]
+            ).reshape(num_seqs, max_kv)
+            gathered = flat.index_select(0, slot_ids.reshape(-1)).view(
+                num_seqs, max_kv, width
+            )
+            row_valid = (
+                torch.arange(max_kv, device=device)[None, :]
+                < kv_lens_dev[:num_seqs].to(torch.int64)[:, None]
+            )
+            torch.mul(gathered, row_valid[:, :, None].to(out.dtype), out=out)
+            return out
 
         kv_seq_lens = metadata.kv_seq_lens
         if kv_seq_lens is not None:
@@ -404,6 +693,30 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         idx = metadata.linear_state_indices
         num_seqs = idx.shape[0] if idx is not None else batch_size
+        # ACL-graph decode with a flattened batch: the model forward unsqueezes
+        # the 1-D ``[num_seqs]`` decode input into ``[1, num_seqs]``, so
+        # mixed_qkv arrives as ``[1, conv_dim, num_seqs]`` with idx
+        # ``[num_seqs]``. The eager multi-sequence branch (a Python loop over
+        # q_cu_seq_lens with host syncs) is not graph-capturable; decode is
+        # exactly one token per sequence, so reshape to ``[num_seqs, conv_dim,
+        # 1]`` and take the simple per-sequence path with static shapes. gate
+        # ``[1, T, nh, hd]`` / beta ``[1, T, nh]`` follow the same transpose.
+        in_graph = _in_acl_graph()
+        is_decode = not metadata.is_prefill and not metadata.is_chunked_prefill
+        flatten_graph_decode = (
+            in_graph
+            and is_decode
+            and idx is not None
+            and batch_size == 1
+            and num_seqs > 1
+            and seq_len == num_seqs
+        )
+        if flatten_graph_decode:
+            mixed_qkv = mixed_qkv.transpose(0, 2)  # [1, C, T] -> [T, C, 1]
+            batch_size, _, seq_len = mixed_qkv.shape
+            hidden_shape = (batch_size, seq_len, -1, head_dim)
+            gate = gate.transpose(0, 1)  # [1, T, nh, hd] -> [T, 1, nh, hd]
+            beta = beta.transpose(0, 1)  # [1, T, nh] -> [T, 1, nh]
         if idx is None:
             device = mixed_qkv.device
             conv_state = torch.zeros(
@@ -434,6 +747,19 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     torch.zeros_like(ssm_i),
                 )
             conv_state, ssm_state = conv_i, ssm_i.contiguous()
+            if os.environ.get("GLM5NEXT_DEBUG_LINEAR") and not (
+                    get_forward_context_or_none() is not None
+                    and get_forward_context_or_none().acl_graph is not None
+                ):
+                print(
+                    f"[linear-debug-in] L{layer.layer_id} graph={in_graph} "
+                    f"conv_in={conv_state.abs().sum().item():.6e} "
+                    f"ssm_in={ssm_state.abs().sum().item():.6e} "
+                    f"mqkv_in={mixed_qkv.abs().sum().item():.6e} "
+                    f"gate_in={gate.abs().sum().item():.6e} "
+                    f"beta_in={beta.abs().sum().item():.6e}",
+                    flush=True,
+                )
 
         conv_weight = layer.conv1d.weight.squeeze(1)
         activation = layer.activation
@@ -441,9 +767,19 @@ class NpuPagedAttentionBackend(AttentionBackend):
             # Simple path: mixed_qkv is already [B, conv_dim, S] (one sequence
             # per batch row, or a single flattened sequence).
             if seq_len == 1:
-                mixed_qkv = _causal_conv1d_update(
-                    mixed_qkv, conv_state, conv_weight, activation
-                )
+                if in_graph:
+                    # F.conv1d is an aclop NPUGraph cannot capture; the manual
+                    # depthwise mul-add is capture-safe. Eager keeps F.conv1d.
+                    from xllm.python.models.glm5_next import (
+                        _causal_conv1d_update_graph,
+                    )
+                    mixed_qkv = _causal_conv1d_update_graph(
+                        mixed_qkv, conv_state, conv_weight, activation
+                    )
+                else:
+                    mixed_qkv = _causal_conv1d_update(
+                        mixed_qkv, conv_state, conv_weight, activation
+                    )
             else:
                 conv_in = torch.cat([conv_state, mixed_qkv], dim=-1)
                 mixed_qkv = _causal_conv1d_fn(
@@ -531,7 +867,18 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 cu_seqlens = q_cu.to(torch.int32)
             elif seq_len == 1:
                 # B independent single-token sequences.
-                cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
+                if in_graph:
+                    # Constant content; allocate once into the persistent
+                    # execution buffer so capture records no per-step H2D
+                    # arange.
+                    cu_seqlens = get_execution_buffer(
+                        ("KDA_DECODE_CU_SEQLENS", num_seqs),
+                        lambda: torch.arange(
+                            num_seqs + 1, dtype=torch.int32, device=device
+                        ),
+                    )
+                else:
+                    cu_seqlens = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
             else:
                 cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
             core_attn_out, final_state = recurrent_kda(
@@ -576,11 +923,31 @@ class NpuPagedAttentionBackend(AttentionBackend):
             ssm_cache.index_copy_(
                 0, idx, final_state.float().contiguous()
             )
+        if os.environ.get("GLM5NEXT_DEBUG_LINEAR") and not (
+            get_forward_context_or_none() is not None
+            and get_forward_context_or_none().acl_graph is not None
+        ):
+            print(
+                f"[linear-debug] L{layer.layer_id} graph={in_graph} "
+                f"bs={batch_size} sl={seq_len} ns={num_seqs} "
+                f"idx={idx.flatten().tolist() if idx is not None else None} "
+                f"his={metadata.has_initial_state.flatten().tolist() if isinstance(metadata.has_initial_state, torch.Tensor) else metadata.has_initial_state} "
+                f"conv_sum={conv_state.abs().sum().item():.6e} "
+                f"ssm_sum={ssm_state.abs().sum().item():.6e} "
+                f"core_sum={core_attn_out.abs().sum().item():.6e}",
+                flush=True,
+            )
         # multi-seq path reshaped mixed_qkv to [num_seqs, ...]; flatten the
         # output back to [1, T, ...] so the KDA forward's hidden_shape [1, T]
         # aligns for o_norm / o_proj.
         if num_seqs != batch_size:
             core_attn_out = core_attn_out.reshape(1, -1, *core_attn_out.shape[2:])
+        elif flatten_graph_decode:
+            # The flatten-decode graph branch ran the simple path on
+            # [num_seqs, 1, nh, hd]; restore the model's flattened [1, T, ...]
+            # layout so o_norm's gate ([1, T, nh, hd]) aligns without
+            # broadcasting.
+            core_attn_out = core_attn_out.transpose(0, 1)
         return core_attn_out
 
     def _mla_sparse(
@@ -591,16 +958,29 @@ class NpuPagedAttentionBackend(AttentionBackend):
         rope_cache: torch.Tensor,
         topk: torch.Tensor,
         block_table: torch.Tensor,
+        layer_id: int,
     ) -> torch.Tensor:
-        out = torch.ops.xllm_ops.sparse_flash_attention(
-            q_latent, nope_cache, nope_cache, topk,
+        out = get_execution_buffer(
+            ("SFA_OUTPUT", layer_id) + tuple(q_latent.shape),
+            lambda: torch.empty_like(q_latent),
+        )
+        return kernels.sparse_flash_attention_out(
+            q_latent,
+            nope_cache,
+            nope_cache,
+            topk,
             block_table,
             self._mla_actual_seq_q,
             self._mla_actual_seq_kv,
-            q_pe, rope_cache, self.scale, 1,
-            "TND", "PA_BSND", 3,
-        )
-        return out  # [T, H, kv_lora]
+            q_pe,
+            rope_cache,
+            self.scale,
+            1,
+            "TND",
+            "PA_BSND",
+            3,
+            out,
+        )  # [T, H, kv_lora]
 
     # ------------------------------------------------------------------
     # Prefill: packed TND with causal mask
@@ -654,6 +1034,89 @@ class NpuPagedAttentionBackend(AttentionBackend):
             softmax_lse_flag=False,
         )
         return output.reshape(num_tokens, self.num_heads * self.head_dim)
+
+    # ------------------------------------------------------------------
+    # Context-Parallel prefill: all-gather KV, attend over causal prefix
+    # ------------------------------------------------------------------
+
+    def _prefill_cp(
+        self,
+        q_3d: torch.Tensor,
+        k_3d: torch.Tensor,
+        v_3d: torch.Tensor,
+        metadata: AttentionMetadata,
+        cp_context: "CpContext",
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill attention for this rank's zigzag sequence shard.
+
+        q/k/v hold this rank's ``total_local`` rows (two owned chunks per
+        sequence, padding rows zeroed). We all-gather K/V back to the full
+        global-order sequence, write the complete KV into the paged cache (so a
+        later non-CP decode sees every position), then run one FIA over this
+        rank's real queries. Each owned (sequence, half) segment is a packed
+        sub-sequence: its ``real_count`` queries attend the causal prefix
+        ``[0, segment_start + real_count)`` selected by ``kv_gather_index``.
+        With ``sparse_mode=3`` (right-aligned causal) query row ``i`` of a
+        segment attends KV ``[0, segment_start + i]`` — its exact global causal
+        range. Segments are independent sub-sequences delimited by
+        ``q_cu_seqlens`` / ``kv_cu_seqlens``, so both owned chunks resolve in a
+        single call.
+        """
+        local_tokens = q_3d.shape[0]
+
+        kv_global_k = cp_gather_kv(k_3d, cp_context)
+        kv_global_v = cp_gather_kv(v_3d, cp_context)
+
+        # Persist the full global-order KV into this rank's paged cache.
+        kernels.reshape_paged_cache(
+            metadata.slot_mapping,
+            kv_global_k.contiguous(),
+            kv_global_v.contiguous(),
+            k_cache,
+            v_cache,
+        )
+
+        # A CP rank can own only padding chunks when every sequence in the batch
+        # is shorter than the zigzag chunk grid (e.g. a 1-token prompt with
+        # cp_size > 1). It then has no real queries. The KV all-gather above
+        # already ran (collectives must stay in lockstep across ranks) and the
+        # full global KV is now in this rank's paged cache, so skip the FIA:
+        # calling it with a 0-row query and empty actual_seq_lengths is rejected
+        # by npu_fused_infer_attention. Return the all-zero shard directly.
+        if cp_context.query_index.numel() == 0:
+            return q_3d.new_zeros(local_tokens, self.num_heads * self.head_dim)
+
+        # Real queries this rank owns, packed per (sequence, half) segment.
+        q_real = q_3d.index_select(0, cp_context.query_index).contiguous()
+        # Each segment's causal KV prefix, packed in the same segment order.
+        kv_prefix_k = kv_global_k.index_select(0, cp_context.kv_gather_index).contiguous()
+        kv_prefix_v = kv_global_v.index_select(0, cp_context.kv_gather_index).contiguous()
+
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            q_real,
+            kv_prefix_k,
+            kv_prefix_v,
+            pse_shift=None,
+            atten_mask=self._causal_mask,
+            actual_seq_lengths=cp_context.q_cu_seqlens,
+            actual_seq_lengths_kv=cp_context.kv_cu_seqlens,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            input_layout="TND",
+            num_key_value_heads=self.num_kv_heads,
+            sparse_mode=3,
+            softmax_lse_flag=False,
+        )
+        output = output.reshape(-1, self.num_heads * self.head_dim)
+
+        # Scatter real-query outputs back into the padded [total_local] layout;
+        # padding rows stay zero (they are never selected by restore_index in
+        # the subsequent all-gather merge).
+        out_local = q_3d.new_zeros(local_tokens, self.num_heads * self.head_dim)
+        out_local.index_copy_(0, cp_context.query_index, output)
+        return out_local
 
     # ------------------------------------------------------------------
     # Decode: FIA with block_table (paged KV, no gather)

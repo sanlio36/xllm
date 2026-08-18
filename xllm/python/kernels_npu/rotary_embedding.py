@@ -76,9 +76,7 @@ def fused_qk_norm_rope(
     )
 
 
-@torch.library.custom_op(
-    "xllm_python::interleaved_rotary_embedding", mutates_args=()
-)
+@torch.library.custom_op("xllm_python::interleaved_rotary_embedding", mutates_args=())
 def interleaved_rotary_embedding(
     value: torch.Tensor,
     cosine: torch.Tensor,
@@ -95,10 +93,31 @@ def interleaved_rotary_embedding(
         A tensor with the shape and dtype of ``value``.
     """
     num_tokens, num_heads, head_dim = value.shape
-    output = torch_npu.npu_interleave_rope(
-        value.view(num_tokens, num_heads, 1, head_dim), cosine, sine
-    )
+    output = torch_npu.npu_interleave_rope(value.view(num_tokens, num_heads, 1, head_dim), cosine, sine)
     return output.view(num_tokens, num_heads, head_dim)
+
+
+def inplace_partial_rotary_mul(
+    value: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    start: int,
+    end: int,
+) -> None:
+    """Apply interleaved RoPE to one slice of ``value`` in place."""
+    if value.dim() == 2:
+        value_4d = value.unsqueeze(1).unsqueeze(1)
+    elif value.dim() == 3:
+        value_4d = value.unsqueeze(1)
+    else:
+        raise ValueError("inplace_partial_rotary_mul expects a 2D or 3D tensor")
+    torch.ops.xllm_ops.inplace_partial_rotary_mul(
+        value_4d,
+        cosine,
+        sine,
+        "interleave",
+        [start, end],
+    )
 
 
 @interleaved_rotary_embedding.register_fake
@@ -111,4 +130,72 @@ def _interleaved_rotary_embedding_fake(
     return torch.empty_like(value)
 
 
-__all__ = ["fused_qk_norm_rope", "interleaved_rotary_embedding"]
+def mrope(
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
+    *,
+    mrope_section: list[int],
+    rotary_mode: str = "half",
+    cache_mode: str = "interleave",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply multi-dimensional RoPE (mRoPE) to query and key tensors.
+
+    Wraps ``torch_npu.npu_mrope``.
+
+    Args:
+        positions: ``[3, num_tokens]`` position ids (time/height/width), dtype int64.
+        q: ``[num_tokens, q_size]`` query tensor.
+        k: ``[num_tokens, kv_size]`` key tensor.
+        cos_sin_cache: ``[max_pos, head_dim]`` cos/sin table.
+        head_dim: Per-head dimension.
+        mrope_section: Section sizes for time/height/width.
+        rotary_mode: Rotation mode (default ``"half"``).
+        cache_mode: Cache layout mode (default ``"interleave"``).
+
+    Returns:
+        Rotated (q, k) with same shapes as inputs.
+    """
+    import torch_npu
+
+    return torch_npu.npu_mrope(
+        positions,
+        q,
+        k,
+        cos_sin_cache,
+        head_dim,
+        mrope_section=list(mrope_section),
+        rotary_mode=rotary_mode,
+        cache_mode=cache_mode,
+    )
+
+
+def vision_rotary_mul(
+    value: torch.Tensor,
+    cos_full: torch.Tensor,
+    sin_full: torch.Tensor,
+) -> torch.Tensor:
+    """Apply RoPE via ``torch_npu.npu_rotary_mul`` (neox/half mode).
+
+    Args:
+        value: ``(total_tokens, num_heads, head_dim)``.
+        cos_full: ``(1, total_tokens, 1, head_dim)``.
+        sin_full: ``(1, total_tokens, 1, head_dim)``.
+
+    Returns:
+        Rotated tensor with same shape as ``value``.
+    """
+    import torch_npu
+
+    return torch_npu.npu_rotary_mul(value.unsqueeze(0).contiguous(), cos_full, sin_full).squeeze(0)
+
+
+__all__ = [
+    "fused_qk_norm_rope",
+    "inplace_partial_rotary_mul",
+    "interleaved_rotary_embedding",
+    "mrope",
+    "vision_rotary_mul",
+]
