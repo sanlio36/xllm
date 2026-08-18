@@ -909,10 +909,26 @@ class Glm5NextIndexer(nn.Module):
         )
         slot_in_range = pool_indices < total_len
         safe_indices = pool_indices.clamp(0, total_len - 1)
-        batch_idx = torch.arange(batch_size, device=device)[:, None, None]
-        grouped_keys = keys[batch_idx, safe_indices]
-        grouped_gate_scores = gate_scores[batch_idx, safe_indices]
-        slot_valid = key_valid[batch_idx, safe_indices] & slot_in_range
+        # AICore-native gather replaces fancy indexing (x[idx]) which falls
+        # back to aclnnIndex on AI_CPU (140-290us). torch.gather requires the
+        # index and input to share ndim, so gather over flattened
+        # (total_len * head_dim) rows, then reshape. safe_indices is
+        # [B, n_pools, rate] and already clamped to [0, total_len-1].
+        head_off = torch.arange(self.head_dim, device=device)
+        flat_idx = (safe_indices[..., None] * self.head_dim + head_off).reshape(
+            batch_size, -1
+        )
+        grouped_keys = keys.reshape(batch_size, -1).gather(1, flat_idx).reshape(
+            batch_size, n_pools, rate, self.head_dim
+        )
+        grouped_gate_scores = gate_scores.reshape(batch_size, -1).gather(
+            1, flat_idx
+        ).reshape(batch_size, n_pools, rate, self.head_dim)
+        # key_valid is bool; gather has no bool kernel on Ascend, so cast
+        # uint8 locally and restore bool — downstream & / ~ / argmax unchanged.
+        slot_valid = key_valid.to(torch.uint8).gather(
+            1, safe_indices.reshape(batch_size, -1)
+        ).reshape(batch_size, n_pools, rate).to(torch.bool) & slot_in_range
         pool_valid = slot_valid.all(-1)
         logits = grouped_gate_scores.float() + self.index_kpool_compress_ape.float()[None, None]
         logits = logits.masked_fill(~slot_valid[..., None], float("-inf"))
