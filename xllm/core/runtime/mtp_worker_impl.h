@@ -195,6 +195,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   struct PendingTargetContext {
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
+    std::vector<uint64_t> dp_global_batch_generations;
     // Both tensors stay on device.  A steady-state overlap step consumes them
     // by queueing gather/update ops behind rejection sampling on the same
     // stream.  They are materialized on CPU only when the batch shape/order
@@ -264,6 +265,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   PendingTargetContext pending_target_context_;
   std::vector<int32_t> device_context_ready_embedding_ids_;
   std::vector<std::string> device_context_ready_request_ids_;
+  std::vector<uint64_t> device_context_ready_batch_generations_;
   // A single persistent pinned destination is sufficient for accepted-token
   // D2H: the preceding pending target context is always flushed before the
   // next validation can submit another copy. The pending context holds a view

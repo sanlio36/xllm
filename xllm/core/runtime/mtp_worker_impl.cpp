@@ -1291,9 +1291,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           input.input_params.embedding.embedding_ids;
       device_context_ready_request_ids_ =
           input.input_params.embedding.request_ids;
+      device_context_ready_batch_generations_ =
+          input.input_params.parallel.dp_global_batch_generations;
     } else if (!device_target_context_ready_for_batch(input)) {
       device_context_ready_embedding_ids_.clear();
       device_context_ready_request_ids_.clear();
+      device_context_ready_batch_generations_.clear();
     }
   }
   // Adaptive is enabled only after profile completes (registry has predictor),
@@ -2185,6 +2188,8 @@ void MTPWorkerImpl::stage_target_context_write(
       input.input_params.embedding.embedding_ids;
   pending_target_context_.request_ids =
       input.input_params.embedding.request_ids;
+  pending_target_context_.dp_global_batch_generations =
+      input.input_params.parallel.dp_global_batch_generations;
   pending_target_context_.accepted_tokens = validate_output.next_tokens;
   pending_target_context_.accepted_tokens_host =
       std::move(accepted_tokens_host);
@@ -2228,7 +2233,9 @@ bool MTPWorkerImpl::pending_target_context_matches(
          pending_target_context_.embedding_ids ==
              input.input_params.embedding.embedding_ids &&
          pending_target_context_.request_ids ==
-             input.input_params.embedding.request_ids;
+             input.input_params.embedding.request_ids &&
+         pending_target_context_.dp_global_batch_generations ==
+             input.input_params.parallel.dp_global_batch_generations;
 }
 
 bool MTPWorkerImpl::device_target_context_ready_for_batch(
@@ -2236,7 +2243,9 @@ bool MTPWorkerImpl::device_target_context_ready_for_batch(
   return device_context_ready_embedding_ids_ ==
              input.input_params.embedding.embedding_ids &&
          device_context_ready_request_ids_ ==
-             input.input_params.embedding.request_ids;
+             input.input_params.embedding.request_ids &&
+         device_context_ready_batch_generations_ ==
+             input.input_params.parallel.dp_global_batch_generations;
 }
 
 void MTPWorkerImpl::flush_pending_target_context() {
