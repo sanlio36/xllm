@@ -2464,6 +2464,22 @@ void MTPWorkerImpl::enqueue_next_first_draft(
   wait_metadata_ready_event(combined_input, *compute_stream_);
   clear_ready_events(combined_input);
 
+  const bool is_glm_moe_dsa_prelaunch =
+      combined_draft_execution_path_ ==
+      mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+  const bool rebuild_prelaunch_metadata =
+      is_glm_moe_dsa_prelaunch && !prelaunch_metadata_batch_matches(input);
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] "
+                 "prelaunch_metadata_decision rank="
+              << parallel_args_.rank()
+              << ", rebuild=" << rebuild_prelaunch_metadata
+              << ", batch_generations="
+              << input.input_params.parallel.dp_global_batch_generations;
+  }
+#endif
+
   // Interleave [repair, current] rows in one decode batch. Every transformer
   // layer projects both rows, writes both KV rows, and only then launches
   // PagedAttention. Same-stream ordering therefore makes repair KV visible to
@@ -2477,10 +2493,21 @@ void MTPWorkerImpl::enqueue_next_first_draft(
       base_positions,
       base_kv_seq_lens,
       /*use_chunked_prefill=*/false,
-      /*rebuild_expanded_decode_metadata=*/true,
+      rebuild_prelaunch_metadata,
       options_.block_size());
 
   submit_pending_first_draft(input, std::move(combined_input));
+  if (rebuild_prelaunch_metadata) {
+    prelaunch_metadata_embedding_ids_ =
+        input.input_params.embedding.embedding_ids;
+    prelaunch_metadata_request_ids_ = input.input_params.embedding.request_ids;
+    prelaunch_metadata_dp_global_token_nums_ =
+        input.input_params.parallel.dp_global_token_nums;
+    prelaunch_metadata_raw_dp_global_token_nums_ =
+        input.input_params.parallel.raw_dp_global_token_nums;
+    prelaunch_metadata_batch_generations_ =
+        input.input_params.parallel.dp_global_batch_generations;
+  }
 }
 
 void MTPWorkerImpl::submit_pending_first_draft(
@@ -2520,6 +2547,20 @@ bool MTPWorkerImpl::pending_draft_context_matches(
          pending_draft_context_.raw_dp_global_token_nums ==
              input.input_params.parallel.raw_dp_global_token_nums &&
          pending_draft_context_.dp_global_batch_generations ==
+             input.input_params.parallel.dp_global_batch_generations;
+}
+
+bool MTPWorkerImpl::prelaunch_metadata_batch_matches(
+    const ForwardInput& input) const {
+  return prelaunch_metadata_embedding_ids_ ==
+             input.input_params.embedding.embedding_ids &&
+         prelaunch_metadata_request_ids_ ==
+             input.input_params.embedding.request_ids &&
+         prelaunch_metadata_dp_global_token_nums_ ==
+             input.input_params.parallel.dp_global_token_nums &&
+         prelaunch_metadata_raw_dp_global_token_nums_ ==
+             input.input_params.parallel.raw_dp_global_token_nums &&
+         prelaunch_metadata_batch_generations_ ==
              input.input_params.parallel.dp_global_batch_generations;
 }
 

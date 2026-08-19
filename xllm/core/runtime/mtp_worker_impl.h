@@ -242,6 +242,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void submit_pending_first_draft(const ForwardInput& batch_identity_input,
                                   ForwardInput draft_input);
   bool pending_draft_context_matches(const ForwardInput& input) const;
+  bool prelaunch_metadata_batch_matches(const ForwardInput& input) const;
 
   void write_target_context_to_cache(const ForwardInput& input,
                                      const SampleOutput& validate_output,
@@ -276,6 +277,13 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.
   PendingDraftContext pending_draft_context_;
+  // GLM MoE DSA rebuilds prelaunch metadata only when this identity changes.
+  // Other MTP model paths do not consult this state.
+  std::vector<int32_t> prelaunch_metadata_embedding_ids_;
+  std::vector<std::string> prelaunch_metadata_request_ids_;
+  std::vector<int32_t> prelaunch_metadata_dp_global_token_nums_;
+  std::vector<int32_t> prelaunch_metadata_raw_dp_global_token_nums_;
+  std::vector<uint64_t> prelaunch_metadata_batch_generations_;
   // Whether validation directly uses selected-only draft_probs [B, S].
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;
