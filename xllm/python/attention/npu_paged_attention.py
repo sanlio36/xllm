@@ -886,10 +886,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 initial_state=ssm_state,
                 cu_seqlens=cu_seqlens,
                 layout="TND", scale=scale,
-                output_final_state=True, inplace_final_state=False,
+                output_final_state=True, inplace_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=False,
                 use_beta_sigmoid_in_kernel=False,
+                state_v_first=True,
             )
             # recurrent_kda returns the packed TND [T, nh, hd] layout of its
             # inputs; restore the [B, S, nh, hd] grouping the model layer
