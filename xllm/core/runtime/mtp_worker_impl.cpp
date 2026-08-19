@@ -24,9 +24,16 @@ limitations under the License.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
+#include <functional>
+#include <iomanip>
 #include <memory>
+#include <mutex>
+#include <sstream>
+#include <thread>
 
 #include "common/metrics.h"
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -336,12 +343,15 @@ void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
 
+using ForwardInputObserver = std::function<void(const ForwardInput&, Stream&)>;
+
 std::optional<ForwardOutput> run_llm_no_sync_impl(
     LLMWorkerImpl& worker,
     const ForwardInput& input,
     Stream& prepare_stream,
     Stream& compute_stream,
-    ForwardInput& processed_input) {
+    ForwardInput& processed_input,
+    const ForwardInputObserver* forward_input_observer) {
   worker.prepare_work_before_execute_on_stream(
       input,
       processed_input,
@@ -350,6 +360,9 @@ std::optional<ForwardOutput> run_llm_no_sync_impl(
   worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
   std::optional<ForwardOutput> output = worker.execute_no_sync_on_stream(
       processed_input, compute_stream, /*record_ready_event=*/false);
+  if (forward_input_observer != nullptr) {
+    (*forward_input_observer)(processed_input, compute_stream);
+  }
 #if defined(USE_NPU)
   if (::xllm::ExecutionConfig::get_instance().debug_sync_dp_mtp_overlap()) {
     static thread_local uint64_t debug_leaf_forward_id = 0;
@@ -375,6 +388,20 @@ std::optional<ForwardOutput> run_llm_no_sync_impl(
   }
 #endif
   return output;
+}
+
+std::optional<ForwardOutput> run_llm_no_sync_impl(
+    LLMWorkerImpl& worker,
+    const ForwardInput& input,
+    Stream& prepare_stream,
+    Stream& compute_stream,
+    ForwardInput& processed_input) {
+  return run_llm_no_sync_impl(worker,
+                              input,
+                              prepare_stream,
+                              compute_stream,
+                              processed_input,
+                              /*forward_input_observer=*/nullptr);
 }
 
 torch::Tensor clone_host_tensor(const torch::Tensor& tensor) {
@@ -587,6 +614,575 @@ using adaptive_pruning::max_pruned_prefix_length;
 using adaptive_pruning::selected_probs_by_step;
 using adaptive_pruning::sync_pruned_boundary_outputs;
 using adaptive_pruning::truncate_draft_outputs;
+
+#if defined(USE_NPU)
+namespace {
+
+struct MtpForwardDebugTensor {
+  std::string name;
+  std::vector<int64_t> shape;
+  uintptr_t device_address = 0;
+  torch::Tensor host_values;
+  torch::Tensor retained_device_values;
+};
+
+struct MtpForwardDebugSnapshot {
+  uint64_t forward_id = 0;
+  uint64_t decode_step_id = 0;
+  int32_t rank = 0;
+  int32_t draft_idx = 0;
+  int32_t block_size = 0;
+  std::string launch_kind;
+  std::string batch_type;
+  int32_t num_sequences = 0;
+  uint64_t batch_id = 0;
+  std::vector<int32_t> embedding_ids;
+  std::vector<std::string> request_ids;
+  std::vector<uint64_t> batch_generations;
+  std::vector<int32_t> dp_global_token_nums;
+  std::vector<int32_t> raw_dp_global_token_nums;
+  std::vector<int64_t> embedding_shape;
+  uintptr_t embedding_address = 0;
+  std::vector<MtpForwardDebugTensor> tensors;
+  StreamEventPtr ready_event;
+};
+
+std::string format_debug_shape(const std::vector<int64_t>& shape) {
+  std::ostringstream stream;
+  stream << '[';
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) {
+      stream << ',';
+    }
+    stream << shape[i];
+  }
+  stream << ']';
+  return stream.str();
+}
+
+template <typename T>
+std::string format_debug_vector(const std::vector<T>& values) {
+  std::ostringstream stream;
+  stream << '[';
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      stream << ',';
+    }
+    stream << values[i];
+  }
+  stream << ']';
+  return stream.str();
+}
+
+std::vector<int64_t> debug_tensor_values(const MtpForwardDebugTensor& tensor) {
+  torch::Tensor values =
+      tensor.host_values.to(torch::kLong).flatten().contiguous();
+  const int64_t* data = values.const_data_ptr<int64_t>();
+  return std::vector<int64_t>(data, data + values.numel());
+}
+
+std::string format_debug_tensor(const MtpForwardDebugTensor& tensor) {
+  const std::vector<int64_t> values = debug_tensor_values(tensor);
+  constexpr size_t kHeadValueCount = 16;
+  constexpr size_t kTailValueCount = 8;
+  uint64_t hash = 1469598103934665603ULL;
+  for (int64_t value : values) {
+    hash ^= static_cast<uint64_t>(value);
+    hash *= 1099511628211ULL;
+  }
+
+  std::ostringstream stream;
+  stream << tensor.name << "={shape=" << format_debug_shape(tensor.shape)
+         << ",addr=0x" << std::hex << tensor.device_address << std::dec
+         << ",hash=0x" << std::hex << hash << std::dec << ",values=[";
+  const bool truncate = values.size() > kHeadValueCount + kTailValueCount;
+  const size_t head_count =
+      truncate ? kHeadValueCount : static_cast<size_t>(values.size());
+  for (size_t i = 0; i < head_count; ++i) {
+    if (i > 0) {
+      stream << ',';
+    }
+    stream << values[i];
+  }
+  if (truncate) {
+    stream << ",...";
+    for (size_t i = values.size() - kTailValueCount; i < values.size(); ++i) {
+      stream << ',' << values[i];
+    }
+  }
+  stream << "]}";
+  return stream.str();
+}
+
+const MtpForwardDebugTensor* find_debug_tensor(
+    const MtpForwardDebugSnapshot& snapshot,
+    const std::string& name) {
+  const auto it = std::find_if(snapshot.tensors.begin(),
+                               snapshot.tensors.end(),
+                               [&name](const MtpForwardDebugTensor& tensor) {
+                                 return tensor.name == name;
+                               });
+  return it == snapshot.tensors.end() ? nullptr : &*it;
+}
+
+std::string check_debug_paged_layout(const MtpForwardDebugSnapshot& snapshot,
+                                     const std::string& label,
+                                     const std::string& kv_name,
+                                     const std::string& block_name,
+                                     const std::string& indptr_name,
+                                     const std::string& indices_name,
+                                     const std::string& last_page_name) {
+  const MtpForwardDebugTensor* kv_tensor = find_debug_tensor(snapshot, kv_name);
+  const MtpForwardDebugTensor* block_tensor =
+      find_debug_tensor(snapshot, block_name);
+  const MtpForwardDebugTensor* indptr_tensor =
+      find_debug_tensor(snapshot, indptr_name);
+  const MtpForwardDebugTensor* indices_tensor =
+      find_debug_tensor(snapshot, indices_name);
+  const MtpForwardDebugTensor* last_page_tensor =
+      find_debug_tensor(snapshot, last_page_name);
+  if (kv_tensor == nullptr || block_tensor == nullptr ||
+      indptr_tensor == nullptr || indices_tensor == nullptr ||
+      last_page_tensor == nullptr || block_tensor->shape.size() != 2) {
+    return label + "=unavailable";
+  }
+
+  const std::vector<int64_t> kv_lens = debug_tensor_values(*kv_tensor);
+  const std::vector<int64_t> block_tables = debug_tensor_values(*block_tensor);
+  const std::vector<int64_t> indptr = debug_tensor_values(*indptr_tensor);
+  const std::vector<int64_t> indices = debug_tensor_values(*indices_tensor);
+  const std::vector<int64_t> last_page_lens =
+      debug_tensor_values(*last_page_tensor);
+  const int64_t block_width = block_tensor->shape[1];
+  std::vector<std::string> errors;
+  if (indptr.size() != kv_lens.size() + 1 ||
+      last_page_lens.size() != kv_lens.size() ||
+      block_tensor->shape[0] != static_cast<int64_t>(kv_lens.size())) {
+    errors.emplace_back("shape");
+  } else {
+    for (size_t row = 0; row < kv_lens.size(); ++row) {
+      const int64_t kv_len = kv_lens[row];
+      const int64_t expected_pages =
+          (kv_len + snapshot.block_size - 1) / snapshot.block_size;
+      const int64_t begin = indptr[row];
+      const int64_t end = indptr[row + 1];
+      const int64_t expected_last_page_len =
+          kv_len == 0 ? 0 : (kv_len - 1) % snapshot.block_size + 1;
+      bool row_valid = end - begin == expected_pages && begin >= 0 &&
+                       end <= static_cast<int64_t>(indices.size()) &&
+                       last_page_lens[row] == expected_last_page_len;
+      if (row_valid && expected_pages > 0) {
+        const int64_t block_offset =
+            static_cast<int64_t>(row) * block_width + expected_pages - 1;
+        row_valid = expected_pages <= block_width &&
+                    block_offset < static_cast<int64_t>(block_tables.size()) &&
+                    indices[end - 1] == block_tables[block_offset];
+      }
+      if (!row_valid) {
+        errors.emplace_back(std::to_string(row));
+      }
+    }
+  }
+
+  return label +
+         (errors.empty() ? "=ok" : "=bad_rows" + format_debug_vector(errors));
+}
+
+MtpForwardDebugTensor copy_debug_tensor(const std::string& name,
+                                        const torch::Tensor& tensor) {
+  MtpForwardDebugTensor snapshot;
+  snapshot.name = name;
+  snapshot.shape = tensor.sizes().vec();
+  snapshot.device_address =
+      tensor.numel() > 0 ? reinterpret_cast<uintptr_t>(tensor.data_ptr()) : 0;
+  torch::Tensor source = tensor.flatten().contiguous();
+  snapshot.retained_device_values = source;
+  snapshot.host_values = torch::empty({source.numel()},
+                                      torch::TensorOptions()
+                                          .dtype(source.scalar_type())
+                                          .device(torch::kCPU)
+                                          .pinned_memory(true));
+  snapshot.host_values.copy_(source, /*non_blocking=*/true);
+  return snapshot;
+}
+
+void append_debug_tensor(std::vector<MtpForwardDebugTensor>& tensors,
+                         const std::string& name,
+                         const torch::Tensor& tensor) {
+  if (tensor.defined()) {
+    tensors.emplace_back(copy_debug_tensor(name, tensor));
+  }
+}
+
+}  // namespace
+
+class MTPWorkerImpl::MtpForwardInputDebugLogger final {
+ public:
+  MtpForwardInputDebugLogger(int32_t block_size, int32_t device_index)
+      : block_size_(block_size),
+        device_index_(device_index),
+        worker_([this]() { run(); }) {}
+
+  ~MtpForwardInputDebugLogger() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    condition_.notify_one();
+    worker_.join();
+  }
+
+  void capture(const ForwardInput& input,
+               Stream& compute_stream,
+               uint64_t decode_step_id,
+               int32_t draft_idx,
+               int32_t rank,
+               const char* launch_kind) {
+    c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+    CHECK(compute_stream.wait_event(input.metadata_ready_event))
+        << "failed to wait final MTP input metadata for debug snapshot";
+
+    MtpForwardDebugSnapshot snapshot;
+    snapshot.forward_id = next_forward_id_++;
+    snapshot.decode_step_id = decode_step_id;
+    snapshot.rank = rank;
+    snapshot.draft_idx = draft_idx;
+    snapshot.block_size = block_size_;
+    snapshot.launch_kind = launch_kind;
+    snapshot.batch_type =
+        input.input_params.meta.batch_forward_type.to_string();
+    snapshot.num_sequences = input.input_params.meta.num_sequences;
+    snapshot.batch_id = input.input_params.meta.batch_id;
+    snapshot.embedding_ids = input.input_params.embedding.embedding_ids;
+    snapshot.request_ids = input.input_params.embedding.request_ids;
+    snapshot.batch_generations =
+        input.input_params.parallel.dp_global_batch_generations;
+    snapshot.dp_global_token_nums =
+        input.input_params.parallel.dp_global_token_nums;
+    snapshot.raw_dp_global_token_nums =
+        input.input_params.parallel.raw_dp_global_token_nums;
+
+    const torch::Tensor& embedding =
+        input.input_params.embedding.input_embedding;
+    if (embedding.defined()) {
+      snapshot.embedding_shape = embedding.sizes().vec();
+      snapshot.embedding_address =
+          embedding.numel() > 0
+              ? reinterpret_cast<uintptr_t>(embedding.data_ptr())
+              : 0;
+      torch::Tensor embedding_rows =
+          embedding.reshape({embedding.size(0), -1}).to(torch::kFloat);
+      torch::Tensor embedding_fingerprint =
+          torch::stack({embedding_rows.sum(/*dim=*/1),
+                        embedding_rows.abs().sum(/*dim=*/1),
+                        embedding_rows.square().sum(/*dim=*/1)},
+                       /*dim=*/1)
+              .mul(1000)
+              .round()
+              .to(torch::kLong);
+      append_debug_tensor(snapshot.tensors,
+                          "embedding_fingerprint_sum_abs_l2_x1000",
+                          embedding_fingerprint);
+    }
+
+    const AttentionDeviceInput& attention = input.input_params.attention.device;
+    const GraphInput& graph = input.input_params.graph;
+    append_debug_tensor(snapshot.tensors, "token_ids", input.token_ids);
+    append_debug_tensor(snapshot.tensors, "positions", input.positions);
+    append_debug_tensor(snapshot.tensors,
+                        "linear_state_indices",
+                        input.input_params.embedding.linear_state_indices);
+    append_debug_tensor(snapshot.tensors, "q_seq_lens", attention.q_seq_lens);
+    append_debug_tensor(snapshot.tensors, "kv_seq_lens", attention.kv_seq_lens);
+    append_debug_tensor(
+        snapshot.tensors, "new_cache_slots", attention.new_cache_slots);
+    append_debug_tensor(
+        snapshot.tensors, "block_tables", attention.block_tables);
+    append_debug_tensor(
+        snapshot.tensors, "paged_kv_indptr", attention.paged_kv_indptr);
+    append_debug_tensor(
+        snapshot.tensors, "paged_kv_indices", attention.paged_kv_indices);
+    append_debug_tensor(snapshot.tensors,
+                        "paged_kv_last_page_len",
+                        attention.paged_kv_last_page_len);
+    append_debug_tensor(
+        snapshot.tensors, "expanded_kv_seq_lens", graph.expanded_kv_seq_lens);
+    append_debug_tensor(
+        snapshot.tensors, "expanded_block_tables", graph.expanded_block_tables);
+    append_debug_tensor(snapshot.tensors,
+                        "expanded_paged_kv_indptr",
+                        graph.expanded_paged_kv_indptr);
+    append_debug_tensor(snapshot.tensors,
+                        "expanded_paged_kv_indices",
+                        graph.expanded_paged_kv_indices);
+    append_debug_tensor(snapshot.tensors,
+                        "expanded_paged_kv_last_page_len",
+                        graph.expanded_paged_kv_last_page_len);
+    enqueue(std::move(snapshot), compute_stream);
+  }
+
+  void capture_validation_state(const ForwardInput& validate_input,
+                                const std::vector<ForwardOutput>& draft_outputs,
+                                const ForwardOutput& target_output,
+                                const SampleOutput& validate_output,
+                                const torch::Tensor& base_positions,
+                                const torch::Tensor& base_kv_seq_lens,
+                                Stream& compute_stream,
+                                uint64_t decode_step_id,
+                                int32_t rank) {
+    c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+
+    MtpForwardDebugSnapshot snapshot;
+    snapshot.forward_id = next_forward_id_++;
+    snapshot.decode_step_id = decode_step_id;
+    snapshot.rank = rank;
+    snapshot.draft_idx = -1;
+    snapshot.block_size = block_size_;
+    snapshot.launch_kind = "validation_state";
+    snapshot.batch_type =
+        validate_input.input_params.meta.batch_forward_type.to_string();
+    snapshot.num_sequences = validate_input.input_params.meta.num_sequences;
+    snapshot.batch_id = validate_input.input_params.meta.batch_id;
+    snapshot.embedding_ids =
+        validate_input.input_params.embedding.embedding_ids;
+    snapshot.request_ids = validate_input.input_params.embedding.request_ids;
+    snapshot.batch_generations =
+        validate_input.input_params.parallel.dp_global_batch_generations;
+    snapshot.dp_global_token_nums =
+        validate_input.input_params.parallel.dp_global_token_nums;
+    snapshot.raw_dp_global_token_nums =
+        validate_input.input_params.parallel.raw_dp_global_token_nums;
+
+    const torch::Tensor accepted_lengths =
+        validate_output.next_tokens.ge(0).sum(/*dim=*/1);
+    append_debug_tensor(
+        snapshot.tensors, "accepted_tokens", validate_output.next_tokens);
+    append_debug_tensor(snapshot.tensors, "accepted_lengths", accepted_lengths);
+    append_debug_tensor(
+        snapshot.tensors, "target_base_positions", base_positions);
+    append_debug_tensor(
+        snapshot.tensors, "target_base_kv_seq_lens", base_kv_seq_lens);
+    append_debug_tensor(snapshot.tensors,
+                        "next_draft_base_positions",
+                        base_positions + accepted_lengths);
+    append_debug_tensor(snapshot.tensors,
+                        "next_draft_base_kv_seq_lens",
+                        base_kv_seq_lens + accepted_lengths);
+    append_debug_tensor(snapshot.tensors,
+                        "target_next_tokens",
+                        target_output.sample_output.next_tokens);
+    for (size_t draft_idx = 0; draft_idx < draft_outputs.size(); ++draft_idx) {
+      append_debug_tensor(snapshot.tensors,
+                          "draft_" + std::to_string(draft_idx) + "_next_tokens",
+                          draft_outputs[draft_idx].sample_output.next_tokens);
+    }
+
+    const torch::Tensor& embeddings = validate_output.embeddings;
+    if (embeddings.defined()) {
+      torch::Tensor embedding_rows =
+          embeddings.reshape({-1, embeddings.size(-1)}).to(torch::kFloat);
+      torch::Tensor embedding_fingerprint =
+          torch::stack({embedding_rows.sum(/*dim=*/1),
+                        embedding_rows.abs().sum(/*dim=*/1),
+                        embedding_rows.square().sum(/*dim=*/1)},
+                       /*dim=*/1)
+              .mul(1000)
+              .round()
+              .to(torch::kLong);
+      append_debug_tensor(snapshot.tensors,
+                          "target_embedding_fingerprint_sum_abs_l2_x1000",
+                          embedding_fingerprint);
+    }
+    enqueue(std::move(snapshot), compute_stream);
+  }
+
+ private:
+  void enqueue(MtpForwardDebugSnapshot snapshot, Stream& compute_stream) {
+    snapshot.ready_event = compute_stream.record_event();
+    CHECK(snapshot.ready_event != nullptr)
+        << "failed to record async MTP forward debug snapshot event";
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshots_.emplace_back(std::move(snapshot));
+    }
+    condition_.notify_one();
+  }
+  void run() {
+    const aclError set_device_ret = aclrtSetDevice(device_index_);
+    if (set_device_ret != ACL_SUCCESS) {
+      LOG(ERROR) << "[DP_MTP_FORWARD_INPUT_DEBUG] failed to set logger device="
+                 << device_index_ << ", ret=" << set_device_ret;
+      return;
+    }
+    while (true) {
+      MtpForwardDebugSnapshot snapshot;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock,
+                        [this]() { return stopping_ || !snapshots_.empty(); });
+        if (stopping_ && snapshots_.empty()) {
+          return;
+        }
+        snapshot = std::move(snapshots_.front());
+        snapshots_.pop_front();
+      }
+
+      if (!snapshot.ready_event->synchronize()) {
+        LOG(ERROR) << "[DP_MTP_FORWARD_INPUT_DEBUG] snapshot_failed forward_id="
+                   << snapshot.forward_id << ", rank=" << snapshot.rank;
+        continue;
+      }
+      log(snapshot);
+    }
+  }
+
+  void log(const MtpForwardDebugSnapshot& snapshot) const {
+    LOG(INFO)
+        << "[DP_MTP_FORWARD_INPUT_DEBUG] context forward_id="
+        << snapshot.forward_id << ", decode_step=" << snapshot.decode_step_id
+        << ", rank=" << snapshot.rank << ", draft_idx=" << snapshot.draft_idx
+        << ", launch=" << snapshot.launch_kind
+        << ", batch_type=" << snapshot.batch_type
+        << ", num_sequences=" << snapshot.num_sequences
+        << ", batch_id=" << snapshot.batch_id
+        << ", embedding_ids=" << format_debug_vector(snapshot.embedding_ids)
+        << ", request_ids=" << format_debug_vector(snapshot.request_ids)
+        << ", batch_generations="
+        << format_debug_vector(snapshot.batch_generations)
+        << ", dp_tokens=" << format_debug_vector(snapshot.dp_global_token_nums)
+        << ", raw_dp_tokens="
+        << format_debug_vector(snapshot.raw_dp_global_token_nums)
+        << ", embedding_shape=" << format_debug_shape(snapshot.embedding_shape)
+        << ", embedding_addr=0x" << std::hex << snapshot.embedding_address
+        << std::dec;
+
+    std::ostringstream tensors;
+    for (size_t i = 0; i < snapshot.tensors.size(); ++i) {
+      if (i > 0) {
+        tensors << ", ";
+      }
+      tensors << format_debug_tensor(snapshot.tensors[i]);
+    }
+    LOG(INFO) << "[DP_MTP_FORWARD_INPUT_DEBUG] tensors forward_id="
+              << snapshot.forward_id << ", " << tensors.str();
+    LOG(INFO) << "[DP_MTP_FORWARD_INPUT_DEBUG] checks forward_id="
+              << snapshot.forward_id << ", "
+              << check_debug_paged_layout(snapshot,
+                                          "attention",
+                                          "kv_seq_lens",
+                                          "block_tables",
+                                          "paged_kv_indptr",
+                                          "paged_kv_indices",
+                                          "paged_kv_last_page_len")
+              << ", "
+              << check_debug_paged_layout(snapshot,
+                                          "expanded",
+                                          "expanded_kv_seq_lens",
+                                          "expanded_block_tables",
+                                          "expanded_paged_kv_indptr",
+                                          "expanded_paged_kv_indices",
+                                          "expanded_paged_kv_last_page_len");
+  }
+
+  const int32_t block_size_;
+  const int32_t device_index_;
+  uint64_t next_forward_id_ = 1;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<MtpForwardDebugSnapshot> snapshots_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
+#endif
+
+MTPWorkerImpl::~MTPWorkerImpl() = default;
+
+std::optional<ForwardOutput> MTPWorkerImpl::run_draft_no_sync_with_debug(
+    const ForwardInput& input,
+    Stream& prepare_stream,
+    Stream& compute_stream,
+    ForwardInput& processed_input,
+    uint64_t decode_step_id,
+    int32_t draft_idx,
+    const char* launch_kind) {
+#if defined(USE_NPU)
+  const bool capture_draft_inputs =
+      ::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      combined_draft_execution_path_ ==
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+  if (capture_draft_inputs) {
+    ForwardInputObserver observer =
+        [this, decode_step_id, draft_idx, launch_kind](
+            const ForwardInput& final_input, Stream& final_compute_stream) {
+          capture_mtp_forward_input_debug_snapshot(final_input,
+                                                   final_compute_stream,
+                                                   decode_step_id,
+                                                   draft_idx,
+                                                   launch_kind);
+        };
+    return run_llm_no_sync_impl(*draft_impl_,
+                                input,
+                                prepare_stream,
+                                compute_stream,
+                                processed_input,
+                                &observer);
+  }
+#else
+  (void)decode_step_id;
+  (void)draft_idx;
+  (void)launch_kind;
+#endif
+  return run_llm_no_sync_impl(
+      *draft_impl_, input, prepare_stream, compute_stream, processed_input);
+}
+
+#if defined(USE_NPU)
+void MTPWorkerImpl::capture_mtp_forward_input_debug_snapshot(
+    const ForwardInput& processed_input,
+    Stream& compute_stream,
+    uint64_t decode_step_id,
+    int32_t draft_idx,
+    const char* launch_kind) {
+  if (mtp_forward_input_debug_logger_ == nullptr) {
+    mtp_forward_input_debug_logger_ =
+        std::make_unique<MtpForwardInputDebugLogger>(options_.block_size(),
+                                                     device_.index());
+  }
+  mtp_forward_input_debug_logger_->capture(processed_input,
+                                           compute_stream,
+                                           decode_step_id,
+                                           draft_idx,
+                                           parallel_args_.rank(),
+                                           launch_kind);
+}
+
+void MTPWorkerImpl::capture_mtp_validation_state_debug_snapshot(
+    const ForwardInput& input,
+    const std::vector<ForwardOutput>& draft_outputs,
+    const ForwardOutput& target_output,
+    const SampleOutput& validate_output,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& base_kv_seq_lens,
+    Stream& compute_stream,
+    uint64_t decode_step_id) {
+  if (mtp_forward_input_debug_logger_ == nullptr) {
+    mtp_forward_input_debug_logger_ =
+        std::make_unique<MtpForwardInputDebugLogger>(options_.block_size(),
+                                                     device_.index());
+  }
+  mtp_forward_input_debug_logger_->capture_validation_state(
+      input,
+      draft_outputs,
+      target_output,
+      validate_output,
+      base_positions,
+      base_kv_seq_lens,
+      compute_stream,
+      decode_step_id,
+      parallel_args_.rank());
+}
+#endif
 
 MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
@@ -1241,6 +1837,11 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
 
 std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs()) {
+    ++mtp_forward_debug_step_id_;
+  }
+#endif
   ForwardInput input = raw_input;
   if (use_chunked_prefill_spec_verify_path()) {
     stabilize_decode_host_tensors(input);
@@ -1562,11 +2163,22 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           std::move(pending_draft_context_.prepared_input);
       pending_draft_context_ = PendingDraftContext();
     } else {
-      draft_output_opt = run_llm_no_sync_impl(*draft_impl_,
-                                              current_draft_input,
-                                              *compute_stream_,
-                                              *compute_stream_,
-                                              draft_prepared[draft_idx]);
+      const char* launch_kind =
+          draft_idx == 0
+              ? (use_device_target_context ? "device_context" : "host_cache")
+              : (use_continuous_dsa_drafts ? "continuous" : "host_prepared");
+      draft_output_opt =
+          run_draft_no_sync_with_debug(current_draft_input,
+                                       *compute_stream_,
+                                       *compute_stream_,
+                                       draft_prepared[draft_idx],
+#if defined(USE_NPU)
+                                       mtp_forward_debug_step_id_,
+#else
+                                       /*decode_step_id=*/0,
+#endif
+                                       draft_idx,
+                                       launch_kind);
     }
 
     if ((use_device_target_context || use_prelaunched_first_draft) &&
@@ -1958,11 +2570,31 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   ForwardInput target_prepared;
   fill_validate_input_from_draft_outputs(
       draft_outputs, validate_input, per_seq_val_tokens, *compute_stream_);
+  const ForwardInputObserver* target_input_observer = nullptr;
+#if defined(USE_NPU)
+  ForwardInputObserver target_input_observer_storage;
+  const bool capture_target_input =
+      ::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      combined_draft_execution_path_ ==
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+  if (capture_target_input) {
+    target_input_observer_storage = [this](const ForwardInput& final_input,
+                                           Stream& final_compute_stream) {
+      capture_mtp_forward_input_debug_snapshot(final_input,
+                                               final_compute_stream,
+                                               mtp_forward_debug_step_id_,
+                                               /*draft_idx=*/-1,
+                                               "target_validate");
+    };
+    target_input_observer = &target_input_observer_storage;
+  }
+#endif
   ForwardOutput target_output = run_llm_no_sync_impl(*impl_,
                                                      validate_input,
                                                      *compute_stream_,
                                                      *compute_stream_,
-                                                     target_prepared)
+                                                     target_prepared,
+                                                     target_input_observer)
                                     .value();
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
@@ -2191,6 +2823,19 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
         batch_size,
         num_val_tokens,
         use_chunked_prefill_spec_verify_path());
+
+#if defined(USE_NPU)
+    if (capture_target_input) {
+      capture_mtp_validation_state_debug_snapshot(input,
+                                                  draft_outputs,
+                                                  target_output,
+                                                  val_output,
+                                                  base_positions,
+                                                  base_kv_seq_lens,
+                                                  *compute_stream_,
+                                                  mtp_forward_debug_step_id_);
+    }
+#endif
 
     accepted_tokens_host.copy_(val_output.next_tokens,
                                /*non_blocking=*/true);
@@ -2526,11 +3171,17 @@ void MTPWorkerImpl::submit_pending_first_draft(
   pending_draft_context_.dp_global_batch_generations =
       batch_identity_input.input_params.parallel.dp_global_batch_generations;
   pending_draft_context_.output =
-      run_llm_no_sync_impl(*draft_impl_,
-                           draft_input,
-                           *compute_stream_,
-                           *compute_stream_,
-                           pending_draft_context_.prepared_input);
+      run_draft_no_sync_with_debug(draft_input,
+                                   *compute_stream_,
+                                   *compute_stream_,
+                                   pending_draft_context_.prepared_input,
+#if defined(USE_NPU)
+                                   mtp_forward_debug_step_id_ + 1,
+#else
+                                   /*decode_step_id=*/0,
+#endif
+                                   /*draft_idx=*/0,
+                                   "prelaunch");
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
 }

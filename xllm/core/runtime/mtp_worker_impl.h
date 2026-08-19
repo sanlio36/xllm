@@ -44,7 +44,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 const torch::Device& device,
                 const runtime::Options& options);
 
-  ~MTPWorkerImpl() override = default;
+  ~MTPWorkerImpl() override;
 
  protected:
   // For derived classes (e.g. Eagle3WorkerImpl) that need custom options for
@@ -180,6 +180,14 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void prepare_draft_inputs(const ForwardInput& inputs,
                             ForwardInput& draft_inputs,
                             int32_t position_offset);
+  std::optional<ForwardOutput> run_draft_no_sync_with_debug(
+      const ForwardInput& input,
+      Stream& prepare_stream,
+      Stream& compute_stream,
+      ForwardInput& processed_input,
+      uint64_t decode_step_id,
+      int32_t draft_idx,
+      const char* launch_kind);
   void update_decode_step_input(
       ForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;
@@ -297,6 +305,27 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       mtp_async::CombinedDraftExecutionPath::UNSUPPORTED;
 
 #if defined(USE_NPU)
+  class MtpForwardInputDebugLogger;
+
+  void capture_mtp_forward_input_debug_snapshot(
+      const ForwardInput& processed_input,
+      Stream& compute_stream,
+      uint64_t decode_step_id,
+      int32_t draft_idx,
+      const char* launch_kind);
+  void capture_mtp_validation_state_debug_snapshot(
+      const ForwardInput& input,
+      const std::vector<ForwardOutput>& draft_outputs,
+      const ForwardOutput& target_output,
+      const SampleOutput& validate_output,
+      const torch::Tensor& base_positions,
+      const torch::Tensor& base_kv_seq_lens,
+      Stream& compute_stream,
+      uint64_t decode_step_id);
+
+  std::unique_ptr<MtpForwardInputDebugLogger> mtp_forward_input_debug_logger_;
+  uint64_t mtp_forward_debug_step_id_ = 0;
+
   // Stable-address sources consumed by the target ACL graph's leading input
   // update. The existing H2D preparation overlaps with the final draft, so no
   // extra graph-external D2D launch is introduced.
