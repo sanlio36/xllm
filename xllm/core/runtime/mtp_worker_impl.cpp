@@ -1255,6 +1255,27 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   const bool use_device_target_context =
       can_use_combined_first_draft() && matching_device_target_context &&
       device_target_context_ready_for_batch(input);
+#if defined(USE_NPU)
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (debug_log_dp_mtp_overlap) {
+    const bool select_metadata_rebuild =
+        !use_prelaunched_first_draft && use_device_target_context;
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] decode_decision rank="
+              << parallel_args_.rank()
+              << ", prelaunch_candidate=" << use_prelaunched_first_draft
+              << ", device_context_candidate=" << use_device_target_context
+              << ", selected_prelaunch=" << use_prelaunched_first_draft
+              << ", selected_rebuild=" << select_metadata_rebuild
+              << ", matching_target_context=" << matching_device_target_context
+              << ", pending_prelaunch="
+              << pending_draft_context_.output.has_value()
+              << ", pending_target="
+              << pending_target_context_.accepted_tokens.defined()
+              << ", batch_generations="
+              << input.input_params.parallel.dp_global_batch_generations;
+  }
+#endif
   // Keep the device-side accepted state alive across a first-transition Host
   // cache flush. The prelaunched draft can be valid before the batch is marked
   // device-context ready, while flush_pending_target_context() clears the
@@ -1270,6 +1291,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       pending_target_context_.ready_event;
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO)
+          << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] stale_prelaunch_drain rank="
+          << parallel_args_.rank() << ", batch_generations="
+          << input.input_params.parallel.dp_global_batch_generations;
+    }
+#endif
     // A batch transition invalidates the speculative prelaunch.  Drain it
     // before releasing its graph/input buffers; this slow path is outside
     // steady decode and preserves cache/buffer lifetime correctness.
@@ -1356,6 +1385,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     // update; continuous DSA drafts use device correction, while target
     // verification still consumes the exact Host metadata.
   } else if (use_device_target_context) {
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO)
+          << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] metadata_rebuild_begin rank="
+          << parallel_args_.rank() << ", batch_generations="
+          << input.input_params.parallel.dp_global_batch_generations;
+    }
+#endif
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
 
     // Clone host tensors before mutating the shallow-copied template.
@@ -1414,7 +1451,20 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         /*use_chunked_prefill=*/false,
         /*rebuild_expanded_decode_metadata=*/true,
         options_.block_size());
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] metadata_rebuild_end rank="
+                << parallel_args_.rank();
+    }
+#endif
   } else {
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] host_cache_fallback rank="
+                << parallel_args_.rank() << ", batch_generations="
+                << input.input_params.parallel.dp_global_batch_generations;
+    }
+#endif
     // First decode after prefill and batch transitions use the host cache.
     std::vector<EmbeddingCache::DecodeState> last_states =
         embedding_cache_->read_decode_states(
@@ -1501,6 +1551,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     }
     std::optional<ForwardOutput> draft_output_opt;
     if (use_prelaunched_first_draft && draft_idx == 0) {
+#if defined(USE_NPU)
+      if (debug_log_dp_mtp_overlap) {
+        LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] prelaunch_consume rank="
+                  << parallel_args_.rank() << ", draft_idx=" << draft_idx;
+      }
+#endif
       draft_output_opt = std::move(pending_draft_context_.output);
       draft_prepared[draft_idx] =
           std::move(pending_draft_context_.prepared_input);
@@ -2035,6 +2091,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
 
   const bool prelaunch_next_first_draft =
       pruned_prefix_lengths == nullptr && can_prelaunch_next_first_draft(input);
+#if defined(USE_NPU)
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (debug_log_dp_mtp_overlap) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] prelaunch_decision rank="
+              << parallel_args_.rank()
+              << ", enabled=" << prelaunch_next_first_draft
+              << ", pruned=" << (pruned_prefix_lengths != nullptr)
+              << ", batch_generations="
+              << input.input_params.parallel.dp_global_batch_generations;
+  }
+#endif
   ForwardInput next_first_draft_input;
   if (prelaunch_next_first_draft) {
     // This input is independent of the accepted token.  Prepare it on the
@@ -2149,6 +2217,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                              base_positions,
                              base_kv_seq_lens,
                              std::move(next_first_draft_input));
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] prelaunch_submit rank="
+                << parallel_args_.rank() << ", batch_generations="
+                << input.input_params.parallel.dp_global_batch_generations;
+    }
+#endif
   }
   target_output.ready_event = target_context_ready_event;
 

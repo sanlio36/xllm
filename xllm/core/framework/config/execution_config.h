@@ -48,6 +48,7 @@ class ExecutionConfig final {
          "enable_graph_vmm_pool",
          "max_tokens_for_graph_mode",
          "acl_graph_decode_batch_size_limit",
+         "debug_log_dp_mtp_overlap",
          "debug_sync_dp_mtp_overlap",
          "enable_shm",
          "use_contiguous_input_buffer",
@@ -73,6 +74,8 @@ class ExecutionConfig final {
   PROPERTY(int32_t, acl_graph_decode_batch_size_limit) = 16;
 
   PROPERTY(bool, debug_sync_dp_mtp_overlap) = false;
+
+  PROPERTY(bool, debug_log_dp_mtp_overlap) = false;
 
   PROPERTY(bool, enable_shm) = false;
 
