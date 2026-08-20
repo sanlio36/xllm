@@ -71,6 +71,13 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
 )
+
+try:
+    import xllm_runtime  # noqa: F401  # pybind-embedded module for fused kernels
+    _has_mhc_fused = hasattr(xllm_runtime, "hc_pre")
+except ImportError:
+    xllm_runtime = None  # type: ignore[assignment]
+    _has_mhc_fused = False
 from xllm.python.models.base import PyModelBase
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinear
@@ -1623,29 +1630,50 @@ class Glm5NextHyperConnection(nn.Module):
         self.input_norm = _UnweightedRMSNorm(cfg.rms_norm_eps)
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(
-            torch.empty(mix, self.hc_mult * cfg.hidden_size, dtype=dtype, device=device)
+            torch.empty(mix, self.hc_mult * cfg.hidden_size, dtype=torch.float32, device=device)
         )
-        self.base = nn.Parameter(torch.empty(mix, dtype=dtype, device=device))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32, device=device))
         # 3 outputs: pre (collapse), post (placement), comb (mixer) scales.
-        self.scale = nn.Parameter(torch.empty(3, dtype=dtype, device=device))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
 
     def forward(self, hidden_streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hc = self.hc_mult
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
-        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
 
-        pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
-        post = 2 * torch.sigmoid(post_w * post_scale + post_b)
-        comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        if _has_mhc_fused:
+            # --- Fused NPU kernel path (matches DeepSeek V4 C++ decoder layer) ---
+            # hc_pre does rsqrt + linear + sinkhorn + weighted-sum-reduce in one
+            # fused call.  x: [B, S, hc_mult, D] -> (output [B,S,D], post [B,S,hc_mult],
+            # comb [B,S,hc_mult,hc_mult]).
+            # .float() guards against weight-loading casting params back to bf16;
+            # __init__ creates them in float32 (aligned with vLLM).
+            collapsed, post, comb = xllm_runtime.hc_pre(
+                hidden_streams,
+                self.fn,
+                self.scale.float(),
+                self.base.float(),
+                hc,
+                self.hc_sinkhorn_iters,
+                self.input_norm.variance_epsilon,
+                self.hc_eps,
+            )
+            return post, comb, collapsed
+        else:
+            # --- Fallback: pure-Python reference implementation ---
+            flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+            pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+            pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+            pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+
+            pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
+            post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+            comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+            comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-        return post, comb, collapsed
+            for _ in range(self.hc_sinkhorn_iters - 1):
+                comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+                comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            return post, comb, collapsed
 
 
 class Glm5NextHyperHead(nn.Module):
@@ -1682,6 +1710,57 @@ class Glm5NextDecoderLayer(nn.Module):
                 prev_topk_indices: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # hidden_states: [B, S, hc_mult, D] (4 residual streams).
+        if _has_mhc_fused:
+            return self._forward_fused(hidden_states, position_ids,
+                                       attention_mask, prev_topk_indices)
+        else:
+            return self._forward_ref(hidden_states, position_ids,
+                                     attention_mask, prev_topk_indices)
+
+    def _forward_fused(self, hidden_states: torch.Tensor,
+                       position_ids: torch.Tensor,
+                       attention_mask: torch.Tensor,
+                       prev_topk_indices: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # --- Fused NPU kernel path (matches DeepSeek V4 C++ decoder layer) ---
+
+        # Attention mHC pre-collapse
+        residual = hidden_states
+        post, comb, hidden_states = self.attn_hc(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(hidden_states, position_ids, attention_mask,
+                                  prev_topk_indices)
+        if isinstance(attn_out, tuple):
+            hidden_states, topk = attn_out
+        else:
+            hidden_states, topk = attn_out, None
+        # MLA attention returns [B*S, D] (2D); reshape to [B, S, D] for hc_post.
+        # KDA attention already returns [B, S, D] so the dim check is a no-op.
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.view(
+                residual.shape[0], residual.shape[1], -1)
+        # Fused post-attention mHC recombination: hc_post returns [B,S,hc_mult,D]
+        hidden_states = xllm_runtime.hc_post(
+            hidden_states, residual, post, comb,
+        )
+
+        # FFN mHC pre-collapse
+        residual = hidden_states
+        post, comb, hidden_states = self.ffn_hc(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        # MLP / MoE preserves shape, so hidden_states is already [B, S, D] (3D).
+        hidden_states = xllm_runtime.hc_post(
+            hidden_states, residual, post, comb,
+        )
+        return hidden_states, topk
+
+    def _forward_ref(self, hidden_states: torch.Tensor,
+                     position_ids: torch.Tensor,
+                     attention_mask: torch.Tensor,
+                     prev_topk_indices: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # --- Fallback: pure-Python reference implementation ---
         residual = hidden_states
         post, comb, hidden_states = self.attn_hc(hidden_states)   # collapsed -> [B,S,D]
         hidden_states = self.input_layernorm(hidden_states)
@@ -1691,6 +1770,10 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, topk = attn_out
         else:
             hidden_states, topk = attn_out, None
+        # MLA attention returns [B*S, D] (2D); reshape to [B, S, D].
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.view(
+                residual.shape[0], residual.shape[1], -1)
         dtype = hidden_states.dtype
         hidden_states = (
             post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2)
