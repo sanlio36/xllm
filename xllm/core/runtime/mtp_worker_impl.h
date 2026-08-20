@@ -247,6 +247,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void flush_pending_target_context();
   bool supports_combined_first_draft_execution() const;
   bool can_use_combined_first_draft() const;
+  bool prelaunch_positions_fit_block_table(const ForwardInput& input) const;
   bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
   void prepare_next_first_draft_template(const ForwardInput& input,
                                          ForwardInput& combined_input);
