@@ -50,6 +50,7 @@ class ExecutionConfig final {
          "acl_graph_decode_batch_size_limit",
          "debug_log_dp_mtp_overlap",
          "debug_log_mtp_forward_inputs",
+         "debug_log_mtp_forward_lifecycle",
          "debug_sync_dp_mtp_overlap",
          "enable_shm",
          "use_contiguous_input_buffer",
@@ -79,6 +80,8 @@ class ExecutionConfig final {
   PROPERTY(bool, debug_log_dp_mtp_overlap) = false;
 
   PROPERTY(bool, debug_log_mtp_forward_inputs) = false;
+
+  PROPERTY(bool, debug_log_mtp_forward_lifecycle) = false;
 
   PROPERTY(bool, enable_shm) = false;
 

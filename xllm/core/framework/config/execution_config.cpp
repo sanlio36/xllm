@@ -78,6 +78,12 @@ DEFINE_bool(debug_log_mtp_forward_inputs,
             "validation inputs without synchronizing the worker thread. For "
             "debugging only.");
 
+DEFINE_bool(debug_log_mtp_forward_lifecycle,
+            false,
+            "Record post-forward events for GLM MoE DSA MTP stages and wait "
+            "for them on a background thread. Does not retain forward "
+            "tensors or synchronize the worker thread. For debugging only.");
+
 DEFINE_bool(enable_shm,
             false,
             "Whether to enable shared memory for executing model.");
@@ -119,6 +125,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_sync_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_mtp_forward_inputs);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_mtp_forward_lifecycle);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(input_shm_size);
@@ -138,6 +145,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_sync_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_dp_mtp_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_mtp_forward_inputs);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_mtp_forward_lifecycle);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(input_shm_size);
@@ -169,6 +177,8 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, debug_log_dp_mtp_overlap);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, debug_log_mtp_forward_inputs);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, debug_log_mtp_forward_lifecycle);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_shm);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

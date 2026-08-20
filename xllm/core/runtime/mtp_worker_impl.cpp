@@ -1094,6 +1094,146 @@ class MTPWorkerImpl::MtpForwardInputDebugLogger final {
   bool stopping_ = false;
   std::thread worker_;
 };
+
+// Post-forward diagnostics deliberately retain only an ACL event and raw
+// addresses. Keeping tensor handles here would change allocator reuse and can
+// hide the lifetime race this logger is intended to expose.
+class MTPWorkerImpl::MtpForwardLifecycleDebugLogger final {
+ public:
+  struct Record {
+    uint64_t id = 0;
+    uint64_t decode_step_id = 0;
+    int32_t rank = 0;
+    int32_t draft_idx = -1;
+    std::string launch_kind;
+    std::vector<uint64_t> batch_generations;
+    int64_t token_count = 0;
+    uintptr_t token_ids = 0;
+    uintptr_t positions = 0;
+    uintptr_t embedding = 0;
+    uintptr_t kv_seq_lens = 0;
+    uintptr_t block_tables = 0;
+    uintptr_t logits = 0;
+    uintptr_t next_tokens = 0;
+    uintptr_t output_embeddings = 0;
+    size_t retained_inputs = 0;
+    StreamEventPtr event;
+  };
+
+  MtpForwardLifecycleDebugLogger(int32_t device_index)
+      : device_index_(device_index), worker_([this]() { run(); }) {}
+
+  ~MtpForwardLifecycleDebugLogger() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    condition_.notify_one();
+    worker_.join();
+  }
+
+  void capture(const ForwardInput& input,
+               const std::optional<ForwardOutput>& output,
+               Stream& compute_stream,
+               uint64_t decode_step_id,
+               int32_t draft_idx,
+               int32_t rank,
+               const char* launch_kind) {
+    Record record;
+    record.id = next_id_++;
+    record.decode_step_id = decode_step_id;
+    record.rank = rank;
+    record.draft_idx = draft_idx;
+    record.launch_kind = launch_kind;
+    record.batch_generations =
+        input.input_params.parallel.dp_global_batch_generations;
+    record.token_count =
+        input.token_ids.defined() ? input.token_ids.numel() : 0;
+    record.token_ids = address(input.token_ids);
+    record.positions = address(input.positions);
+    record.embedding = address(input.input_params.embedding.input_embedding);
+    record.kv_seq_lens =
+        address(input.input_params.attention.device.kv_seq_lens);
+    record.block_tables =
+        address(input.input_params.attention.device.block_tables);
+    if (output.has_value()) {
+      record.logits = address(output->logits);
+      record.next_tokens = address(output->sample_output.next_tokens);
+      record.output_embeddings = address(output->sample_output.embeddings);
+      record.retained_inputs = output->retained_inputs.size();
+    }
+    record.event = compute_stream.record_event();
+    CHECK(record.event != nullptr)
+        << "failed to record MTP forward lifecycle event";
+    LOG(INFO) << "[DP_MTP_FORWARD_LIFECYCLE] queued id=" << record.id
+              << ", decode_step=" << record.decode_step_id
+              << ", rank=" << record.rank << ", draft_idx=" << record.draft_idx
+              << ", launch=" << record.launch_kind
+              << ", token_count=" << record.token_count
+              << ", batch_generations="
+              << format_debug_vector(record.batch_generations)
+              << ", token_ids=0x" << std::hex << record.token_ids
+              << ", positions=0x" << record.positions << ", embedding=0x"
+              << record.embedding << ", kv_seq_lens=0x" << record.kv_seq_lens
+              << ", block_tables=0x" << record.block_tables << ", logits=0x"
+              << record.logits << ", next_tokens=0x" << record.next_tokens
+              << ", output_embeddings=0x" << record.output_embeddings
+              << std::dec << ", retained_inputs=" << record.retained_inputs;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      records_.emplace_back(std::move(record));
+    }
+    condition_.notify_one();
+  }
+
+ private:
+  static uintptr_t address(const torch::Tensor& tensor) {
+    return tensor.defined() && tensor.numel() > 0
+               ? reinterpret_cast<uintptr_t>(tensor.data_ptr())
+               : 0;
+  }
+
+  void run() {
+    const aclError ret = aclrtSetDevice(device_index_);
+    if (ret != ACL_SUCCESS) {
+      LOG(ERROR) << "[DP_MTP_FORWARD_LIFECYCLE] set device failed, device="
+                 << device_index_ << ", ret=" << ret;
+      return;
+    }
+    while (true) {
+      Record record;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock,
+                        [this]() { return stopping_ || !records_.empty(); });
+        if (stopping_ && records_.empty()) {
+          return;
+        }
+        record = std::move(records_.front());
+        records_.pop_front();
+      }
+      const bool completed = record.event->synchronize();
+      LOG(INFO) << "[DP_MTP_FORWARD_LIFECYCLE] "
+                << (completed ? "completed" : "failed") << " id=" << record.id
+                << ", decode_step=" << record.decode_step_id
+                << ", rank=" << record.rank
+                << ", draft_idx=" << record.draft_idx
+                << ", launch=" << record.launch_kind;
+      if (!completed) {
+        LOG(ERROR) << "[DP_MTP_FORWARD_LIFECYCLE] first failed post-forward "
+                      "event; subsequent HCCL errors are likely secondary";
+      }
+    }
+  }
+
+  const int32_t device_index_;
+  uint64_t next_id_ = 1;
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<Record> records_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
 #endif
 
 MTPWorkerImpl::~MTPWorkerImpl() = default;
@@ -1121,20 +1261,36 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_draft_no_sync_with_debug(
                                                    draft_idx,
                                                    launch_kind);
         };
-    return run_llm_no_sync_impl(*draft_impl_,
-                                input,
-                                prepare_stream,
-                                compute_stream,
-                                processed_input,
-                                &observer);
+    std::optional<ForwardOutput> output = run_llm_no_sync_impl(*draft_impl_,
+                                                               input,
+                                                               prepare_stream,
+                                                               compute_stream,
+                                                               processed_input,
+                                                               &observer);
+    record_mtp_forward_lifecycle(processed_input,
+                                 output,
+                                 compute_stream,
+                                 decode_step_id,
+                                 draft_idx,
+                                 launch_kind);
+    return output;
   }
 #else
   (void)decode_step_id;
   (void)draft_idx;
   (void)launch_kind;
 #endif
-  return run_llm_no_sync_impl(
+  std::optional<ForwardOutput> output = run_llm_no_sync_impl(
       *draft_impl_, input, prepare_stream, compute_stream, processed_input);
+#if defined(USE_NPU)
+  record_mtp_forward_lifecycle(processed_input,
+                               output,
+                               compute_stream,
+                               decode_step_id,
+                               draft_idx,
+                               launch_kind);
+#endif
+  return output;
 }
 
 #if defined(USE_NPU)
@@ -1181,6 +1337,32 @@ void MTPWorkerImpl::capture_mtp_validation_state_debug_snapshot(
       compute_stream,
       decode_step_id,
       parallel_args_.rank());
+}
+
+void MTPWorkerImpl::record_mtp_forward_lifecycle(
+    const ForwardInput& processed_input,
+    const std::optional<ForwardOutput>& output,
+    Stream& compute_stream,
+    uint64_t decode_step_id,
+    int32_t draft_idx,
+    const char* launch_kind) {
+  if (!::xllm::ExecutionConfig::get_instance()
+           .debug_log_mtp_forward_lifecycle() ||
+      combined_draft_execution_path_ !=
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION) {
+    return;
+  }
+  if (mtp_forward_lifecycle_debug_logger_ == nullptr) {
+    mtp_forward_lifecycle_debug_logger_ =
+        std::make_unique<MtpForwardLifecycleDebugLogger>(device_.index());
+  }
+  mtp_forward_lifecycle_debug_logger_->capture(processed_input,
+                                               output,
+                                               compute_stream,
+                                               decode_step_id,
+                                               draft_idx,
+                                               parallel_args_.rank(),
+                                               launch_kind);
 }
 #endif
 
@@ -2596,6 +2778,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                                      target_prepared,
                                                      target_input_observer)
                                     .value();
+#if defined(USE_NPU)
+  record_mtp_forward_lifecycle(target_prepared,
+                               target_output,
+                               *compute_stream_,
+                               mtp_forward_debug_step_id_,
+                               /*draft_idx=*/-1,
+                               "target_validate");
+#endif
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_latency_ms / 1000.0);

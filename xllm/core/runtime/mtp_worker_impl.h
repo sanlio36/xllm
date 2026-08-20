@@ -306,6 +306,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 
 #if defined(USE_NPU)
   class MtpForwardInputDebugLogger;
+  class MtpForwardLifecycleDebugLogger;
 
   void capture_mtp_forward_input_debug_snapshot(
       const ForwardInput& processed_input,
@@ -322,8 +323,16 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const torch::Tensor& base_kv_seq_lens,
       Stream& compute_stream,
       uint64_t decode_step_id);
+  void record_mtp_forward_lifecycle(const ForwardInput& processed_input,
+                                    const std::optional<ForwardOutput>& output,
+                                    Stream& compute_stream,
+                                    uint64_t decode_step_id,
+                                    int32_t draft_idx,
+                                    const char* launch_kind);
 
   std::unique_ptr<MtpForwardInputDebugLogger> mtp_forward_input_debug_logger_;
+  std::unique_ptr<MtpForwardLifecycleDebugLogger>
+      mtp_forward_lifecycle_debug_logger_;
   uint64_t mtp_forward_debug_step_id_ = 0;
 
   // Stable-address sources consumed by the target ACL graph's leading input
