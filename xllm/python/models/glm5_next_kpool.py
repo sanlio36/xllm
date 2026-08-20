@@ -31,7 +31,7 @@ def pooled_states(packed_states: torch.Tensor, key_valid: torch.Tensor,
     device = keys.device
     first_key = torch.where(
         key_valid.any(-1),
-        key_valid.long().argmax(-1),
+        key_valid.to(torch.int32).argmax(-1),
         torch.full((batch_size,), total_len, dtype=torch.long, device=device),
     )
     n_pools = (total_len + rate - 1) // rate
