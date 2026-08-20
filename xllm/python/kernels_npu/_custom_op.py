@@ -522,6 +522,35 @@ def _sparse_flash_attention_out_fake(
     return output
 
 
+def _hc_pre_fake(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del hc_fn, hc_scale, hc_base, hc_sinkhorn_iters, norm_eps, hc_eps
+    leading = x.shape[:-2]  # [B, S] for 4D, [tokens] for 3D
+    hidden_dim = x.shape[-1]
+    y = x.new_empty(leading + (hidden_dim,))
+    post = x.new_empty(leading + (hc_mult,), dtype=torch.float32)
+    comb = x.new_empty(leading + (hc_mult, hc_mult), dtype=torch.float32)
+    return y, post, comb
+
+
+def _hc_post_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    del x, post, comb
+    return torch.empty_like(residual)
+
+
 register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::fused_add_rms_norm", _fused_add_rms_norm_fake)
 register_fake("xllm_ops::silu_and_mul", _silu_and_mul_fake)
@@ -548,3 +577,5 @@ register_fake("xllm_ops::lightning_indexer_out", _lightning_indexer_out_fake)
 register_fake("xllm_ops::scatter_nd_update", _scatter_nd_update_fake)
 register_fake("xllm_ops::sparse_flash_attention", _sparse_flash_attention_fake)
 register_fake("xllm_ops::sparse_flash_attention_out", _sparse_flash_attention_out_fake)
+register_fake("xllm_ops::hc_pre", _hc_pre_fake)
+register_fake("xllm_ops::hc_post", _hc_post_fake)

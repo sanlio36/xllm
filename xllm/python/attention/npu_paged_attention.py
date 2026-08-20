@@ -911,6 +911,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                                 use_qk_l2norm_in_kernel=True,
                                 use_gate_in_kernel=False,
                                 use_beta_sigmoid_in_kernel=False,
+                                state_v_first=True,
                             )
                             ssm_cache[slot] = _st[0].to(ssm_cache.dtype)
                         if 0 <= _m <= prev_seg.shape[2]:
@@ -1000,6 +1001,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                         use_qk_l2norm_in_kernel=True,
                         use_gate_in_kernel=False,
                         use_beta_sigmoid_in_kernel=False,
+                        state_v_first=True,
                     )
                     for _bi, (_lid, _sl) in enumerate(_b_scatter):
                         self._kv_caches[_lid].ssm[_sl] = _bst[_bi].to(
@@ -1256,6 +1258,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                                 use_qk_l2norm_in_kernel=True,
                                 use_gate_in_kernel=False,
                                 use_beta_sigmoid_in_kernel=False,
+                                state_v_first=True,
                             )
                             ssm_state[adv_idx[_si]] = _st.to(ssm_state.dtype)
                     else:
@@ -1269,6 +1272,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                             use_qk_l2norm_in_kernel=True,
                             use_gate_in_kernel=False,
                             use_beta_sigmoid_in_kernel=False,
+                            state_v_first=True,
                         )
                         ssm_state[adv_idx] = adv_state.to(ssm_state.dtype)
                 outs = []
@@ -1369,6 +1373,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 # branch). Chain the current rows read-only from that state
                 # for their outputs; the tail write-back persists exactly
                 # the advanced state (never the drafted rows).
+                # state_v_first=True matches the V-first accumulation order of
+                # the KDA reference and the prefill/advance paths so every
+                # read here is layout-consistent with the advanced state.
+                # inplace_final_state stays False on purpose: the lazy-advance
+                # scheme owns ssm_state mutations (advance step writes, verify
+                # reads); an in-place write here would clobber the advanced
+                # state before the tail write-back persists it.
                 if _KDA_SEQWISE and num_seqs > 1 and num_seqs != batch_size:
                     # Seq-wise dispatch: one single-segment recurrent call per
                     # sequence, exactly matching the single-request verify call
@@ -1395,6 +1406,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                             use_qk_l2norm_in_kernel=True,
                             use_gate_in_kernel=False,
                             use_beta_sigmoid_in_kernel=False,
+                            state_v_first=True,
                         )
                         _ros.append(_ro[0] if isinstance(_ro, tuple) else _ro)
                     core_attn_out = torch.cat(_ros, dim=0)
@@ -1409,6 +1421,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                         use_qk_l2norm_in_kernel=True,
                         use_gate_in_kernel=False,
                         use_beta_sigmoid_in_kernel=False,
+                        state_v_first=True,
                     )
                     # fla_npu returns a tuple even with
                     # output_final_state=False.
@@ -1424,6 +1437,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     use_qk_l2norm_in_kernel=True,
                     use_gate_in_kernel=False,
                     use_beta_sigmoid_in_kernel=False,
+                    state_v_first=True,
                 )
             # recurrent_kda returns the packed TND [T, nh, hd] layout of its
             # inputs; restore the [B, S, nh, hd] grouping the model layer
@@ -1445,6 +1459,10 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 # that differs from a single-request prefill (state-fingerprint
                 # verified: L0 state matches, L1+ diverges on seq1/seq2), and
                 # that state drift propagates through every later verify step.
+                # state_v_first=True pins the [HV,V,K] state layout so the
+                # ssm state handed to decode matches the recurrent path
+                # (default False is [HV,K,V] — K/V-transposed; K=V=128 hides
+                # the shape mismatch while corrupting decode precision).
                 _pout, _pstates = [], []
                 for s in range(num_seqs):
                     t0, t1 = q_cu_list[s], q_cu_list[s + 1]
@@ -1462,6 +1480,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                             [0, int(t1 - t0)], dtype=torch.int32, device=device),
                         use_gate_in_kernel=False,
                         return_intermediate_states=False,
+                        state_v_first=True,
                     )
                     _pout.append(_r[0])
                     _pstates.append(_r[1])
@@ -1476,6 +1495,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     cu_seqlens=cu_seqlens,
                     use_gate_in_kernel=False,
                     return_intermediate_states=False,
+                    state_v_first=True,
                 )
                 core_attn_out = result[0].to(query.dtype)
                 final_state = result[1]

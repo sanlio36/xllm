@@ -71,7 +71,10 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     get_forward_context_or_none,
 )
+
+_has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.glm5_next_kpool import pooled_states as _kpool_pooled_states
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.layers.embedding import HiddenParallelEmbedding
@@ -958,37 +961,10 @@ class Glm5NextIndexer(nn.Module):
 
     def get_pooled_states(self, packed_states: torch.Tensor,
                           key_valid: torch.Tensor):
-        keys, gate_scores, _ = torch.split(
-            packed_states, [self.head_dim, self.head_dim, 1], dim=-1
+        pool_keys, pool_indices, pool_valid = _kpool_pooled_states(
+            packed_states, key_valid, self.index_kpool_compress_ape,
+            self.head_dim, self.index_kpool,
         )
-        batch_size, total_len = keys.shape[:2]
-        device = keys.device
-        rate = self.index_kpool
-        first_key = torch.where(
-            key_valid.any(-1),
-            key_valid.long().argmax(-1),
-            torch.full((batch_size,), total_len, dtype=torch.long, device=device),
-        )
-        n_pools = (total_len + rate - 1) // rate
-        pool_offsets = torch.arange(n_pools, device=device) * rate
-        slot_offsets = torch.arange(rate, device=device)
-        pool_indices = (
-            first_key[:, None, None]
-            + pool_offsets[None, :, None]
-            + slot_offsets[None, None, :]
-        )
-        slot_in_range = pool_indices < total_len
-        safe_indices = pool_indices.clamp(0, total_len - 1)
-        batch_idx = torch.arange(batch_size, device=device)[:, None, None]
-        grouped_keys = keys[batch_idx, safe_indices]
-        grouped_gate_scores = gate_scores[batch_idx, safe_indices]
-        slot_valid = key_valid[batch_idx, safe_indices] & slot_in_range
-        pool_valid = slot_valid.all(-1)
-        logits = grouped_gate_scores.float() + self.index_kpool_compress_ape.float()[None, None]
-        logits = logits.masked_fill(~slot_valid[..., None], float("-inf"))
-        weights = torch.nan_to_num(logits.softmax(2)).to(grouped_keys.dtype)
-        pool_keys = (weights * grouped_keys).sum(2)
-        pool_indices = pool_indices.masked_fill(~slot_valid, -1)
         if self.use_acl_graph and _in_acl_graph():
             # Graph branch (fixed shapes): keep ALL pools. The boolean
             # ``pool_keys[:, keep]`` filter below produces a data-dependent
@@ -1084,9 +1060,16 @@ class Glm5NextIndexer(nn.Module):
             # pool0 a candidate for tok0..kpool-2; the per-position causal filter
             # below then keeps only the slots the query can actually see.
             pool_start = pool_indices[..., 0].clamp(0, kv_len - 1)
-            batch_idx = torch.arange(batch_size, device=device)[:, None, None]
-            query_idx = torch.arange(seq_len, device=device)[None, :, None]
-            pool_visible = token_visible[batch_idx, query_idx, pool_start[:, None, :]]
+            # AICore-native gather replaces fancy indexing
+            # token_visible[batch_idx, query_idx, pool_start[:, None, :]] which
+            # falls back to aclnnIndex on AI_CPU. token_visible is
+            # [B, S_q, kv_len]; index dim=2 by pool_start [B, n_pools],
+            # broadcast over S_q -> [B, S_q, n_pools]. bool is cast uint8 for
+            # gather (no bool kernel) then restored.
+            pool_idx_expand = pool_start[:, None, :].expand(batch_size, seq_len, -1)
+            pool_visible = token_visible.to(torch.uint8).gather(
+                2, pool_idx_expand
+            ).to(torch.bool)
             candidate_valid = (pool_visible & pool_valid[:, None]).to(torch.bool)
             pool_scores = pool_scores.masked_fill(
                 ~candidate_valid, torch.finfo(pool_scores.dtype).min
@@ -1102,9 +1085,21 @@ class Glm5NextIndexer(nn.Module):
             )
         else:
             selected = pool_scores.topk(select_k, dim=-1).indices
-            batch_pool_idx = torch.arange(batch_size, device=device)[:, None, None]
             selected_valid = candidate_valid.gather(-1, selected)
-            selected_indices = pool_indices[batch_pool_idx, selected]
+            # AICore-native gather replaces fancy indexing
+            # pool_indices[batch_pool_idx, selected] which falls back to
+            # aclnnIndex on AI_CPU. pool_indices is [B, n_pools, rate]; index
+            # dim=1 by selected [B, S_q, select_k] -> [B, S_q, select_k, rate].
+            # Flatten (n_pools*rate) rows and gather, matching the
+            # get_pooled_states pattern.
+            rate = self.index_kpool
+            rate_off = torch.arange(rate, device=device)
+            sel_flat = (selected[..., None] * rate + rate_off).reshape(
+                batch_size, -1
+            )
+            selected_indices = pool_indices.reshape(batch_size, -1).gather(
+                1, sel_flat
+            ).reshape(batch_size, seq_len, select_k, rate)
             topk_indices = selected_indices.flatten(-2)
             topk_indices = topk_indices.masked_fill(
                 ~selected_valid[..., None].expand_as(selected_indices).flatten(-2),
@@ -1116,9 +1111,12 @@ class Glm5NextIndexer(nn.Module):
             # of a prefill). Drop any selected position the query cannot
             # causally see, so tok0 -> {0}, tok1 -> {0,1}, ... (matches ref).
             safe_pos = topk_indices.clamp(0, kv_len - 1)
-            b_idx = torch.arange(batch_size, device=device)[:, None, None]
-            q_idx = torch.arange(seq_len, device=device)[None, :, None]
-            pos_visible = token_visible[b_idx, q_idx, safe_pos]
+            # AICore-native gather replaces fancy indexing
+            # token_visible[b_idx, q_idx, safe_pos] which falls back to
+            # aclnnIndex on AI_CPU. token_visible is [B, S_q, kv_len]; index
+            # dim=2 by safe_pos [B, S_q, select_k*rate]. bool cast uint8 for
+            # gather then restored.
+            pos_visible = token_visible.to(torch.uint8).gather(2, safe_pos).to(torch.bool)
             topk_indices = topk_indices.masked_fill(~pos_visible, -1)
 
         output_width = self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
@@ -1655,29 +1653,50 @@ class Glm5NextHyperConnection(nn.Module):
         self.input_norm = _UnweightedRMSNorm(cfg.rms_norm_eps)
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(
-            torch.empty(mix, self.hc_mult * cfg.hidden_size, dtype=dtype, device=device)
+            torch.empty(mix, self.hc_mult * cfg.hidden_size, dtype=torch.float32, device=device)
         )
-        self.base = nn.Parameter(torch.empty(mix, dtype=dtype, device=device))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32, device=device))
         # 3 outputs: pre (collapse), post (placement), comb (mixer) scales.
-        self.scale = nn.Parameter(torch.empty(3, dtype=dtype, device=device))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
 
     def forward(self, hidden_streams: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hc = self.hc_mult
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
-        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
 
-        pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
-        post = 2 * torch.sigmoid(post_w * post_scale + post_b)
-        comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        if _has_mhc_fused:
+            # --- Fused NPU kernel path (matches DeepSeek V4 C++ decoder layer) ---
+            # hc_pre does rsqrt + linear + sinkhorn + weighted-sum-reduce in one
+            # fused call.  x: [B, S, hc_mult, D] -> (output [B,S,D], post [B,S,hc_mult],
+            # comb [B,S,hc_mult,hc_mult]).
+            # .float() guards against weight-loading casting params back to bf16;
+            # __init__ creates them in float32 (aligned with vLLM).
+            collapsed, post, comb = kernels.hc_pre(
+                hidden_streams,
+                self.fn,
+                self.scale.float(),
+                self.base.float(),
+                hc,
+                self.hc_sinkhorn_iters,
+                self.input_norm.variance_epsilon,
+                self.hc_eps,
+            )
+            return post, comb, collapsed
+        else:
+            # --- Fallback: pure-Python reference implementation ---
+            flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+            pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+            pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+            pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+
+            pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
+            post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+            comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+            comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-        return post, comb, collapsed
+            for _ in range(self.hc_sinkhorn_iters - 1):
+                comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+                comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            return post, comb, collapsed
 
 
 class Glm5NextHyperHead(nn.Module):
@@ -1714,6 +1733,57 @@ class Glm5NextDecoderLayer(nn.Module):
                 prev_topk_indices: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # hidden_states: [B, S, hc_mult, D] (4 residual streams).
+        if _has_mhc_fused:
+            return self._forward_fused(hidden_states, position_ids,
+                                       attention_mask, prev_topk_indices)
+        else:
+            return self._forward_ref(hidden_states, position_ids,
+                                     attention_mask, prev_topk_indices)
+
+    def _forward_fused(self, hidden_states: torch.Tensor,
+                       position_ids: torch.Tensor,
+                       attention_mask: torch.Tensor,
+                       prev_topk_indices: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # --- Fused NPU kernel path (matches DeepSeek V4 C++ decoder layer) ---
+
+        # Attention mHC pre-collapse
+        residual = hidden_states
+        post, comb, hidden_states = self.attn_hc(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_out = self.self_attn(hidden_states, position_ids, attention_mask,
+                                  prev_topk_indices)
+        if isinstance(attn_out, tuple):
+            hidden_states, topk = attn_out
+        else:
+            hidden_states, topk = attn_out, None
+        # MLA attention returns [B*S, D] (2D); reshape to [B, S, D] for hc_post.
+        # KDA attention already returns [B, S, D] so the dim check is a no-op.
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.view(
+                residual.shape[0], residual.shape[1], -1)
+        # Fused post-attention mHC recombination: hc_post returns [B,S,hc_mult,D]
+        hidden_states = kernels.hc_post(
+            hidden_states, residual, post, comb,
+        )
+
+        # FFN mHC pre-collapse
+        residual = hidden_states
+        post, comb, hidden_states = self.ffn_hc(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        # MLP / MoE preserves shape, so hidden_states is already [B, S, D] (3D).
+        hidden_states = kernels.hc_post(
+            hidden_states, residual, post, comb,
+        )
+        return hidden_states, topk
+
+    def _forward_ref(self, hidden_states: torch.Tensor,
+                     position_ids: torch.Tensor,
+                     attention_mask: torch.Tensor,
+                     prev_topk_indices: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # --- Fallback: pure-Python reference implementation ---
         residual = hidden_states
         post, comb, hidden_states = self.attn_hc(hidden_states)   # collapsed -> [B,S,D]
         hidden_states = self.input_layernorm(hidden_states)
@@ -1723,6 +1793,10 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, topk = attn_out
         else:
             hidden_states, topk = attn_out, None
+        # MLA attention returns [B*S, D] (2D); reshape to [B, S, D].
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.view(
+                residual.shape[0], residual.shape[1], -1)
         dtype = hidden_states.dtype
         hidden_states = (
             post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2)
