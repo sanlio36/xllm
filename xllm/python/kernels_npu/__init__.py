@@ -52,6 +52,10 @@ from .gated_delta_net import (
     fused_recurrent_gated_delta_rule_packed_decode,
     resolve_gdn_prefill_backend,
 )
+from .hyper_connection import (
+    hc_post,
+    hc_pre,
+)
 from .linear import (
     prepare_quant_weight,
     prepare_row_parallel_weight,
@@ -153,6 +157,8 @@ __all__ = [
     "sparse_flash_attention_out",
     "causal_conv1d_prefill",
     "causal_conv1d_decode",
+    "hc_pre",
+    "hc_post",
     "resolve_gdn_prefill_backend",
     "fused_gdn_prefill_post_conv",
     "fused_recurrent_gated_delta_rule_packed_decode",

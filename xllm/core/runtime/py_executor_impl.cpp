@@ -31,15 +31,11 @@ limitations under the License.
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
 #if defined(USE_NPU)
-#include "core/runtime/py_hyper_connection.h"
-#endif
-#include "models/llm/py_causal_lm.h"
-
-#if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
+#include "models/llm/py_causal_lm.h"
 
 namespace py = pybind11;
 
@@ -66,10 +62,6 @@ void clear_python_object(py::object& object) {
 
 PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
   register_attention_metadata_views(m);
-#if defined(USE_NPU)
-  register_hyper_connection_kernels(m);
-#endif
-
 #if defined(USE_NPU)
   py::class_<NPULayerSynchronizerImpl,
              std::shared_ptr<NPULayerSynchronizerImpl>>(m, "LayerSynchronizer")

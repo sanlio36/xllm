@@ -72,12 +72,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context_or_none,
 )
 
-try:
-    import xllm_runtime  # noqa: F401  # pybind-embedded module for fused kernels
-    _has_mhc_fused = hasattr(xllm_runtime, "hc_pre")
-except ImportError:
-    xllm_runtime = None  # type: ignore[assignment]
-    _has_mhc_fused = False
+_has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_next_kpool import pooled_states as _kpool_pooled_states
 from xllm.python.layers.linear import ColumnParallelLinear
@@ -1604,7 +1599,7 @@ class Glm5NextHyperConnection(nn.Module):
             # comb [B,S,hc_mult,hc_mult]).
             # .float() guards against weight-loading casting params back to bf16;
             # __init__ creates them in float32 (aligned with vLLM).
-            collapsed, post, comb = xllm_runtime.hc_pre(
+            collapsed, post, comb = kernels.hc_pre(
                 hidden_streams,
                 self.fn,
                 self.scale.float(),
@@ -1698,7 +1693,7 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states = hidden_states.view(
                 residual.shape[0], residual.shape[1], -1)
         # Fused post-attention mHC recombination: hc_post returns [B,S,hc_mult,D]
-        hidden_states = xllm_runtime.hc_post(
+        hidden_states = kernels.hc_post(
             hidden_states, residual, post, comb,
         )
 
@@ -1708,7 +1703,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         # MLP / MoE preserves shape, so hidden_states is already [B, S, D] (3D).
-        hidden_states = xllm_runtime.hc_post(
+        hidden_states = kernels.hc_post(
             hidden_states, residual, post, comb,
         )
         return hidden_states, topk

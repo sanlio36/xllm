@@ -280,6 +280,27 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
                          total_local);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_npu(
+    const torch::Tensor& x,
+    const torch::Tensor& hc_fn,
+    const torch::Tensor& hc_scale,
+    const torch::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps) {
+  return xllm::kernel::npu::hc_pre(
+      x, hc_fn, hc_scale, hc_base,
+      hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
+}
+
+torch::Tensor hc_post_npu(const torch::Tensor& x,
+                          const torch::Tensor& residual,
+                          const torch::Tensor& post,
+                          const torch::Tensor& comb) {
+  return xllm::kernel::npu::hc_post(x, residual, post, comb);
+}
+
 }  // namespace
 
 void ensure_xllm_ops_registered() {
@@ -394,6 +415,13 @@ TORCH_LIBRARY(xllm_ops, m) {
       "cache_mode, int quant_mode, bool do_rms_norm, int "
       "wdkv_split_count, bool q_down_out_flag) -> (Tensor, Tensor(a!), "
       "Tensor, Tensor(b!), Tensor)");
+  m.def(
+      "hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int hc_sinkhorn_iters, float norm_eps, float hc_eps) "
+      "-> (Tensor, Tensor, Tensor)");
+  m.def(
+      "hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) "
+      "-> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -423,6 +451,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("sparse_flash_attention_out",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_out));
   m.impl("mla_preprocess_v2", TORCH_FN(xllm::kernel::npu::mla_preprocess_v2));
+  m.impl("hc_pre", TORCH_FN(xllm::hc_pre_npu));
+  m.impl("hc_post", TORCH_FN(xllm::hc_post_npu));
 }
 
 // build_cp_context is pure host index math with no Tensor input, so the
