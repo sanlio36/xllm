@@ -146,6 +146,40 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+# Upper bound on the flattened seq dim (T = total tokens across every sequence
+# in the batch) for which RMSNorm is split into per-row S=1 calls. The NPU
+# reduction over the hidden dim is tiled as a function of the *full 2D tensor
+# shape*, so a decode/verify batch flattened to [1, T, D] (engine varlen layout
+# — see ``_current_q_seq_lens``) picks a different accumulation order for
+# different T. Single-concurrency verify is T=2; with N concurrent verify
+# sequences (num_spec=1) T = 2N, so e.g. 3-way concurrency gives T=6 — which the
+# old ``<= 4`` cap left on the batched path while single-concurrency ran the
+# row-wise S=1 path, flipping 1 ULP that cascades to an argmax divergence (the
+# same root class as the MTP-vs-non-MTP fix). The cap must cover the largest
+# decode/verify batch (max_seqs_per_batch * (num_speculative_tokens+1)) while
+# staying well under prefill lengths (thousands) so prefill keeps the fast
+# batched path. Default 64 covers max_seqs_per_batch=16, num_spec=3 with margin.
+_RMSNORM_ROWWISE_MAX_S = 64
+
+
+def _rowwise_rms(fn, x, *extra):
+    """Split a small-S RMSNorm call into per-row S=1 calls.
+
+    Returns ``None`` when the row-wise path does not apply (env off, S<=1, or
+    S above the cap), so the caller falls through to its batched implementation.
+    Slicing (``x[..., i:i+1, :]``) is a pure view — no device tensor creation,
+    no H2D sync — so it is legal under aclgraph capture (see the _RMSNorm
+    comment on why index_select was removed).
+    """
+    if (os.environ.get("GLM5_RMSNORM_ROWWISE") == "1"
+            and x.dim() >= 2 and 1 < x.shape[-2] <= _RMSNORM_ROWWISE_MAX_S):
+        return torch.cat(
+            [fn(x[..., i:i + 1, :], *[e[..., i:i + 1, :] for e in extra])
+             for i in range(x.shape[-2])],
+            dim=-2)
+    return None
+
+
 class _RMSNorm(nn.Module):
     """Pure-torch RMSNorm matching transformers (fp32 compute, cast back)."""
 
@@ -159,6 +193,20 @@ class _RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
+        # MTP spec-verify packs [anchor, draft] rows into one [1, S=2, D] call
+        # and, under concurrency, multiple verify sequences flatten to S = 2N.
+        # NPU reduce tiling is shape/process-state dependent: a batch whose
+        # flattened S differs picks a different reduction path, flipping the
+        # last bf16 bit near a rounding boundary (bisect10-14: bit-identical
+        # input + weight, bit-identical offline replay, yet 1-ULP output
+        # divergence, amplified through 45 layers to a 6e-2 final_norm drift
+        # and eventual argmax flips). Row-wise dispatch makes each call use the
+        # exact S=1 op shapes of single-token decode, pinning every batch size
+        # onto the same kernel path. See ``_rowwise_rms`` for the S cap; large
+        # prefill (S in the hundreds/thousands) stays on the fast batched path.
+        rowwise = _rowwise_rms(self.forward, x)
+        if rowwise is not None:
+            return rowwise
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -178,6 +226,12 @@ class _UnweightedRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
+        # Same concurrency tiling hazard as _RMSNorm (this runs in the mHC
+        # input projection on the same flattened [1, T, D] decode batch);
+        # pin S=1 per row so the reduce path is batch-size-independent.
+        rowwise = _rowwise_rms(self.forward, x)
+        if rowwise is not None:
+            return rowwise
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -197,6 +251,22 @@ class _RMSNormGated(nn.Module):
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
+        # o_norm runs on the 4D KDA head output [B, S, num_heads, head_dim]; the
+        # RMS reduction over head_dim has row count = B*S*num_heads, so the NPU
+        # tiling depends on the flattened batch size S (T under concurrency).
+        # Single-concurrency (T=2) happened to match non-MTP decode (T=1) for the
+        # 4172-char baseline, but T=6 under 3-way concurrency picks a different
+        # reduction path and flips 1 ULP at @391/@322. Split along the seq dim
+        # (dim=1, NOT dim=-2=heads) so every per-row call is [B,1,nh,hd] with a
+        # fixed nh row count — identical to non-MTP single-token decode, which is
+        # S=1 (no split) and therefore the same [B,1,nh,hd] reduction. Slicing is
+        # a pure view (graph-safe, no H2D/sync); large prefill S stays batched.
+        if (os.environ.get("GLM5_RMSNORM_ROWWISE") == "1"
+                and x.dim() == 4 and 1 < x.shape[1] <= _RMSNORM_ROWWISE_MAX_S):
+            return torch.cat(
+                [self.forward(x[:, i:i + 1], gate[:, i:i + 1])
+                 for i in range(x.shape[1])],
+                dim=1)
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)

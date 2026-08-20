@@ -96,6 +96,7 @@ VLMMaster::VLMMaster(const Options& options)
       .max_seqs_per_batch(options.max_seqs_per_batch())
       .max_tokens_per_chunk_for_prefill(
           options.max_tokens_per_chunk_for_prefill())
+      .num_speculative_tokens(options_.num_speculative_tokens())
       .dp_size(options_.dp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_chunked_prefill(options_.enable_chunked_prefill())
@@ -387,7 +388,11 @@ std::shared_ptr<Request> VLMMaster::build_request(
 
   // allocate enough capacity for prompt tokens, max tokens, and speculative
   // tokens, TODO: add image token size as well.
-  const size_t capacity = prompt_tokens.size() + max_tokens + 1;
+  size_t capacity =
+      prompt_tokens.size() + max_tokens + 1 + options_.num_speculative_tokens();
+  if (options_.enable_schedule_overlap()) {
+    capacity += options_.num_speculative_tokens() + 1;
+  }
   const size_t best_of = sp.best_of.value_or(sp.n);
 
   RequestSamplingParam sampling_param;

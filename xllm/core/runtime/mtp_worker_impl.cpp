@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/sampling/logits_utils.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
@@ -2687,6 +2688,29 @@ SampleOutput MTPWorkerImpl::validate(const SamplingParameters& sampling_params,
 
   auto target_logits =
       target_output.logits.view({batch_size, num_val_tokens, vocab_size});
+  if (!sampling_params.all_greedy_sample) {
+    // Mirror the regular sampler's logits processing on the verify logits:
+    // RejectionSampler::forward softmaxes RAW logits, so temperature/top-k/
+    // top-p silently vanished for every draft accept/resample decision (only
+    // the bonus token, sampled by the worker's regular sampler, kept the
+    // truncated distribution). With temperature=1 + top_k=10 the untruncated
+    // distribution lets long-tail tokens through and long generations drift
+    // into repetition loops. Flatten to [batch*num_val, vocab] and expand the
+    // per-seq params to token rows — apply_top_k_top_p broadcasts its param
+    // tensors against the logits' leading dims, which would misalign on the
+    // 3D view ([batch] vs [batch, num_val]).
+    auto flat_logits =
+        target_logits.view({batch_size * num_val_tokens, vocab_size});
+    auto rep = [&](const torch::Tensor& t) {
+      return t.defined()
+                 ? t.repeat_interleave(num_val_tokens).to(flat_logits.device())
+                 : t;
+    };
+    apply_top_k_top_p(flat_logits,
+                      rep(sampling_params.temperatures),
+                      rep(sampling_params.top_k),
+                      rep(sampling_params.top_p));
+  }
 
   // prepare input for rejection sampling
   auto rejection_sampler =

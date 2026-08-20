@@ -59,6 +59,11 @@ if TYPE_CHECKING:
 # rejected draft leaves a phantom write, a persistent per-step error.
 
 _MTP_FULL_COMMIT = os.environ.get("GLM5_MTP_COMMIT", "lazy") == "full"
+# Seq-wise KDA recurrent dispatch for spec-verify batches: split the flattened
+# multi-sequence call into one single-segment call per sequence so concurrent
+# verify runs the exact op-call shapes of single-request verify (see the
+# read-only branch below for the divergence rationale).
+_KDA_SEQWISE = os.environ.get("GLM5_KDA_SEQWISE", "1") == "1"
 # Spec-verify acceptance instrumentation (MTP_TRACE=1): layer-0 counts
 # verify steps and non-prefill plain steps (each reject inserts one plain
 # bootstrap step, so the plain share of decode steps is the reject rate).
@@ -769,7 +774,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
             merged_q_cu: Optional[torch.Tensor] = None
             merged_row0: list = []
             q_cu_raw = metadata.q_cu_seq_lens
-            q_rows = int(q_cu_raw.numel()) - 1 if q_cu_raw is not None else 0
+            # The row-merge + lazy-commit bookkeeping below is MTP-spec-verify
+            # tracking that relies on device->host syncs (.item()/.tolist()),
+            # which are forbidden on a captured ACL-graph stream. The graph
+            # decode path is not spec-verify (merged_q_cu stays None and the
+            # simple path below uses the capture-safe conv), so skip it whole.
+            q_rows = (0 if in_graph else
+                      (int(q_cu_raw.numel()) - 1
+                       if q_cu_raw is not None else 0))
             per_row_idx = None
             if q_rows == idx.numel() and idx.numel() > 1 and bool(
                     (idx[1:] == idx[:-1]).any().item()):
@@ -821,12 +833,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 # steps record a coverage marker (kv length, empty stash) so
                 # the next verify does not re-advance them. Prefill resets
                 # the chain (the slot restarts from a fresh state).
-                if not _MTP_FULL_COMMIT:
+                if not _MTP_FULL_COMMIT and not in_graph:
                     _pending = getattr(self, "_mtp_pending", None)
                     if _pending is None:
                         _pending = {}
                         self._mtp_pending = _pending
                     _lp = _pending.setdefault(layer.layer_id, {})
+                    # NOTE: kv_seq_lens.tolist() / idx.tolist() are device->host
+                    # syncs forbidden on a captured stream; the graph path uses
+                    # static metadata and the capture-safe conv in the simple
+                    # path below, so this lazy-commit bookkeeping is eager-only.
                     _kv_list = (metadata.kv_seq_lens.tolist()
                                 if metadata.kv_seq_lens is not None else None)
                     _active = getattr(self, "_mtp_seen_verify", False)
@@ -908,6 +924,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                             gate[:, 0:0], beta[:, 0:0],
                             _cw, layer.activation)
             if (not _MTP_FULL_COMMIT and merged_q_cu is not None
+                    and not in_graph
                     and getattr(self, "_mtp_pending", None)
                     and layer.layer_id == min(self._mtp_pending.keys())):
                 # Batched cross-layer lazy advance. Every KDA layer's
@@ -1189,7 +1206,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
                     # collect post-conv qkv for the recurrent advance.
                     adv_conv_out = []
                     for s, seg_raw in zip(adv_seq, adv_seg):
-                        cs = conv_state[s:s + 1]
+                        cs = conv_state[s:s + 1].contiguous()
+                        seg_raw = seg_raw.contiguous()
                         cin = torch.cat([cs, seg_raw], dim=-1)
                         adv_conv_out.append(_causal_conv1d_fn(
                             cin, conv_weight, activation
@@ -1215,23 +1233,52 @@ class NpuPagedAttentionBackend(AttentionBackend):
                         -1, num_heads_local).to(torch.float32).contiguous()
                     adv_idx = torch.tensor(adv_seq, dtype=torch.long,
                                            device=ssm_state.device)
-                    _, adv_state = recurrent_kda(
-                        aq, ak, av, ag, ab,
-                        initial_state=ssm_state.index_select(0, adv_idx),
-                        cu_seqlens=torch.tensor(
-                            a_cu, dtype=torch.int32, device=device),
-                        layout="TND", scale=scale,
-                        output_final_state=True, inplace_final_state=False,
-                        use_qk_l2norm_in_kernel=True,
-                        use_gate_in_kernel=False,
-                        use_beta_sigmoid_in_kernel=False,
-                    )
-                    ssm_state[adv_idx] = adv_state.to(ssm_state.dtype)
+                    if _KDA_SEQWISE and len(adv_seq) > 1:
+                        # Same seq-wise rationale as the read-only branch: keep
+                        # every advance call at the single-sequence shape so
+                        # concurrent batches advance state bit-identically to a
+                        # single-request run.
+                        for _si, _slot in enumerate(adv_seq):
+                            _a0, _a1 = a_cu[_si], a_cu[_si + 1]
+                            _asel = slice(int(_a0), int(_a1))
+                            _, _st = recurrent_kda(
+                                aq[_asel].contiguous(), ak[_asel].contiguous(),
+                                av[_asel].contiguous(), ag[_asel].contiguous(),
+                                ab[_asel].contiguous(),
+                                initial_state=ssm_state.index_select(
+                                    0, adv_idx[[_si]]),
+                                cu_seqlens=torch.tensor(
+                                    [0, int(_a1 - _a0)], dtype=torch.int32,
+                                    device=device),
+                                layout="TND", scale=scale,
+                                output_final_state=True,
+                                inplace_final_state=False,
+                                use_qk_l2norm_in_kernel=True,
+                                use_gate_in_kernel=False,
+                                use_beta_sigmoid_in_kernel=False,
+                            )
+                            ssm_state[adv_idx[_si]] = _st.to(ssm_state.dtype)
+                    else:
+                        _, adv_state = recurrent_kda(
+                            aq, ak, av, ag, ab,
+                            initial_state=ssm_state.index_select(0, adv_idx),
+                            cu_seqlens=torch.tensor(
+                                a_cu, dtype=torch.int32, device=device),
+                            layout="TND", scale=scale,
+                            output_final_state=True, inplace_final_state=False,
+                            use_qk_l2norm_in_kernel=True,
+                            use_gate_in_kernel=False,
+                            use_beta_sigmoid_in_kernel=False,
+                        )
+                        ssm_state[adv_idx] = adv_state.to(ssm_state.dtype)
                 outs = []
                 for s in range(num_seqs):
                     t0, t1 = q_cu_list[s], q_cu_list[s + 1]
-                    seg = mixed_qkv[:, :, t0:t1]
-                    cs = conv_state[s:s + 1]
+                    seg = mixed_qkv[:, :, t0:t1].contiguous()
+                    # contiguous: a row-view of the batched cache has a
+                    # different layout than a single-request's whole cache
+                    # and the conv kernel picks its tiling off that layout.
+                    cs = conv_state[s:s + 1].contiguous()
                     cin = torch.cat([cs, seg], dim=-1)
                     outs.append(_causal_conv1d_fn(
                         cin, conv_weight, activation,
@@ -1322,19 +1369,51 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 # branch). Chain the current rows read-only from that state
                 # for their outputs; the tail write-back persists exactly
                 # the advanced state (never the drafted rows).
-                ro = recurrent_kda(
-                    q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
-                    initial_state=ssm_state,
-                    cu_seqlens=cu_seqlens,
-                    layout="TND", scale=scale,
-                    output_final_state=False, inplace_final_state=False,
-                    use_qk_l2norm_in_kernel=True,
-                    use_gate_in_kernel=False,
-                    use_beta_sigmoid_in_kernel=False,
-                )
-                # fla_npu returns a tuple even with output_final_state=False.
-                core_attn_out = ro[0] if isinstance(ro, tuple) else ro
-                final_state = ssm_state
+                if _KDA_SEQWISE and num_seqs > 1 and num_seqs != batch_size:
+                    # Seq-wise dispatch: one single-segment recurrent call per
+                    # sequence, exactly matching the single-request verify call
+                    # shape. The flattened multi-segment call picks a different
+                    # device tiling inside the engine process (verified
+                    # bit-exact offline but not in-process), leaking a 1-ULP
+                    # drift into the KDA output that the next layer's mHC
+                    # sinkhorn amplifies ~16x per layer until argmax flips —
+                    # concurrent outputs then diverge from single-request ones.
+                    _ros = []
+                    for s in range(num_seqs):
+                        _t0, _t1 = q_cu_list[s], q_cu_list[s + 1]
+                        _sel = slice(int(_t0), int(_t1))
+                        _ro = recurrent_kda(
+                            q_tnd[_sel].contiguous(), k_tnd[_sel].contiguous(),
+                            v_tnd[_sel].contiguous(), g_tnd[_sel].contiguous(),
+                            b_tnd[_sel].contiguous(),
+                            initial_state=ssm_state[s:s + 1].contiguous(),
+                            cu_seqlens=torch.tensor(
+                                [0, int(_t1 - _t0)], dtype=torch.int32,
+                                device=device),
+                            layout="TND", scale=scale,
+                            output_final_state=False, inplace_final_state=False,
+                            use_qk_l2norm_in_kernel=True,
+                            use_gate_in_kernel=False,
+                            use_beta_sigmoid_in_kernel=False,
+                        )
+                        _ros.append(_ro[0] if isinstance(_ro, tuple) else _ro)
+                    core_attn_out = torch.cat(_ros, dim=0)
+                    final_state = ssm_state
+                else:
+                    ro = recurrent_kda(
+                        q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
+                        initial_state=ssm_state,
+                        cu_seqlens=cu_seqlens,
+                        layout="TND", scale=scale,
+                        output_final_state=False, inplace_final_state=False,
+                        use_qk_l2norm_in_kernel=True,
+                        use_gate_in_kernel=False,
+                        use_beta_sigmoid_in_kernel=False,
+                    )
+                    # fla_npu returns a tuple even with
+                    # output_final_state=False.
+                    core_attn_out = ro[0] if isinstance(ro, tuple) else ro
+                    final_state = ssm_state
             else:
                 core_attn_out, final_state = recurrent_kda(
                     q_tnd, k_tnd, v_tnd, g_tnd, b_tnd,
@@ -1359,17 +1438,47 @@ class NpuPagedAttentionBackend(AttentionBackend):
             v_in = value.to(torch.bfloat16).contiguous()
             cu_seqlens = q_cu.to(torch.int32) if num_seqs != batch_size else \
                 torch.tensor([0, seq_len], dtype=torch.int32, device=device)
-            result = chunk_kda_fwd(
-                q_in, k_in, v_in, g, b, scale,
-                chunk_size=64, layout="BSND",
-                initial_state=ssm_state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                use_gate_in_kernel=False,
-                return_intermediate_states=False,
-            )
-            core_attn_out = result[0].to(query.dtype)
-            final_state = result[1]
+            if _KDA_SEQWISE and cu_seqlens.numel() > 2:
+                # Seq-wise prefill: one single-sequence chunk_kda_fwd per
+                # sequence. A merged multi-sequence prefill (engine batches the
+                # concurrent requests' prefills) leaves per-seq conv/ssm state
+                # that differs from a single-request prefill (state-fingerprint
+                # verified: L0 state matches, L1+ diverges on seq1/seq2), and
+                # that state drift propagates through every later verify step.
+                _pout, _pstates = [], []
+                for s in range(num_seqs):
+                    t0, t1 = q_cu_list[s], q_cu_list[s + 1]
+                    sel = slice(int(t0), int(t1))
+                    _r = chunk_kda_fwd(
+                        q_in[:, sel].contiguous(), k_in[:, sel].contiguous(),
+                        v_in[:, sel].contiguous(),
+                        g[:, sel].contiguous(),
+                        b[:, sel].contiguous(),
+                        scale,
+                        chunk_size=64, layout="BSND",
+                        initial_state=ssm_state[s:s + 1],
+                        output_final_state=True,
+                        cu_seqlens=torch.tensor(
+                            [0, int(t1 - t0)], dtype=torch.int32, device=device),
+                        use_gate_in_kernel=False,
+                        return_intermediate_states=False,
+                    )
+                    _pout.append(_r[0])
+                    _pstates.append(_r[1])
+                core_attn_out = torch.cat(_pout, dim=0).to(query.dtype)
+                final_state = torch.cat(_pstates, dim=0)
+            else:
+                result = chunk_kda_fwd(
+                    q_in, k_in, v_in, g, b, scale,
+                    chunk_size=64, layout="BSND",
+                    initial_state=ssm_state,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    use_gate_in_kernel=False,
+                    return_intermediate_states=False,
+                )
+                core_attn_out = result[0].to(query.dtype)
+                final_state = result[1]
 
         if idx is not None:
             if chain_seqs:
