@@ -79,6 +79,7 @@ except ImportError:
     xllm_runtime = None  # type: ignore[assignment]
     _has_mhc_fused = False
 from xllm.python.models.base import PyModelBase
+from xllm.python.models.glm5_next_kpool import pooled_states as _kpool_pooled_states
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.layers.embedding import HiddenParallelEmbedding
@@ -895,53 +896,10 @@ class Glm5NextIndexer(nn.Module):
 
     def get_pooled_states(self, packed_states: torch.Tensor,
                           key_valid: torch.Tensor):
-        keys, gate_scores, _ = torch.split(
-            packed_states, [self.head_dim, self.head_dim, 1], dim=-1
+        pool_keys, pool_indices, pool_valid = _kpool_pooled_states(
+            packed_states, key_valid, self.index_kpool_compress_ape,
+            self.head_dim, self.index_kpool,
         )
-        batch_size, total_len = keys.shape[:2]
-        device = keys.device
-        rate = self.index_kpool
-        first_key = torch.where(
-            key_valid.any(-1),
-            key_valid.long().argmax(-1),
-            torch.full((batch_size,), total_len, dtype=torch.long, device=device),
-        )
-        n_pools = (total_len + rate - 1) // rate
-        pool_offsets = torch.arange(n_pools, device=device) * rate
-        slot_offsets = torch.arange(rate, device=device)
-        pool_indices = (
-            first_key[:, None, None]
-            + pool_offsets[None, :, None]
-            + slot_offsets[None, None, :]
-        )
-        slot_in_range = pool_indices < total_len
-        safe_indices = pool_indices.clamp(0, total_len - 1)
-        # AICore-native gather replaces fancy indexing (x[idx]) which falls
-        # back to aclnnIndex on AI_CPU (140-290us). torch.gather requires the
-        # index and input to share ndim, so gather over flattened
-        # (total_len * head_dim) rows, then reshape. safe_indices is
-        # [B, n_pools, rate] and already clamped to [0, total_len-1].
-        head_off = torch.arange(self.head_dim, device=device)
-        flat_idx = (safe_indices[..., None] * self.head_dim + head_off).reshape(
-            batch_size, -1
-        )
-        grouped_keys = keys.reshape(batch_size, -1).gather(1, flat_idx).reshape(
-            batch_size, n_pools, rate, self.head_dim
-        )
-        grouped_gate_scores = gate_scores.reshape(batch_size, -1).gather(
-            1, flat_idx
-        ).reshape(batch_size, n_pools, rate, self.head_dim)
-        # key_valid is bool; gather has no bool kernel on Ascend, so cast
-        # uint8 locally and restore bool — downstream & / ~ / argmax unchanged.
-        slot_valid = key_valid.to(torch.uint8).gather(
-            1, safe_indices.reshape(batch_size, -1)
-        ).reshape(batch_size, n_pools, rate).to(torch.bool) & slot_in_range
-        pool_valid = slot_valid.all(-1)
-        logits = grouped_gate_scores.float() + self.index_kpool_compress_ape.float()[None, None]
-        logits = logits.masked_fill(~slot_valid[..., None], float("-inf"))
-        weights = torch.nan_to_num(logits.softmax(2)).to(grouped_keys.dtype)
-        pool_keys = (weights * grouped_keys).sum(2)
-        pool_indices = pool_indices.masked_fill(~slot_valid, -1)
         if self.use_acl_graph and _in_acl_graph():
             # Graph branch (fixed shapes): keep ALL pools. The boolean
             # ``pool_keys[:, keep]`` filter below produces a data-dependent
