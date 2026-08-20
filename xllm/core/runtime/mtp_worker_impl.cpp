@@ -2276,6 +2276,56 @@ bool MTPWorkerImpl::can_use_combined_first_draft() const {
   return enable_schedule_overlap() && supports_combined_first_draft_execution();
 }
 
+bool MTPWorkerImpl::prelaunch_positions_fit_block_table(
+    const ForwardInput& input) const {
+  const int32_t block_size = options_.block_size();
+  if (block_size <= 0) {
+    return false;
+  }
+  // The prelaunch forward interleaves two rows per sequence: the "current"
+  // row is written at base_positions + accepted_lengths and the "repair" row
+  // one position ahead on rejection. With the maximum accepted length the
+  // largest position any prelaunch row can touch is
+  // kv_seq_len + num_speculative_tokens. The scheduler allocates exactly
+  // ceil(kv_seq_len / block_size) blocks per sequence, so any sequence whose
+  // extended length crosses into a new block is a candidate for the
+  // LightningIndexer "DDR address out of range" fault.
+  //
+  // In DP the prelaunch decision must be identical on every rank, otherwise
+  // the HCCL collectives inside the prelaunched draft forward deadlock when
+  // one rank falls back while its peers still prelaunch. Each rank allocates
+  // ceil(local kv_max / block_size) blocks for its own longest sequence, so
+  // the safe capacity is the MINIMUM width across the group while the demand
+  // is the worst-case extended length of ANY shard. Both are pure functions
+  // of dp_global_kv_max_seq_lens (replicated to every rank by the engine), so
+  // the decision is symmetric without an extra collective.
+  int64_t min_allocated_blocks = std::numeric_limits<int64_t>::max();
+  int64_t max_required_blocks = 0;
+  const std::vector<int32_t>& dp_global_kv_max_seq_lens =
+      input.input_params.parallel.dp_global_kv_max_seq_lens;
+  const std::vector<int32_t>* kv_max_sources = nullptr;
+  if (!dp_global_kv_max_seq_lens.empty()) {
+    kv_max_sources = &dp_global_kv_max_seq_lens;
+  } else {
+    kv_max_sources = &input.input_params.attention.host.kv_seq_lens;
+  }
+  const int64_t speculative_width = options_.num_speculative_tokens() + 1;
+  for (const int32_t kv_max : *kv_max_sources) {
+    if (kv_max <= 0) {
+      continue;
+    }
+    const int64_t allocated_blocks =
+        (static_cast<int64_t>(kv_max) + block_size - 1) / block_size;
+    const int64_t required_blocks =
+        (static_cast<int64_t>(kv_max) + speculative_width + block_size - 1) /
+        block_size;
+    min_allocated_blocks = std::min(min_allocated_blocks, allocated_blocks);
+    max_required_blocks = std::max(max_required_blocks, required_blocks);
+  }
+  return min_allocated_blocks != std::numeric_limits<int64_t>::max() &&
+         max_required_blocks <= min_allocated_blocks;
+}
+
 bool MTPWorkerImpl::can_prelaunch_next_first_draft(
     const ForwardInput& input) const {
   if (!can_use_combined_first_draft()) {
@@ -2285,6 +2335,11 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
       parallel_args_.dp_size() > 1 &&
       combined_draft_execution_path_ ==
           mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+  if (combined_draft_execution_path_ ==
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION &&
+      !prelaunch_positions_fit_block_table(input)) {
+    return false;
+  }
   if (requires_dp_symmetric_prelaunch) {
     return has_active_dp_tokens(input);
   }
