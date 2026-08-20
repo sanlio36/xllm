@@ -123,6 +123,32 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
     node.workspace = work_space_->get_workspace_buffer(node.workspaceSize);
   }
 
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      name_.find("deepseek_v2_decoder_layer") != std::string::npos) {
+    const auto tensor_data = [&node](size_t index) -> const void* {
+      return index < node.variantPack.inTensors.size()
+                 ? node.variantPack.inTensors.at(index).deviceData
+                 : nullptr;
+    };
+    const void* output_data =
+        node.variantPack.outTensors.empty()
+            ? nullptr
+            : node.variantPack.outTensors
+                  .at(node.variantPack.outTensors.size() - 1)
+                  .deviceData;
+    LOG(INFO) << "[DP_MTP_LIGHTNING_INDEXER_DEBUG] node_setup name=" << name_
+              << ", node=" << static_cast<const void*>(&node) << ", operation="
+              << static_cast<const void*>(node.operation.get()) << ", stream="
+              << static_cast<const void*>(context_->GetExecuteStream())
+              << ", kv_seq_lens=" << tensor_data(121)
+              << ", block_tables=" << tensor_data(125)
+              << ", index_cache=" << tensor_data(140)
+              << ", shared_topk=" << tensor_data(142)
+              << ", output_last=" << output_data;
+  }
+#endif
+
   run_task_func_(name_ + std::to_string(node_id), [=, this]() {
     return execute_plan(
         node, name_ + std::to_string(node_id), event, event_flag);
@@ -135,6 +161,31 @@ atb::Status BaseLayer::execute_plan(const atb_speed::Model::Node& node,
                                     const std::string& op_name,
                                     aclrtEvent* event,
                                     std::atomic<bool>* event_flag) {
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      name_.find("deepseek_v2_decoder_layer") != std::string::npos) {
+    const auto tensor_data = [&node](size_t index) -> const void* {
+      return index < node.variantPack.inTensors.size()
+                 ? node.variantPack.inTensors.at(index).deviceData
+                 : nullptr;
+    };
+    const void* output_data =
+        node.variantPack.outTensors.empty()
+            ? nullptr
+            : node.variantPack.outTensors
+                  .at(node.variantPack.outTensors.size() - 1)
+                  .deviceData;
+    LOG(INFO) << "[DP_MTP_LIGHTNING_INDEXER_DEBUG] node_execute name=" << name_
+              << ", node=" << static_cast<const void*>(&node) << ", operation="
+              << static_cast<const void*>(node.operation.get()) << ", stream="
+              << static_cast<const void*>(context_->GetExecuteStream())
+              << ", kv_seq_lens=" << tensor_data(121)
+              << ", block_tables=" << tensor_data(125)
+              << ", index_cache=" << tensor_data(140)
+              << ", shared_topk=" << tensor_data(142)
+              << ", output_last=" << output_data;
+  }
+#endif
   atb::Status st = node.operation->Execute(
       node.variantPack, (uint8_t*)node.workspace, node.workspaceSize, context_);
   LOG_IF(ERROR, st != 0) << name_ << " execute plan fail, error code: " << st;

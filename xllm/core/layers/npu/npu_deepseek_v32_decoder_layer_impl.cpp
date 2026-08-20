@@ -1406,6 +1406,53 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.outTensors.at(node.variantPack.outTensors.size() - 1) =
         atb_speed::Utils::AtTensor2Tensor(*output_topk_indices);
   }
+
+#if defined(USE_NPU)
+  // The DSA indexer is submitted asynchronously.  Keep this diagnostic at
+  // the point where the ATB variant pack is fully bound so we can compare the
+  // addresses used by LightningIndexer with the post-forward event that
+  // eventually completes (or fails).  This intentionally does not add any
+  // synchronization or retain tensors.
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      uses_dsa_attention) {
+    const auto tensor_ptr = [](const torch::Tensor& tensor) -> const void* {
+      return tensor.defined() ? tensor.data_ptr() : nullptr;
+    };
+    const auto tensor_numel = [](const torch::Tensor& tensor) -> int64_t {
+      return tensor.defined() ? tensor.numel() : 0;
+    };
+    const auto& device_attention = input_params.attention.device;
+    LOG(INFO)
+        << "[DP_MTP_LIGHTNING_INDEXER_DEBUG] layer_bind rank=" << rank_
+        << ", layer=" << layer_id_ << ", prefill=" << is_prefill
+        << ", skip_topk=" << skip_topk << ", output_topk=" << output_topk
+        << ", batch_type=" << input_params.meta.batch_forward_type.to_string()
+        << ", num_sequences=" << input_params.meta.num_sequences
+        << ", node=" << static_cast<const void*>(&node)
+        << ", operation=" << static_cast<const void*>(node.operation.get())
+        << ", x=" << tensor_ptr(x)
+        << ", index_cache=" << tensor_ptr(kv_cache.get_index_cache())
+        << ", index_cache_numel=" << tensor_numel(kv_cache.get_index_cache())
+        << ", kv_seq_lens=" << tensor_ptr(device_attention.kv_seq_lens)
+        << ", kv_seq_lens_numel=" << tensor_numel(device_attention.kv_seq_lens)
+        << ", q_seq_lens=" << tensor_ptr(device_attention.q_seq_lens)
+        << ", q_seq_lens_numel=" << tensor_numel(device_attention.q_seq_lens)
+        << ", block_tables=" << tensor_ptr(device_attention.block_tables)
+        << ", block_tables_numel="
+        << tensor_numel(device_attention.block_tables)
+        << ", new_cache_slots=" << tensor_ptr(device_attention.new_cache_slots)
+        << ", new_cache_slots_numel="
+        << tensor_numel(device_attention.new_cache_slots)
+        << ", shared_topk=" << tensor_ptr(shared_topk_indices)
+        << ", shared_topk_numel=" << tensor_numel(shared_topk_indices)
+        << ", output_topk="
+        << tensor_ptr(output_topk_indices == nullptr ? torch::Tensor()
+                                                     : *output_topk_indices)
+        << ", output_topk_numel="
+        << tensor_numel(output_topk_indices == nullptr ? torch::Tensor()
+                                                       : *output_topk_indices);
+  }
+#endif
 }
 
 }  // namespace layer
