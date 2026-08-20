@@ -913,6 +913,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 cu_seqlens=cu_seqlens,
                 use_gate_in_kernel=False,
                 return_intermediate_states=False,
+                state_v_first=True,
             )
             core_attn_out = result[0].to(query.dtype)
             final_state = result[1]
