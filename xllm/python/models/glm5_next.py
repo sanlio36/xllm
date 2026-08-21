@@ -356,14 +356,12 @@ def _causal_conv1d_update_graph(mixed_qkv: torch.Tensor, conv_state: torch.Tenso
     k_size = weight.shape[-1]
     # Unified aclop conv contract (reverse-engineered bitwise on NPU): operands
     # are rounded RNE to 11 explicit mantissa bits (a no-op for bf16/fp16
-    # sources), per-tap products are exact in fp32, taps accumulate in fp32 in
-    # ascending order, and the result rounds ONCE to the conv's output dtype
-    # (= weight dtype; bf16 for the real checkpoint). Ascending order matters:
-    # a pairwise-tree variant mismatches on adversarial magnitude mixes while
-    # ascending is exact (0/2.5M elements). fp32-in (align harness) and
-    # bf16-in (engine) are the same kernel with different final rounding.
-    h_r = _round_mantissa_rne(hidden_states_new.float())
-    w_r = _round_mantissa_rne(weight.float())
+    # sources). Since the engine's conv weight is always bf16 and hidden_states
+    # are cast to bf16 above, the RNE rounding is a no-op — float() alone
+    # preserves the exact bf16 value in fp32. We skip _round_mantissa_rne to
+    # avoid RightShift/BitwiseAnd on AI_CPU (~7.4% of total decode time).
+    h_r = hidden_states_new.float()
+    w_r = weight.float()
     out = w_r[:, 0:1].unsqueeze(0) * h_r[:, :, 0:seq_len]
     for k in range(1, k_size):
         out = out + w_r[:, k:k + 1].unsqueeze(0) * h_r[:, :, k:k + seq_len]

@@ -3,7 +3,7 @@
 # spec-verify in aclgraph. Target: verify replay ~7-10ms, TPOT <=50ms/token,
 # AND coherent output (V3 fixes V2 garbling). Determinism NOT a goal.
 set -e
-export HCCL_DETERMINISTIC=true
+#export HCCL_DETERMINISTIC=true
 export PYTHON_INCLUDE_PATH="$(python3 -c 'from sysconfig import get_paths; print(get_paths()["include"])')"
 export PYTHON_LIB_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
 export PYTORCH_NPU_INSTALL_PATH=/usr/local/libtorch_npu/
@@ -63,7 +63,7 @@ export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
 nohup numactl -C $((DEVICE*CORES_PER_CARD))-$((DEVICE*CORES_PER_CARD+CORES_PER_CARD-1)) $XLLM_PATH \
   --model "$MODEL_PATH" --model_id glm5 --port "$PORT" \
   --master_node_addr="$MASTER_NODE_ADDR" --nnodes="$NNODES" --node_rank="$i" \
-  --communication_backend="$COMMUNICATION_BACKEND" --max_memory_utilization=0.80 \
+  --communication_backend="$COMMUNICATION_BACKEND" --max_memory_utilization=0.75 \
   --enable_chunked_prefill=True --enable_schedule_overlap=True \
   --enable_prefix_cache=False --max_tokens_per_chunk_for_prefill=8192 \
   --enable_mix_batch=False --max_tokens_per_batch=10240 --enable_shm=False \

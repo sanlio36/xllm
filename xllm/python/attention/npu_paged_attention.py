@@ -108,12 +108,6 @@ _SPARSE_MODE_NONE = 0
 _SPARSE_MODE_RIGHT_DOWN_CAUSAL = 3
 
 
-# RNE-rounded constant conv weights, keyed by data_ptr() (see
-# _causal_conv1d_graph_multi): the rounded form is invariant, so compute it
-# once and bake the constant into the captured graph instead of per-layer.
-_RNE_WEIGHT_CACHE: dict[int, torch.Tensor] = {}
-
-
 def _causal_conv1d_graph_multi(
     cin: torch.Tensor, weight: torch.Tensor, out_rows: int,
     activation: str = "silu",
@@ -124,21 +118,17 @@ def _causal_conv1d_graph_multi(
     current rows); the causal outputs for the R rows are the K-wide windows
     STARTING at ``[0, R)``. F.conv1d lowers to an aclop NPUGraph cannot
     capture, so the conv is unrolled into the per-tap multiply-add contract
-    of ``_causal_conv1d_update_graph`` (RNE-rounded operands, fp32 taps
-    accumulated in ascending order, one final round to the weight dtype) —
-    bit-compatible with the eager F.conv1d path the V2 code keeps.
+    of ``_causal_conv1d_update_graph`` — bit-compatible with that plain-decode
+    path and the eager F.conv1d path the V2 code keeps.
+
+    Mirrors _causal_conv1d_update_graph's numeric contract exactly: operands
+    cast to fp32, per-tap products exact in fp32, ascending accumulation,
+    one final round to the weight dtype. The RNE rounding to 11 mantissa bits
+    is a no-op for bf16 sources (7 mantissa bits), so it is skipped to avoid
+    RightShift/BitwiseAnd on AI_CPU (see commit 32760093).
     """
-    from xllm.python.models.glm5_next import _round_mantissa_rne
-    h_r = _round_mantissa_rne(cin.to(weight.dtype).float())
-    # ``weight`` is a constant model parameter, so its RNE-rounded form is
-    # invariant across calls/layers/forwards. Recomputing it every layer bakes
-    # ~5 elementwise ops/layer × 34 KDA layers into the captured graph for no
-    # reason; cache it keyed by data_ptr() and reuse the constant tensor.
-    wptr = weight.data_ptr()
-    w_r = _RNE_WEIGHT_CACHE.get(wptr)
-    if w_r is None or w_r.data_ptr() == 0:
-        w_r = _round_mantissa_rne(weight.float())
-        _RNE_WEIGHT_CACHE[wptr] = w_r
+    h_r = cin.to(weight.dtype).float()
+    w_r = weight.float()
     k_size = weight.shape[-1]
     out = w_r[:, 0:1].unsqueeze(0) * h_r[:, :, 0:out_rows]
     for k in range(1, k_size):
