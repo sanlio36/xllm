@@ -8,13 +8,13 @@ import tilelang.language as T
 
 from scripts.logger import logger
 
-from compiler.tilelang.targets.ascend.kernels.utils import (
+from .utils import (
     DEFAULT_ASCEND_PASS_CONFIGS,
     detect_vec_core_num,
     mte2_wait_mte3,
     mte3_notify_mte2,
 )
-from compiler.tilelang.common.spec import (
+from ....common.spec import (
     DispatchField,
     TilelangKernel,
     register_kernel,

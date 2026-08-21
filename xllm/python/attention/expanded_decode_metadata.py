@@ -36,9 +36,11 @@ class ExpandedDecodeMetadataLike(Protocol):
 class ExpandedDecodeMetadata:
     kv_seq_lens: torch.Tensor
     block_table: torch.Tensor
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
-    paged_kv_last_page_len: torch.Tensor
+    # Row-scoped paging metadata is optional: derived on-device by the
+    # decode-graph runner when the C++ packing provides only kv/block-table.
+    paged_kv_indptr: torch.Tensor | None
+    paged_kv_indices: torch.Tensor | None
+    paged_kv_last_page_len: torch.Tensor | None
     paged_attention_tiling_data: torch.Tensor | None
     kv_seq_lens_host: torch.Tensor | None
     kv_seq_lens_host_values: list[int] | None
@@ -57,9 +59,6 @@ def resolve_expanded_decode_metadata(
     required = {
         "kv_seq_lens": expanded.kv_seq_lens,
         "block_table": expanded.block_table,
-        "paged_kv_indptr": expanded.paged_kv_indptr,
-        "paged_kv_indices": expanded.paged_kv_indices,
-        "paged_kv_last_page_len": expanded.paged_kv_last_page_len,
     }
     missing = [name for name, tensor in required.items() if tensor is None]
     if missing:
@@ -98,8 +97,9 @@ def _validate_expanded_decode_metadata(
         raise RuntimeError("expanded decode slot_mapping must contain one slot per token")
     per_sequence_tensors = (
         ("kv_seq_lens", metadata.kv_seq_lens),
-        ("paged_kv_last_page_len", metadata.paged_kv_last_page_len),
     )
+    if metadata.paged_kv_last_page_len is not None:
+        per_sequence_tensors += (("paged_kv_last_page_len", metadata.paged_kv_last_page_len),)
     if metadata.kv_seq_lens_host is not None:
         per_sequence_tensors += (("kv_seq_lens_host", metadata.kv_seq_lens_host),)
     for name, tensor in per_sequence_tensors:
@@ -107,14 +107,20 @@ def _validate_expanded_decode_metadata(
             raise RuntimeError(f"expanded decode {name} must contain one value per sequence")
     if metadata.kv_seq_lens_host_values is not None and len(metadata.kv_seq_lens_host_values) != sequence_count:
         raise RuntimeError("expanded decode kv_seq_lens_host_values must contain one value per sequence")
-    if metadata.paged_kv_indptr.dim() != 1 or metadata.paged_kv_indptr.numel() != sequence_count + 1:
-        raise RuntimeError(
-            "expanded decode paged_kv_indptr must contain one offset per sequence plus the terminal offset"
-        )
-    if metadata.paged_kv_indices.dim() != 1 or metadata.paged_kv_indices.numel() == 0:
-        raise RuntimeError("expanded decode paged_kv_indices must be a non-empty flat page list")
+    # The row-scoped paged fields are optional: the decode-graph runner
+    # derives them on-device when the C++ packing did not provide them
+    # (python-executor spec-verify path; mirrors PR #2199).
+    if metadata.paged_kv_indptr is not None or metadata.paged_kv_indices is not None:
+        if metadata.paged_kv_indptr is None or metadata.paged_kv_indices is None:
+            raise RuntimeError("expanded decode paged fields must be provided together")
+        if metadata.paged_kv_indptr.dim() != 1 or metadata.paged_kv_indptr.numel() != sequence_count + 1:
+            raise RuntimeError(
+                "expanded decode paged_kv_indptr must contain one offset per sequence plus the terminal offset"
+            )
+        if metadata.paged_kv_indices.dim() != 1 or metadata.paged_kv_indices.numel() == 0:
+            raise RuntimeError("expanded decode paged_kv_indices must be a non-empty flat page list")
 
-    if metadata.paged_kv_indptr.device.type == "cpu":
+    if metadata.paged_kv_indptr is not None and metadata.paged_kv_indptr.device.type == "cpu":
         indptr = metadata.paged_kv_indptr
         if int(indptr[0]) != 0:
             raise RuntimeError("expanded decode paged_kv_indptr must start at zero")
@@ -122,7 +128,7 @@ def _validate_expanded_decode_metadata(
             raise RuntimeError("expanded decode paged_kv_indptr must be monotonic")
         if int(indptr[-1]) != metadata.paged_kv_indices.numel():
             raise RuntimeError("expanded decode terminal page offset must match page count")
-    if metadata.paged_kv_last_page_len.device.type == "cpu":
+    if metadata.paged_kv_last_page_len is not None and metadata.paged_kv_last_page_len.device.type == "cpu":
         last_page_lens = metadata.paged_kv_last_page_len
         if not bool(torch.all(last_page_lens >= 1)):
             raise RuntimeError("expanded decode last-page lengths must be positive")

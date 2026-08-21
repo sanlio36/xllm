@@ -32,6 +32,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+import time
+
 import torch
 import torch.nn as nn
 
@@ -74,6 +77,11 @@ class _StaticAttentionMetadata:
     has_initial_state: torch.Tensor | None = None
     dp_token_counts: tuple[int, ...] = ()
     q_seq_lens: torch.Tensor | None = None
+    # Host-side copy of the (per-entry constant) q_cu for prepare()'s
+    # sequence-lens read: a .cpu() on the device buffer would block the host
+    # until the whole prior step's device queue drains, serializing the
+    # scheduler behind the replay.
+    q_cu_host_values: list[int] | None = None
     expanded_decode_metadata: ExpandedDecodeMetadata | None = None
     is_prefill: bool = False
     is_chunked_prefill: bool = False
@@ -82,6 +90,7 @@ class _StaticAttentionMetadata:
 class _DecodeGraphEntry:
     __slots__ = (
         "batch_size",
+        "spec_width",
         "graph",
         "static_output",
         "static_input_ids",
@@ -139,13 +148,45 @@ class DecodeAclGraphRunner(BaseRunner):
             return False
         batch_size = input_ids.numel()
         bucket_size = _decode_bucket(batch_size)
-        is_expanded_spec_verify = resolve_expanded_decode_metadata(metadata) is not None
-        return (
+        is_expanded_spec_verify = (
+            resolve_expanded_decode_metadata(metadata) is not None
+            or self._is_untyped_spec_verify(metadata)
+        )
+        # Debug isolation switch: force spec-verify batches through the eager
+        # runner while keeping the chunked-typed (expanded) layout, to A/B the
+        # typed-eager semantics against the graph capture/replay path.
+        if (is_expanded_spec_verify
+                and os.environ.get("XLLM_NO_VERIFY_GRAPH") == "1"):
+            return False
+        ok = (
             ((not metadata.is_prefill and not metadata.is_chunked_prefill) or is_expanded_spec_verify)
             and self._has_compatible_decode_metadata(input_ids, metadata)
             and (input_embedding is None or input_embedding.shape[0] == batch_size)
             and bucket_size <= self.max_batch
         )
+        if not ok and os.environ.get("XLLM_GRAPH_DEBUG_REJECT") == "1":
+            reason = []
+            if metadata.is_prefill or metadata.is_chunked_prefill:
+                if not is_expanded_spec_verify:
+                    reason.append("prefill-typed")
+            if input_embedding is not None and input_embedding.shape[0] != batch_size:
+                reason.append("embedding-mismatch")
+            if bucket_size > self.max_batch:
+                reason.append("bucket-overflow")
+            if not reason:
+                reason.append("metadata-incompatible")
+            with open("/tmp/graph_reject.log", "a") as fh:
+                fh.write(
+                    f"pid={os.getpid()} bs={batch_size} "
+                    f"expanded={is_expanded_spec_verify} "
+                    f"prefill={metadata.is_prefill} "
+                    f"chunked={metadata.is_chunked_prefill} "
+                    f"kv={None if metadata.kv_seq_lens is None else tuple(metadata.kv_seq_lens.shape)} "
+                    f"bt={None if metadata.block_table is None else tuple(metadata.block_table.shape)} "
+                    f"qcu={None if metadata.q_cu_seq_lens is None else metadata.q_cu_seq_lens.numel()} "
+                    f"lsi={None if getattr(metadata, 'linear_state_indices', None) is None else getattr(metadata, 'linear_state_indices', None).numel()} "
+                    f"reason={reason[-1]}\n")
+        return ok
 
     def _decode_metadata(
         self, metadata: AttentionMetadata
@@ -158,7 +199,7 @@ class DecodeAclGraphRunner(BaseRunner):
         torch.Tensor,
     ]:
         """Return per-row KV and paging metadata for decode graph replay."""
-        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
+        expanded = self._expanded_verify_view(metadata)
         block_table = expanded.block_table if expanded is not None else metadata.block_table
         kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
         kv_seq_lens_host_values = (
@@ -185,7 +226,20 @@ class DecodeAclGraphRunner(BaseRunner):
             expanded.paged_kv_last_page_len if expanded is not None else metadata.paged_kv_last_page_len
         )
         if paged_kv_indptr is None or paged_kv_indices is None or paged_kv_last_page_len is None:
-            raise RuntimeError("decode graph requires paged KV metadata")
+            if expanded is None:
+                raise RuntimeError("decode graph requires paged KV metadata")
+            # Python-executor spec-verify packing provides the expanded kv
+            # lens / block tables but not the row-scoped paged metadata (the
+            # C++ graph executor derives it in acl_graph_persistent_param).
+            # Build it on-device like the C++ graph input builder.
+            (
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+            ) = self._build_row_aligned_paged_kv_metadata(
+                block_table,
+                kv_seq_lens,
+            )
         self._validate_decode_metadata_shapes(
             block_table,
             kv_seq_lens,
@@ -201,6 +255,117 @@ class DecodeAclGraphRunner(BaseRunner):
             paged_kv_indptr,
             paged_kv_indices,
             paged_kv_last_page_len,
+        )
+
+    @staticmethod
+    def _is_untyped_spec_verify(metadata: AttentionMetadata) -> bool:
+        """Shape-only detector for a GENERIC-flow MTP verify batch.
+
+        The untyped (GENERIC) spec-verify batch carries one row per token —
+        kv_seq_lens / q_cu_seq_lens / slot_mapping / block_table are all
+        per-row — while linear_state_indices stays per logical sequence with
+        a fixed verify width > 1 rows per sequence. Pure shape math — no
+        device->host sync.
+        """
+        kv = metadata.kv_seq_lens
+        bt = metadata.block_table
+        q_cu = metadata.q_cu_seq_lens
+        lsi = getattr(metadata, "linear_state_indices", None)
+        if kv is None or bt is None or bt.dim() != 2 or kv.dim() != 1:
+            return False
+        if lsi is None or lsi.dim() != 1:
+            return False
+        rows = kv.shape[0]
+        seqs = lsi.shape[0]
+        if bt.shape[0] != rows or seqs <= 0 or rows <= seqs or rows % seqs != 0:
+            return False
+        if q_cu is not None and q_cu.numel() != rows + 1:
+            return False
+        return not (metadata.is_prefill or metadata.is_chunked_prefill)
+
+    def _expanded_verify_view(
+        self, metadata: AttentionMetadata
+    ) -> ExpandedDecodeMetadata | None:
+        """Resolve the expanded (token-row) view of a spec-verify batch.
+
+        Chunked-typed flows (Qwen3.5) carry the expanded metadata from C++;
+        a GENERIC-flow MTP verify batch (e.g. GLM5-next KDA) instead arrives
+        decode-typed with per-row kv lens and per-sequence block tables.
+        Synthesize the token-row expanded view for the latter — block table
+        rows duplicated per verify row, row-scoped paging built on-device —
+        so the same graph machinery captures both.
+        """
+        expanded = resolve_expanded_decode_metadata(
+            metadata, block_size=self.attention_backend.page_size)
+        if expanded is not None:
+            return expanded
+        if not self._is_untyped_spec_verify(metadata):
+            return None
+        kv_rows = metadata.kv_seq_lens.to(torch.int32)
+        block_table_rows = metadata.block_table.to(torch.int32).contiguous()
+        host_values = getattr(metadata, "kv_seq_lens_host_values", None)
+        (
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+        ) = self._build_row_aligned_paged_kv_metadata(
+            block_table_rows,
+            kv_rows,
+        )
+        synthesized = ExpandedDecodeMetadata(
+            kv_seq_lens=kv_rows,
+            block_table=block_table_rows,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            paged_attention_tiling_data=None,
+            kv_seq_lens_host=None,
+            kv_seq_lens_host_values=host_values,
+        )
+        return synthesized
+
+    def _build_row_aligned_paged_kv_metadata(
+        self,
+        block_table: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build token-row paging metadata like the C++ graph input builder."""
+        page_size = int(self.attention_backend.page_size)
+        if page_size <= 0:
+            raise RuntimeError("decode graph page size must be positive")
+
+        effective_kv_seq_lens = torch.clamp(kv_seq_lens, min=1)
+        page_counts = torch.div(
+            effective_kv_seq_lens + page_size - 1,
+            page_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+        paged_kv_indptr = torch.cat(
+            (
+                torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=block_table.device,
+                ),
+                torch.cumsum(page_counts, dim=0, dtype=torch.int32),
+            )
+        )
+        page_offsets = torch.arange(
+            block_table.shape[1],
+            dtype=torch.int32,
+            device=block_table.device,
+        )
+        valid_pages = page_offsets.unsqueeze(0) < page_counts.unsqueeze(1)
+        paged_kv_indices = block_table.to(torch.int32).masked_select(
+            valid_pages
+        ).contiguous()
+        paged_kv_last_page_len = (
+            (effective_kv_seq_lens - 1) % page_size + 1
+        ).to(torch.int32)
+        return (
+            paged_kv_indptr.contiguous(),
+            paged_kv_indices,
+            paged_kv_last_page_len.contiguous(),
         )
 
     @staticmethod
@@ -267,7 +432,10 @@ class DecodeAclGraphRunner(BaseRunner):
         except (RuntimeError, ValueError):
             return False
         batch_size = input_ids.numel()
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        is_expanded = (
+            resolve_expanded_decode_metadata(metadata) is not None
+            or self._is_untyped_spec_verify(metadata)
+        )
         if not is_expanded and metadata.kv_cu_seq_lens is not None:
             if metadata.kv_cu_seq_lens.numel() not in (
                 batch_size,
@@ -282,13 +450,21 @@ class DecodeAclGraphRunner(BaseRunner):
                 return False
         # Linear-attention (KDA) layers read per-sequence conv/ssm state via
         # linear_state_indices; without it the captured graph would index
-        # state slots with a None buffer.
+        # state slots with a None buffer. A spec-verify batch may carry one
+        # slot id per logical sequence (GENERIC flow) — the fill expands it
+        # per token row.
         needs_linear_state = any(
             getattr(cache, "conv", None) is not None for cache in self.layer_caches
         )
         if needs_linear_state:
             linear_idx = getattr(metadata, "linear_state_indices", None)
-            if linear_idx is None or linear_idx.numel() != batch_size:
+            if linear_idx is None:
+                return False
+            if linear_idx.numel() != batch_size and not (
+                is_expanded
+                and batch_size % linear_idx.numel() == 0
+                and linear_idx.numel() > 0
+            ):
                 return False
         # The kPool indexer's graph gather densifies each sequence to a
         # static max_kv (graph_index_history_max_kv). A sequence whose block
@@ -412,6 +588,8 @@ class DecodeAclGraphRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = input_ids.shape[0]
+        if os.environ.get("XLLM_GRAPH_REPLAY_TIMING") == "1":
+            self._replay_t0 = time.perf_counter()
         padded_batch_size = _decode_bucket(batch_size)
         if padded_batch_size > self.max_batch:
             raise ValueError("decode batch exceeds ACL graph capacity")
@@ -454,6 +632,31 @@ class DecodeAclGraphRunner(BaseRunner):
         with torch.npu.stream(self._stream):
             entry.graph.replay()
             output = entry.static_output[:batch_size]
+        if os.environ.get("XLLM_GRAPH_REPLAY_TIMING") == "1":
+            torch.npu.synchronize()
+            t_end = time.perf_counter()
+            dt = (t_end - self._replay_t0) * 1000
+            tag = "exp" if is_expanded else "plain"
+            key = f"_replay_{tag}"
+            n = getattr(self, key + "_n", 0) + 1
+            tot = getattr(self, key + "_tot", 0.0) + dt
+            setattr(self, key + "_n", n)
+            setattr(self, key + "_tot", tot)
+            self._replay_ms_n = getattr(self, "_replay_ms_n", 0) + 1
+            # one-shot per-replay trace (first 40) to see what batch/key replays
+            if getattr(self, "_trace_n", 0) < 40:
+                self._trace_n = getattr(self, "_trace_n", 0) + 1
+                with open("/tmp/replay_trace.log", "a") as fh:
+                    fh.write(f"pid={os.getpid()} #{self._trace_n} "
+                             f"tag={tag} bs={batch_size} "
+                             f"padded={padded_batch_size} dt={dt:.1f}ms\n")
+            if self._replay_ms_n % 10 == 0:
+                with open("/tmp/replay_timing.log", "a") as fh:
+                    fh.write(
+                        f"pid={os.getpid()} n={self._replay_ms_n} "
+                        f"{tag}_last={dt:.1f}ms {tag}_avg={tot / n:.1f}ms "
+                        f"exp_n={getattr(self, '_replay_exp_n', 0)} "
+                        f"plain_n={getattr(self, '_replay_plain_n', 0)}\n")
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later
@@ -521,6 +724,7 @@ class DecodeAclGraphRunner(BaseRunner):
 
         entry = _DecodeGraphEntry()
         entry.batch_size = padded_batch_size
+        entry.spec_width = 1
         entry.graph = None
         entry.static_output = None
         entry.graph_tasks = []
@@ -564,12 +768,35 @@ class DecodeAclGraphRunner(BaseRunner):
                 padded_batch_size, dtype=torch.int32, device=device
             ),
         )
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
+        is_expanded = self._expanded_verify_view(metadata) is not None
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
         # The graph metadata update writes per-sequence KV lengths into this
         # buffer.  MLA/SFA consumes the same stable buffer as its key lengths.
         entry.static_metadata.kv_seq_lens = entry.kv_seq_lens_delta
         if is_expanded:
+            # Spec-verify rows per logical sequence: the static q_cu holds
+            # GROUP boundaries [0, w, 2w, ...] so the in-graph KDA verify
+            # grouping derives the sequence count without host syncs.
+            src_rows = (metadata.kv_seq_lens.shape[0]
+                        if metadata.kv_seq_lens is not None else 0)
+            src_lsi = getattr(metadata, "linear_state_indices", None)
+            src_seqs = src_lsi.shape[0] if src_lsi is not None else 0
+            if src_seqs > 0 and src_rows > src_seqs and src_rows % src_seqs == 0:
+                entry.spec_width = src_rows // src_seqs
+            w = max(1, entry.spec_width)
+            if padded_batch_size % w == 0:
+                # q_cu stays PER-ROW (the eager verify layout the attention
+                # backends consume); the per-SEQENCE group count rides on
+                # q_seq_lens (N entries of value w).
+                entry.static_metadata.q_cu_seq_lens = torch.arange(
+                    0, padded_batch_size + 1, 1,
+                    dtype=torch.int32, device=device)
+                entry.static_metadata.q_cu_host_values = list(
+                    range(padded_batch_size + 1))
+                entry.static_metadata.q_seq_lens = torch.full(
+                    (padded_batch_size // w,), w,
+                    dtype=torch.int32, device=device)
             entry.static_metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
                 kv_seq_lens=entry.kv_seq_lens_delta,
                 block_table=entry.static_metadata.block_table,
@@ -618,7 +845,7 @@ class DecodeAclGraphRunner(BaseRunner):
             metadata.slot_mapping,
             block_table.shape[0],
         )
-        is_expanded = resolve_expanded_decode_metadata(metadata) is not None
+        is_expanded = self._expanded_verify_view(metadata) is not None
         cumulative_kv_seq_lens = self._cumulative_lengths(
             kv_seq_lens,
             None if is_expanded else metadata.kv_cu_seq_lens,
@@ -680,11 +907,18 @@ class DecodeAclGraphRunner(BaseRunner):
         # KDA (linear-attention) static state slots.  Padded lanes point at
         # slot 0, which the linear-state block manager reserves as its padding
         # slot (block_manager_impl padding_block_), so their conv/ssm writes
-        # never touch a live sequence's state.
+        # never touch a live sequence's state.  A GENERIC-flow spec-verify
+        # batch carries one slot id per logical sequence: expand per row.
         if static_metadata.linear_state_indices is not None:
             src_idx = getattr(metadata, "linear_state_indices", None)
             if src_idx is not None:
-                static_metadata.linear_state_indices[:batch_size].copy_(src_idx[:batch_size])
+                if src_idx.numel() >= batch_size:
+                    static_metadata.linear_state_indices[:batch_size].copy_(
+                        src_idx[:batch_size])
+                else:
+                    width = batch_size // src_idx.numel()
+                    static_metadata.linear_state_indices[:batch_size].copy_(
+                        src_idx.repeat_interleave(width)[:batch_size])
             if padded_batch_size > batch_size:
                 static_metadata.linear_state_indices[batch_size:].zero_()
         if static_metadata.has_initial_state is not None:
@@ -741,6 +975,27 @@ class DecodeAclGraphRunner(BaseRunner):
         # would leave each sequence's recurrent state several steps ahead.
         # Snapshot the touched state slots and restore them after capture.
         linear_snapshot = self._snapshot_linear_state(entry)
+        # The spec-verify V2 stash (backend-owned persistent buffers) follows
+        # the same lifecycle: the warmup/capture runs consume and rewrite it,
+        # so restore the entry contents or the first replay would advance
+        # from a stash several steps stale.
+        v2_snapshot = None
+        v2_snap_fn = getattr(
+            self.attention_backend, "snapshot_kda_v2_state", None)
+        if (v2_snap_fn is not None
+                and entry.static_metadata.linear_state_indices is not None):
+            v2_snapshot = v2_snap_fn(
+                entry.static_metadata.linear_state_indices)
+        # V3 combined [base|draft] pools follow the same lifecycle (warmup
+        # + capture advance them); restore entry contents or the first replay
+        # resumes from a state several steps stale.
+        v3_snapshot = None
+        v3_snap_fn = getattr(
+            self.attention_backend, "snapshot_kda_v3_state", None)
+        if (v3_snap_fn is not None
+                and entry.static_metadata.linear_state_indices is not None):
+            v3_snapshot = v3_snap_fn(
+                entry.static_metadata.linear_state_indices)
         context = ForwardContext(
             self.attention_backend,
             self.device,
@@ -766,6 +1021,16 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_output = self._forward_static(entry)
         entry.graph_tasks = capture_context.tasks
         self._restore_linear_state(entry, linear_snapshot)
+        if v2_snapshot is not None:
+            restore_fn = getattr(
+                self.attention_backend, "restore_kda_v2_state", None)
+            if restore_fn is not None:
+                restore_fn(v2_snapshot)
+        if v3_snapshot is not None:
+            v3_restore_fn = getattr(
+                self.attention_backend, "restore_kda_v3_state", None)
+            if v3_restore_fn is not None:
+                v3_restore_fn(v3_snapshot)
 
     def _snapshot_linear_state(
         self, entry: _DecodeGraphEntry

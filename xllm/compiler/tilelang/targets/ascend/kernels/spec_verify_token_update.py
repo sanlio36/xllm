@@ -69,12 +69,14 @@ def build_spec_verify_token_update_kernel(spec_width: int):
                     persistent_tokens[output_offset + 1] = T.Cast(
                         "int32", draft_token_0[batch_idx]
                     )
-                    persistent_tokens[output_offset + 2] = T.Cast(
-                        "int32", draft_token_1[batch_idx]
-                    )
-                    persistent_tokens[output_offset + 3] = T.Cast(
-                        "int32", draft_token_2[batch_idx]
-                    )
+                    if spec_width >= 3:
+                        persistent_tokens[output_offset + 2] = T.Cast(
+                            "int32", draft_token_1[batch_idx]
+                        )
+                    if spec_width >= 4:
+                        persistent_tokens[output_offset + 3] = T.Cast(
+                            "int32", draft_token_2[batch_idx]
+                        )
                     if spec_width >= 5:
                         persistent_tokens[output_offset + 4] = T.Cast(
                             "int32", draft_token_3[batch_idx]

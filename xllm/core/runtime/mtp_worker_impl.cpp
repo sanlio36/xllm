@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
 
@@ -1116,6 +1118,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
 
 std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
+  const auto step_t0 = std::chrono::steady_clock::now();
   ForwardInput input = raw_input;
   if (use_chunked_prefill_spec_verify_path()) {
     stabilize_decode_host_tensors(input);
@@ -1385,7 +1388,21 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
-  return run_validate(input, draft_outputs, validate_input);
+  auto out = run_validate(input, draft_outputs, validate_input);
+  static std::atomic<int64_t> step_count{0};
+  static std::atomic<double> step_total_ms{0.0};
+  const double step_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - step_t0).count();
+  step_total_ms += step_ms;
+  const int64_t n = ++step_count;
+  if (n % 50 == 0) {
+    const char* env = std::getenv("GLM5_MTP_TIMING");
+    if (env != nullptr && std::string_view(env) == "1") {
+      LOG(INFO) << "[mtp-step] n=" << n << " last=" << step_ms << "ms "
+                << "avg=" << step_total_ms.load() / n << "ms";
+    }
+  }
+  return out;
 }
 
 void MTPWorkerImpl::fill_validate_input_from_draft_outputs(

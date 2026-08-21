@@ -17,7 +17,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 # 确定性计算开关：跨 run 复现 MTP vs 非 MTP 精度对比时必须开启
-export HCCL_DETERMINISTIC=true
+#export HCCL_DETERMINISTIC=true
 
 # MTP 精度修复：NPU reduce tiling 对 S=2 verify 批次与 S=1 decode 走不同路径，
 # 在 bf16 舍入边界翻转 1 ULP（首次 L34），经 45 层放大后翻转 argmax（长输出
@@ -96,19 +96,19 @@ nohup numactl -C $((DEVICE*CORES_PER_CARD))-$((DEVICE*CORES_PER_CARD+CORES_PER_C
 --node_rank="$i" \
 --communication_backend="$COMMUNICATION_BACKEND" \
 --max_memory_utilization=0.85 \
---enable_chunked_prefill=False \
---enable_schedule_overlap=False \
+--enable_chunked_prefill=True \
+--enable_schedule_overlap=True \
 --enable_prefix_cache=False \
 --max_tokens_per_chunk_for_prefill=8192 \
 --enable_mix_batch=False \
 --max_tokens_per_batch=10240 \
 --enable_shm=False \
---enable_graph=True \
---model_impl=python \
---backend=vlm \
 --draft_model=/export/home/models/GLM-next-w8a8-mtp \
 --num_speculative_tokens=1 \
 --speculative_algorithm=MTP \
+--enable_graph=True \
+--model_impl=python \
+--backend=vlm \
 --max_seqs_per_batch=16 \
 --max_body_size=268435456 \
 )
@@ -118,3 +118,9 @@ echo "启动节点 $i\(i，设备 npu:\) npu:$DEVICE，端口 $PORT，日志: $L
 done
 
 echo "所有节点已启动，主节点地址: $MASTER_NODE_ADDR"
+
+
+
+# --draft_model=/export/home/models/GLM-next-w8a8-mtp \
+# --num_speculative_tokens=1 \
+# --speculative_algorithm=MTP \

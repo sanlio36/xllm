@@ -23,12 +23,12 @@ import tilelang.language as T
 
 from scripts.logger import logger
 
-from compiler.tilelang.common.spec import (
+from ....common.spec import (
     DispatchField,
     TilelangKernel,
     register_kernel,
 )
-from compiler.tilelang.targets.ascend.kernels.utils import (
+from .utils import (
     detect_vec_core_num,
     mte2_notify_mte3,
     mte2_notify_v,

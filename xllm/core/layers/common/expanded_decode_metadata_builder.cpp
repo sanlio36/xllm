@@ -233,9 +233,15 @@ void ExpandedDecodeMetadataBuilder::validate(
 
   CHECK(metadata.kv_seq_lens.defined());
   CHECK(metadata.block_table.defined());
-  CHECK(metadata.paged_kv_indptr.defined());
-  CHECK(metadata.paged_kv_indices.defined());
-  CHECK(metadata.paged_kv_last_page_len.defined());
+  // The row-scoped paged metadata is OPTIONAL here: the python executor's
+  // spec-verify packing fills the expanded kv lens / block tables but not
+  // the row-scoped paged fields (only the C++ graph executor derives them
+  // in acl_graph_persistent_param). The python decode-graph runner builds
+  // them on-device from the block table + kv lens in that case
+  // (_build_row_aligned_paged_kv_metadata), so absence must not fatal.
+  const bool has_paged_metadata = metadata.paged_kv_indptr.defined();
+  CHECK_EQ(has_paged_metadata, metadata.paged_kv_indices.defined());
+  CHECK_EQ(has_paged_metadata, metadata.paged_kv_last_page_len.defined());
   CHECK_EQ(metadata.kv_seq_lens.dim(), 1);
   CHECK_EQ(metadata.block_table.dim(), 2);
   const int64_t sequence_count = metadata.kv_seq_lens.numel();
@@ -243,18 +249,20 @@ void ExpandedDecodeMetadataBuilder::validate(
     CHECK_EQ(sequence_count, expected_sequence_count);
   }
   CHECK_EQ(metadata.block_table.size(0), sequence_count);
-  CHECK_EQ(metadata.paged_kv_indptr.dim(), 1);
-  CHECK_EQ(metadata.paged_kv_indptr.numel(), sequence_count + 1);
-  CHECK_EQ(metadata.paged_kv_indices.dim(), 1);
-  CHECK_GT(metadata.paged_kv_indices.numel(), 0);
-  CHECK_EQ(metadata.paged_kv_last_page_len.dim(), 1);
-  CHECK_EQ(metadata.paged_kv_last_page_len.numel(), sequence_count);
+  if (has_paged_metadata) {
+    CHECK_EQ(metadata.paged_kv_indptr.dim(), 1);
+    CHECK_EQ(metadata.paged_kv_indptr.numel(), sequence_count + 1);
+    CHECK_EQ(metadata.paged_kv_indices.dim(), 1);
+    CHECK_GT(metadata.paged_kv_indices.numel(), 0);
+    CHECK_EQ(metadata.paged_kv_last_page_len.dim(), 1);
+    CHECK_EQ(metadata.paged_kv_last_page_len.numel(), sequence_count);
+  }
   if (metadata.kv_seq_lens_host.defined()) {
     CHECK(metadata.kv_seq_lens_host.device().is_cpu());
     CHECK_EQ(metadata.kv_seq_lens_host.dim(), 1);
     CHECK_EQ(metadata.kv_seq_lens_host.numel(), sequence_count);
   }
-  if (metadata.paged_kv_indptr.device().is_cpu()) {
+  if (has_paged_metadata && metadata.paged_kv_indptr.device().is_cpu()) {
     const torch::Tensor& host_indptr = metadata.paged_kv_indptr;
     CHECK_EQ(host_indptr[0].item<int32_t>(), 0);
     const int64_t offset_count = host_indptr.numel() - 1;
@@ -265,7 +273,7 @@ void ExpandedDecodeMetadataBuilder::validate(
     CHECK_EQ(host_indptr[host_indptr.numel() - 1].item<int32_t>(),
              metadata.paged_kv_indices.numel());
   }
-  if (metadata.paged_kv_last_page_len.device().is_cpu()) {
+  if (has_paged_metadata && metadata.paged_kv_last_page_len.device().is_cpu()) {
     const torch::Tensor& host_last_page_len = metadata.paged_kv_last_page_len;
     CHECK(torch::all(host_last_page_len >= 1).item<bool>());
     if (block_size > 0) {
