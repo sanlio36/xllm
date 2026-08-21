@@ -74,7 +74,12 @@ from xllm.python.model_executor.forward_context import (
 
 _has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
 from xllm.python.models.base import PyModelBase
-from xllm.python.models.glm5_next_kpool import pooled_states as _kpool_pooled_states
+from xllm.python.models.glm5_next_kpool import (
+    alloc_pool_cache,
+    compress_completed_pools,
+    pooled_states as _kpool_pooled_states,
+    read_pools,
+)
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.layers.embedding import HiddenParallelEmbedding
@@ -108,6 +113,10 @@ def _in_acl_graph() -> bool:
     return ctx is not None and (
         ctx.acl_graph is not None or ctx.execution_state is not None
     )
+
+
+# Paged pool cache: write-time incremental compression + direct pool read
+# (see glm5_next_kpool.py).
 
 
 def _capturing_acl_graph() -> bool:
@@ -946,6 +955,9 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, cfg.hidden_size, dtype=dtype, device=device)
         )
+        # Paged pool cache per DSA layer (lazily allocated on first eager
+        # forward, before graph capture): layer_id -> [blocks, bs//4, 1, D].
+        self._pool_caches: dict[int, torch.Tensor] = {}
 
     def get_token_visible(self, key_valid: torch.Tensor,
                          local_valid: torch.Tensor,
@@ -996,18 +1008,21 @@ class Glm5NextIndexer(nn.Module):
         # delegate to select_topk so both paths share one pooling/selection body.
         packed_states = self.get_packed_states(hidden_states, attention_mask)
         return self.select_topk(
-            q_resid, hidden_states, packed_states, attention_mask,
+            q_resid, hidden_states, attention_mask,
             kv_len=kv_len, current_length=kv_len,
+            packed_states=packed_states,
         )
 
     def select_topk(
         self,
         q_resid: torch.Tensor,
         hidden_states: torch.Tensor,
-        packed_states: torch.Tensor,
         attention_mask: torch.Tensor,
         kv_len: int,
         current_length: int,
+        packed_states: torch.Tensor | None = None,
+        pool_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Top-k pool selection over the FULL packed index history.
 
@@ -1015,21 +1030,33 @@ class Glm5NextIndexer(nn.Module):
         every kv token accumulated so far (the reference keeps this in the
         indexer cache and pools over the whole of it each step); ``q_resid`` /
         ``hidden_states`` are the CURRENT query tokens ``[B, S_q, ...]``.
-        Returns absolute kv-position top-k indices ``[B, S_q, topk]`` (int64,
-        -1 = invalid), matching the reference indexer output.
+        Alternatively, pass ``pool_data``/``key_valid`` from the paged pool
+        cache (read_pools) to skip both the dense gather and the per-step
+        re-pooling. Returns absolute kv-position top-k indices
+        ``[B, S_q, topk]`` (int64, -1 = invalid), matching the reference
+        indexer output.
         """
         batch_size, seq_len = q_resid.shape[:2]
         device = q_resid.device
 
         q = self.wq_b(q_resid).view(batch_size, seq_len, self.n_heads, self.head_dim)
 
-        key_valid = packed_states[..., -1].gt(0)
-        token_visible = self.get_token_visible(
-            key_valid, attention_mask, kv_len, seq_len, current_length
-        )
-        pool_keys, pool_indices, pool_valid = self.get_pooled_states(
-            packed_states, key_valid
-        )
+        if pool_data is not None:
+            # Pool-cache path: pools were compressed at write time; only the
+            # visibility mask is derived here (rows past each sequence's live
+            # length are invalid, mirroring gather_index_history's row_valid).
+            pool_keys, pool_indices, pool_valid = pool_data
+            token_visible = self.get_token_visible(
+                key_valid, attention_mask, kv_len, seq_len, current_length
+            )
+        else:
+            key_valid = packed_states[..., -1].gt(0)
+            token_visible = self.get_token_visible(
+                key_valid, attention_mask, kv_len, seq_len, current_length
+            )
+            pool_keys, pool_indices, pool_valid = self.get_pooled_states(
+                packed_states, key_valid
+            )
 
         scores = torch.matmul(
             q.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1)
@@ -1151,6 +1178,103 @@ class Glm5NextIndexer(nn.Module):
         if ctx.index_cache is not None and ctx.slot_mapping is not None:
             # kPool index cache is unquantized (no scale side-channel).
             ctx.update_index_cache(packed.reshape(num_tokens, -1), None)
+
+        pool_cache = None
+        if (
+            ctx.index_cache is not None
+            and ctx.block_table is not None
+            and ctx.slot_mapping is not None
+            and ctx.actual_seq_kv is not None
+        ):
+            pool_cache = self._pool_caches.get(layer.layer_id)
+            if pool_cache is None and not _in_acl_graph():
+                # Lazy alloc on the first eager forward (before capture);
+                # never allocate inside a capture.
+                pool_cache = alloc_pool_cache(ctx.index_cache)
+                self._pool_caches[layer.layer_id] = pool_cache
+                print(
+                    f"[kpool] layer {layer.layer_id}: pool cache "
+                    f"{tuple(pool_cache.shape)} "
+                    f"({pool_cache.numel() * 2 / 1024**3:.2f} GiB), "
+                    f"index cache {tuple(ctx.index_cache.shape)}"
+                )
+
+        if pool_cache is not None:
+            n_seqs = ctx.block_table.shape[0]
+            kv_lens_t = ctx.actual_seq_kv.reshape(-1).to(torch.int64)
+            pos_flat = positions.reshape(-1)
+            # ---- write path: compress pools completed by this step ----
+            if num_tokens == n_seqs:
+                # Decode (graph or eager): one token per sequence; static
+                # per-seq slices keep graph capture host-sync free.
+                for s in range(n_seqs):
+                    compress_completed_pools(
+                        ctx.index_cache, pool_cache, ctx.block_table[s:s + 1],
+                        pos_flat[s:s + 1], self.index_kpool_compress_ape,
+                        self.head_dim, self.index_kpool,
+                    )
+            else:
+                # Prefill chunk (eager): per-seq position slices from the
+                # host-side query lengths.
+                if n_seqs == 1:
+                    slices = [(0, num_tokens)]
+                else:
+                    q_lens_w = _current_q_seq_lens(n_seqs, num_tokens)
+                    starts = [0]
+                    for l in q_lens_w[:-1]:
+                        starts.append(starts[-1] + l)
+                    slices = list(zip(starts, q_lens_w))
+                for s, (lo, hi) in enumerate(slices):
+                    compress_completed_pools(
+                        ctx.index_cache, pool_cache, ctx.block_table[s:s + 1],
+                        pos_flat[lo:hi], self.index_kpool_compress_ape,
+                        self.head_dim, self.index_kpool,
+                    )
+
+            # ---- read path: direct pool read for decode ----
+            if num_tokens == n_seqs:
+                max_kv_cap = getattr(
+                    backend, "graph_index_history_max_kv", None
+                )
+                if not _in_acl_graph():
+                    max_kv = int(kv_lens_t.max().item())
+                elif max_kv_cap is not None:
+                    # Same static cap the dense gather used, so the graph
+                    # runner's eager-fallback condition stays consistent.
+                    page_size = ctx.index_cache.shape[1]
+                    max_kv = min(
+                        ctx.block_table.shape[1] * page_size, max_kv_cap
+                    )
+                else:
+                    # No static cap: cannot size the read without a host
+                    # sync; use the dense path for this step.
+                    max_kv = None
+                if max_kv is not None:
+                    n_pools = (max_kv + self.index_kpool - 1) // self.index_kpool
+                    pool_keys, pool_indices, pool_valid = read_pools(
+                        pool_cache, ctx.block_table, kv_lens_t,
+                        n_pools, self.index_kpool,
+                    )
+                    key_valid = (
+                        torch.arange(
+                            n_pools * self.index_kpool, device=pool_keys.device
+                        )[None, :]
+                        < kv_lens_t.reshape(-1, 1)
+                    )
+                    kv_len = n_pools * self.index_kpool
+                    qr_bsd = qr.view(n_seqs, 1, -1)
+                    hidden_bsd = hidden_states.view(n_seqs, 1, -1)
+                    mask_bsd = attention_mask.view(n_seqs, 1)
+                    topk_indices = self.select_topk(
+                        qr_bsd, hidden_bsd, mask_bsd,
+                        kv_len=kv_len, current_length=kv_len,
+                        pool_data=(pool_keys, pool_indices, pool_valid),
+                        key_valid=key_valid,
+                    )
+                    return (
+                        topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
+                    )
+
         packed_history = backend.gather_index_history(layer, batch_size)
         num_seqs = packed_history.shape[0]
         if num_seqs == 1:
@@ -1198,8 +1322,9 @@ class Glm5NextIndexer(nn.Module):
             )
         kv_len = packed_history.shape[1]
         topk_indices = self.select_topk(
-            qr_bsd, hidden_bsd, packed_history, mask_bsd,
+            qr_bsd, hidden_bsd, mask_bsd,
             kv_len=kv_len, current_length=kv_len,
+            packed_states=packed_history,
         )
         if is_varlen:
             topk_indices = topk_indices[valid]
