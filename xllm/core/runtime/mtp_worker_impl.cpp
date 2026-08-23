@@ -1272,6 +1272,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   const bool use_device_target_context =
       can_use_combined_first_draft() && matching_device_target_context &&
       device_target_context_ready_for_batch(input);
+  // A matching GLM draft-0 already owns the accepted target state and waits on
+  // its publication event on device. Keep that state pending until all drafts
+  // have been queued; flushing it here would block the worker behind target
+  // validation and leave only draft-0 prelaunched.
+  const bool defer_target_context_materialization =
+      use_prelaunched_first_draft && matching_device_target_context &&
+      combined_draft_execution_path_ ==
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
   // Keep the device-side accepted state alive across a first-transition Host
   // cache flush. The prelaunched draft can be valid before the batch is marked
   // device-context ready, while flush_pending_target_context() clears the
@@ -1295,7 +1303,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                      << ret;
     pending_draft_context_ = PendingDraftContext();
   }
-  if (!use_device_target_context) {
+  const auto mark_device_target_context_ready = [&]() {
+    device_context_ready_embedding_ids_ =
+        input.input_params.embedding.embedding_ids;
+    device_context_ready_request_ids_ =
+        input.input_params.embedding.request_ids;
+    device_context_ready_batch_generations_ =
+        input.input_params.parallel.dp_global_batch_generations;
+  };
+  if (!use_device_target_context && !defer_target_context_materialization) {
     // Batch transitions are uncommon in steady decode.  Materialize the most
     // recent target state only for that fallback; the normal path below never
     // synchronizes the worker thread with the NPU.
@@ -1304,12 +1320,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       // The first target-context publication for a new batch establishes the
       // scheduler's corrected position/KV base. Subsequent publications can
       // derive that base fully on device without waiting for the scheduler.
-      device_context_ready_embedding_ids_ =
-          input.input_params.embedding.embedding_ids;
-      device_context_ready_request_ids_ =
-          input.input_params.embedding.request_ids;
-      device_context_ready_batch_generations_ =
-          input.input_params.parallel.dp_global_batch_generations;
+      mark_device_target_context_ready();
     } else if (!device_target_context_ready_for_batch(input)) {
       device_context_ready_embedding_ids_.clear();
       device_context_ready_request_ids_.clear();
@@ -1488,6 +1499,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
 
   const auto materialize_pending_target_host_state = [&]() {
     flush_pending_target_context();
+    if (matching_device_target_context) {
+      // Publish readiness only after the accepted state has reached its owned
+      // host cache slot. This preserves the transition-step correctness guard
+      // while allowing its matching drafts to be submitted before the wait.
+      mark_device_target_context_ready();
+    }
     std::vector<EmbeddingCache::DecodeState> resolved_states =
         embedding_cache_->read_decode_states(
             input.input_params.embedding.embedding_ids,
