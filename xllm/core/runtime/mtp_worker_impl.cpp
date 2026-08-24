@@ -2418,13 +2418,35 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
   if (combined_draft_execution_path_ ==
           mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION &&
       !prelaunch_positions_fit_block_table(input)) {
+    LOG_FIRST_N(WARNING, 4)
+        << "GLM MTP prelaunch fallback: speculative positions exceed the "
+           "allocated block-table capacity."
+        << " dp_global_kv_max_seq_lens="
+        << input.input_params.parallel.dp_global_kv_max_seq_lens
+        << ", block_size=" << options_.block_size()
+        << ", speculative_tokens=" << options_.num_speculative_tokens();
     return false;
   }
   if (requires_dp_symmetric_prelaunch) {
-    return has_active_dp_tokens(input) &&
-           !input.input_params.parallel.dp_global_batch_generations.empty() &&
-           validated_dp_batch_generations_ ==
-               input.input_params.parallel.dp_global_batch_generations;
+    const bool has_active_tokens = has_active_dp_tokens(input);
+    const bool has_batch_generations =
+        !input.input_params.parallel.dp_global_batch_generations.empty();
+    const bool batch_generation_validated =
+        has_batch_generations &&
+        validated_dp_batch_generations_ ==
+            input.input_params.parallel.dp_global_batch_generations;
+    if (!has_active_tokens || !batch_generation_validated) {
+      LOG_FIRST_N(WARNING, 4)
+          << "GLM MTP DP prelaunch fallback: current DP batch is not "
+             "eligible for symmetric prelaunch."
+          << " has_active_tokens=" << has_active_tokens
+          << ", has_batch_generations=" << has_batch_generations
+          << ", batch_generation_validated=" << batch_generation_validated
+          << ", input_generations="
+          << input.input_params.parallel.dp_global_batch_generations
+          << ", validated_generations=" << validated_dp_batch_generations_;
+    }
+    return has_active_tokens && batch_generation_validated;
   }
   return device_target_context_ready_for_batch(input);
 }
