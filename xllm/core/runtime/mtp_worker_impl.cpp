@@ -143,6 +143,32 @@ int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
   return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
 }
 
+// A mixed DP step is dispatched through the common prefill fallback so every
+// DP shard follows the same collective order.  Decode shards can still carry
+// schedule-overlap placeholders (-1, -2, ...), while prefill shards carry the
+// real prompt.  Only the former may use the speculative decode row builder.
+bool is_local_decode_in_mixed_dp_step(const ModelInputParams& params,
+                                      const ParallelArgs& parallel_args) {
+  const auto& dp_is_decode = params.parallel.dp_is_decode;
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t world_size = std::max<int64_t>(parallel_args.world_size(), 1);
+  if (dp_size <= 1 || dp_is_decode.size() != static_cast<size_t>(dp_size) ||
+      world_size % dp_size != 0) {
+    return false;
+  }
+  const int64_t decode_count =
+      std::count(dp_is_decode.begin(), dp_is_decode.end(), 1);
+  if (decode_count == 0 || decode_count == dp_size) {
+    return false;
+  }
+  const int64_t ranks_per_dp = world_size / dp_size;
+  const int64_t dp_rank = parallel_args.rank() / ranks_per_dp;
+  if (dp_rank < 0 || dp_rank >= dp_size) {
+    return false;
+  }
+  return dp_is_decode[static_cast<size_t>(dp_rank)] == 1;
+}
+
 KVCacheEstimateOptions make_kv_cache_estimate_options(
     const ModelArgs& model_args,
     const runtime::Options& options,
@@ -951,6 +977,17 @@ bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
 
 ForwardInput MTPWorkerImpl::update_input_by_last_step_output(
     ForwardInput& inputs) {
+  // In a mixed DP step, SpeculativeWorkerImpl::step() deliberately chooses
+  // step_prefill() on every rank to preserve collective ordering.  Resolve
+  // overlap placeholders only on local decode shards before that fallback;
+  // applying the decode builder to a prefill shard would discard its prompt.
+  const ModelInputParams& params = inputs.input_params;
+  if (params.meta.num_sequences > 0 &&
+      params.meta.batch_forward_type.is_decode() &&
+      !should_run_speculative_decode(params) &&
+      is_local_decode_in_mixed_dp_step(params, parallel_args_)) {
+    return SpeculativeWorkerImpl::update_input_by_last_step_output(inputs);
+  }
   return inputs;
 }
 
@@ -1058,7 +1095,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     clear_all_output_embeddings(output);
     finalize_output_on_stream(
         output, *compute_stream_, enable_schedule_overlap());
-    if (can_prelaunch_next_first_draft(input)) {
+    const bool prelaunch_next_first_draft =
+        can_prelaunch_next_first_draft(input);
+    if (prelaunch_next_first_draft) {
       ForwardInput next_first_draft_input = input;
       for (int32_t& token_num :
            next_first_draft_input.input_params.parallel.dp_global_token_nums) {
@@ -1070,6 +1109,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       }
       submit_pending_first_draft(input, std::move(next_first_draft_input));
     }
+    // Empty DP ranks do not stage a target context. Publish the generation
+    // after this turn's decision so they skip exactly the same first turn as
+    // the active rank, then join subsequent symmetric prelaunches.
+    mark_dp_batch_validated_for_prelaunch(input);
     return output;
   }
 }
@@ -1265,9 +1308,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
           input.input_params.embedding.embedding_ids;
       device_context_ready_request_ids_ =
           input.input_params.embedding.request_ids;
+      device_context_ready_batch_generations_ =
+          input.input_params.parallel.dp_global_batch_generations;
     } else if (!device_target_context_ready_for_batch(input)) {
       device_context_ready_embedding_ids_.clear();
       device_context_ready_request_ids_.clear();
+      device_context_ready_batch_generations_.clear();
     }
   }
   // Adaptive is enabled only after profile completes (registry has predictor),
@@ -2159,6 +2205,8 @@ void MTPWorkerImpl::stage_target_context_write(
       input.input_params.embedding.embedding_ids;
   pending_target_context_.request_ids =
       input.input_params.embedding.request_ids;
+  pending_target_context_.dp_global_batch_generations =
+      input.input_params.parallel.dp_global_batch_generations;
   pending_target_context_.accepted_tokens = validate_output.next_tokens;
   pending_target_context_.accepted_tokens_host =
       std::move(accepted_tokens_host);
@@ -2166,6 +2214,17 @@ void MTPWorkerImpl::stage_target_context_write(
   pending_target_context_.base_positions = std::move(base_positions);
   pending_target_context_.base_kv_seq_lens = std::move(base_kv_seq_lens);
   pending_target_context_.ready_event = std::move(ready_event);
+  mark_dp_batch_validated_for_prelaunch(input);
+}
+
+void MTPWorkerImpl::mark_dp_batch_validated_for_prelaunch(
+    const ForwardInput& input) {
+  if (parallel_args_.dp_size() > 1 &&
+      combined_draft_execution_path_ ==
+          mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION) {
+    validated_dp_batch_generations_ =
+        input.input_params.parallel.dp_global_batch_generations;
+  }
 }
 
 torch::Tensor MTPWorkerImpl::acquire_accepted_tokens_host_buffer(
@@ -2202,7 +2261,9 @@ bool MTPWorkerImpl::pending_target_context_matches(
          pending_target_context_.embedding_ids ==
              input.input_params.embedding.embedding_ids &&
          pending_target_context_.request_ids ==
-             input.input_params.embedding.request_ids;
+             input.input_params.embedding.request_ids &&
+         pending_target_context_.dp_global_batch_generations ==
+             input.input_params.parallel.dp_global_batch_generations;
 }
 
 bool MTPWorkerImpl::device_target_context_ready_for_batch(
@@ -2210,7 +2271,9 @@ bool MTPWorkerImpl::device_target_context_ready_for_batch(
   return device_context_ready_embedding_ids_ ==
              input.input_params.embedding.embedding_ids &&
          device_context_ready_request_ids_ ==
-             input.input_params.embedding.request_ids;
+             input.input_params.embedding.request_ids &&
+         device_context_ready_batch_generations_ ==
+             input.input_params.parallel.dp_global_batch_generations;
 }
 
 void MTPWorkerImpl::flush_pending_target_context() {
@@ -2341,7 +2404,10 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
     return false;
   }
   if (requires_dp_symmetric_prelaunch) {
-    return has_active_dp_tokens(input);
+    return has_active_dp_tokens(input) &&
+           !input.input_params.parallel.dp_global_batch_generations.empty() &&
+           validated_dp_batch_generations_ ==
+               input.input_params.parallel.dp_global_batch_generations;
   }
   return device_target_context_ready_for_batch(input);
 }
@@ -2409,6 +2475,12 @@ void MTPWorkerImpl::enqueue_next_first_draft(
   wait_metadata_ready_event(combined_input, *compute_stream_);
   clear_ready_events(combined_input);
 
+  const bool is_glm_moe_dsa_prelaunch =
+      combined_draft_execution_path_ ==
+      mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+  const bool rebuild_prelaunch_metadata =
+      is_glm_moe_dsa_prelaunch && !prelaunch_metadata_batch_matches(input);
+
   // Interleave [repair, current] rows in one decode batch. Every transformer
   // layer projects both rows, writes both KV rows, and only then launches
   // PagedAttention. Same-stream ordering therefore makes repair KV visible to
@@ -2422,10 +2494,21 @@ void MTPWorkerImpl::enqueue_next_first_draft(
       base_positions,
       base_kv_seq_lens,
       /*use_chunked_prefill=*/false,
-      /*rebuild_expanded_decode_metadata=*/false,
+      rebuild_prelaunch_metadata,
       options_.block_size());
 
   submit_pending_first_draft(input, std::move(combined_input));
+  if (rebuild_prelaunch_metadata) {
+    prelaunch_metadata_embedding_ids_ =
+        input.input_params.embedding.embedding_ids;
+    prelaunch_metadata_request_ids_ = input.input_params.embedding.request_ids;
+    prelaunch_metadata_dp_global_token_nums_ =
+        input.input_params.parallel.dp_global_token_nums;
+    prelaunch_metadata_raw_dp_global_token_nums_ =
+        input.input_params.parallel.raw_dp_global_token_nums;
+    prelaunch_metadata_batch_generations_ =
+        input.input_params.parallel.dp_global_batch_generations;
+  }
 }
 
 void MTPWorkerImpl::submit_pending_first_draft(
@@ -2465,6 +2548,20 @@ bool MTPWorkerImpl::pending_draft_context_matches(
          pending_draft_context_.raw_dp_global_token_nums ==
              input.input_params.parallel.raw_dp_global_token_nums &&
          pending_draft_context_.dp_global_batch_generations ==
+             input.input_params.parallel.dp_global_batch_generations;
+}
+
+bool MTPWorkerImpl::prelaunch_metadata_batch_matches(
+    const ForwardInput& input) const {
+  return prelaunch_metadata_embedding_ids_ ==
+             input.input_params.embedding.embedding_ids &&
+         prelaunch_metadata_request_ids_ ==
+             input.input_params.embedding.request_ids &&
+         prelaunch_metadata_dp_global_token_nums_ ==
+             input.input_params.parallel.dp_global_token_nums &&
+         prelaunch_metadata_raw_dp_global_token_nums_ ==
+             input.input_params.parallel.raw_dp_global_token_nums &&
+         prelaunch_metadata_batch_generations_ ==
              input.input_params.parallel.dp_global_batch_generations;
 }
 
