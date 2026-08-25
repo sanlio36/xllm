@@ -1583,6 +1583,22 @@ class Glm5NextExperts(nn.Module):
         # atomicAdd. Accumulate each (token, topk-slot) expert contribution in a
         # fp32 [n_tokens, topk, hidden] buffer and sum the topk axis — stable
         # and matches the reference's eager path exactly.
+        #
+        # Two paths:
+        #  1) Graph-friendly: batched gather + bmm — fixed-shape ops that stay
+        #     compatible with ACL graph capture (no dynamic nonzero/torch.where).
+        #  2) Eager: per-expert loop with nonzero/torch.where — memory-efficient
+        #     for large n_tokens (prefill) where the batched gather would OOM.
+        ctx = get_forward_context_or_none()
+        if ctx is not None and ctx.acl_graph is not None:
+            return self._forward_graph_friendly(
+                hidden_states, top_k_index, top_k_weights)
+        return self._forward_eager(hidden_states, top_k_index, top_k_weights)
+
+    def _forward_eager(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
         n_tokens, topk = top_k_index.shape
         hidden = hidden_states.shape[-1]
         final_f32 = torch.zeros(
@@ -1604,6 +1620,57 @@ class Glm5NextExperts(nn.Module):
             current = F.linear(F.silu(gate) * up, self.down_proj[expert_idx])
             current = current * top_k_weights[token_idx, top_k_pos, None]
             final_f32[token_idx, top_k_pos] += current.float()
+        return final_f32.sum(1).to(hidden_states.dtype)
+
+    def _forward_graph_friendly(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fixed-shape batched expert dispatch for ACL graph capture.
+
+        Replaces the eager per-expert loop (nonzero → torch.where → F.linear)
+        with gather + bmm whose output shapes are static regardless of which
+        experts are selected.  This avoids ``aclnnNonzero`` -triggered stream
+        syncs that are illegal inside a captured stream.
+        """
+        n_tokens, topk = top_k_index.shape
+        hidden = hidden_states.shape[-1]
+        N = n_tokens * topk  # total number of token-expert assignments
+
+        flat_indices = top_k_index.flatten()  # [N]
+        flat_weights = top_k_weights.flatten()  # [N]
+
+        # Repeat each token's hidden state for every expert slot it has.
+        h = hidden_states.repeat_interleave(topk, dim=0)  # [N, hidden]
+
+        # Gather the expert weight slices for all assignments at once.
+        gate_up_w = self.gate_up_proj[flat_indices]  # [N, 2*inter_dim, hidden]
+        down_w = self.down_proj[flat_indices]        # [N, hidden, inter_dim]
+
+        # Batched gate + up projection.
+        # [N, 1, hidden] × [N, hidden, 2*inter_dim] → [N, 1, 2*inter_dim]
+        gate_up = torch.bmm(
+            h.unsqueeze(1), gate_up_w.transpose(1, 2),
+        ).squeeze(1)  # [N, 2*inter_dim]
+
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(min=None, max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+
+        # Batched down projection.
+        # [N, 1, inter_dim] × [N, inter_dim, hidden] → [N, 1, hidden]
+        current = torch.bmm(
+            (F.silu(gate) * up).unsqueeze(1), down_w.transpose(1, 2),
+        ).squeeze(1)  # [N, hidden]
+
+        # Apply router weights and accumulate in fp32 for determinism.
+        current = (current * flat_weights.unsqueeze(-1)).float()
+        current = current.view(n_tokens, topk, hidden)
+        final_f32 = torch.zeros(
+            n_tokens, topk, hidden, dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        final_f32 = final_f32 + current
         return final_f32.sum(1).to(hidden_states.dtype)
 
 
