@@ -76,7 +76,7 @@ KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
   const bool enable_linear_attention = has_linear_attention_layers(model_args);
   // A model may be BOTH linear-attention (KDA layers need conv/ssm caches)
   // AND have a lighting indexer (DSA layers need an index cache) — e.g.
-  // glm5_next. The three shape members are independent optionals, and
+  // glm5_3_flash. The three shape members are independent optionals, and
   // create_kv_cache_impl dispatches ONE impl per layer (LinearAttention /
   // Indexed / base), each reading only its own shape, so coexistence here
   // is harmless. The prior exclusivity CHECK guarded a non-problem.

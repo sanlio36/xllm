@@ -95,7 +95,7 @@ class JsonReader {
   }
 
   // Look up a key, falling back to the same key under a "text_config" subtree
-  // when the top-level lookup misses. Multimodal configs (e.g. glm5_next full
+  // when the top-level lookup misses. Multimodal configs (e.g. glm5_3_flash full
   // weights) nest the text-model fields under "text_config"; single-model
   // configs keep them flat. This lets model args loaders use the same flat key
   // ("num_hidden_layers") for both layouts.

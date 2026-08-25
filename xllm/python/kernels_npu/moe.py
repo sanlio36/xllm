@@ -137,7 +137,7 @@ def grouped_moe(
     num_tokens = hidden_states.shape[0]
     num_experts = gating_output.shape[1]
     expert_range = active_expert_range if active_expert_range is not None else [0, num_experts]
-    # W8A8 GMM v1 path (proven on real glm5_next w8a8 weights pre-graph-port).
+    # W8A8 GMM v1 path (proven on real glm5_3_flash w8a8 weights pre-graph-port).
     # The vllm-ascend-style v2 path (expert_tokens_num_type=0 +
     # npu_grouped_matmul_swiglu_quant_v2) diverges on these weights (L3.mlp
     # cos 0.879 vs the pre-port engine); keep v1 until the v2 NZ contract is

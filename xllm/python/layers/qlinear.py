@@ -109,7 +109,7 @@ class QLinearWeightLoader:
         self.tp_size = tp_size
         self.tp_rank = tp_rank
 
-    # expose the underlying helpers glm5_next's load_weights still needs directly
+    # expose the underlying helpers glm5_3_flash's load_weights still needs directly
     def find(self, name): return self._w8.find(name)
     def load_tensor(self, name): return self._w8.load_tensor(name)
     def shard(self, t, dim, world=None, rank=None): return self._w8.shard(t, dim, world, rank)

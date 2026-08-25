@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""glm5_next (model_type=glm5_next) causal LM — Python model executor target.
+"""glm5_3_flash (model_type=glm5_3_flash) causal LM — Python model executor target.
 
 Hybrid decoder: 3 of every 4 layers are KDA (Kimi Delta Attention) linear
 attention; the 4th is MLA full-attention driven by a DSA ``kPool`` sparse
 indexer. MLP is dense SwiGLU for the first ``first_k_dense_replace`` layers and
 DeepSeek-V2-style MoE (sigmoid + noaux_tc) thereafter. bf16 throughout, matching
-the patched HuggingFace ``Glm5NextForCausalLM`` reference for tensor alignment.
+the patched HuggingFace ``Glm53FlashForCausalLM`` reference for tensor alignment.
 
 This is a faithful pure-torch port of the transformers implementation
-(``transformers/src/transformers/models/glm5_next/modeling_glm5_next.py``) so
+(``transformers/src/transformers/models/glm5_3_flash/modeling_glm5_3_flash.py``) so
 that per-tensor alignment against the reference is exact (same ops, same fp32
 cast points, same eps, same interleaved RoPE, same scatter-based mask).
 
@@ -74,7 +74,7 @@ from xllm.python.model_executor.forward_context import (
 
 _has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
 from xllm.python.models.base import PyModelBase
-from xllm.python.models.glm5_next_kpool import (
+from xllm.python.models.glm5_3_flash_kpool import (
     alloc_pool_cache,
     compress_completed_pools,
     pooled_states as _kpool_pooled_states,
@@ -116,7 +116,7 @@ def _in_acl_graph() -> bool:
 
 
 # Paged pool cache: write-time incremental compression + direct pool read
-# (see glm5_next_kpool.py).
+# (see glm5_3_flash_kpool.py).
 
 
 def _capturing_acl_graph() -> bool:
@@ -126,7 +126,7 @@ def _capturing_acl_graph() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Small faithful helpers (mirror transformers modeling_glm5_next exactly).
+# Small faithful helpers (mirror transformers modeling_glm5_3_flash exactly).
 # ---------------------------------------------------------------------------
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """FLA-style l2norm: sqrt(sum(x^2)+eps) then divide (NOT F.normalize)."""
@@ -226,7 +226,7 @@ class _RMSNorm(nn.Module):
 
 
 class _UnweightedRMSNorm(nn.Module):
-    """Unweighted RMSNorm (transformers Glm5NextTextUnweightedRMSNorm).
+    """Unweighted RMSNorm (transformers Glm53FlashTextUnweightedRMSNorm).
 
     Used inside the mHC input projection: no weight parameter, just rescale by
     the fp32 RMS then cast back (input_norm in the reference HyperConnection).
@@ -251,7 +251,7 @@ class _UnweightedRMSNorm(nn.Module):
 
 
 class _RMSNormGated(nn.Module):
-    """RMSNorm + sigmoid gate (transformers Glm5NextRMSNormGated)."""
+    """RMSNorm + sigmoid gate (transformers Glm53FlashRMSNormGated)."""
 
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype,
                  device: torch.device) -> None:
@@ -536,10 +536,10 @@ def chunk_kda(
 # Config
 # ---------------------------------------------------------------------------
 @dataclass
-class Glm5NextConfig:
-    """glm5_next architecture parameters (transformers schema)."""
+class Glm53FlashConfig:
+    """glm5_3_flash architecture parameters (transformers schema)."""
 
-    model_type: str = "glm5_next"
+    model_type: str = "glm5_3_flash"
     hidden_size: int = 4096
     n_layers: int = 45
     n_heads: int = 64
@@ -601,7 +601,7 @@ class Glm5NextConfig:
         return self.qk_rope_head_dim + self.qk_nope_head_dim
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Glm5NextConfig":
+    def from_dict(cls, d: dict) -> "Glm53FlashConfig":
         # Multimodal full-weight configs nest text-model fields under
         # "text_config"; single-model configs are flat. Merge text_config into
         # the top level (without clobbering top-level overrides) so the flat
@@ -638,7 +638,7 @@ class Glm5NextConfig:
             lower_bound = -5.0
 
         cfg = cls(
-            model_type=str(pick("model_type", default="glm5_next")),
+            model_type=str(pick("model_type", default="glm5_3_flash")),
             hidden_size=hidden,
             n_layers=n_layers,
             n_heads=n_heads,
@@ -741,10 +741,10 @@ class Glm5NextConfig:
 # ---------------------------------------------------------------------------
 # KDA (Kimi Delta Attention) linear-attention layer
 # ---------------------------------------------------------------------------
-class Glm5NextForgetGate(nn.Module):
+class Glm53FlashForgetGate(nn.Module):
     """forget gate: g = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)."""
 
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.head_dim = cfg.kda_head_dim
@@ -768,7 +768,7 @@ class Glm5NextForgetGate(nn.Module):
         )
         decay_rate = torch.exp(self.A_log.float().view(1, 1, self.num_heads, 1))
 
-        # Safe lower bound decay (reference Glm5NextTextForgetGate): when a bound
+        # Safe lower bound decay (reference Glm53FlashTextForgetGate): when a bound
         # is set, the gate is `-bound * sigmoid(decay_rate * g)` instead of the
         # softplus form. For the default config linear_lower_bound=-5.0 -> this
         # branch is taken.
@@ -781,7 +781,7 @@ class Glm5NextForgetGate(nn.Module):
         return -decay_rate * g_softplus
 
 
-class Glm5NextKdaAttention(Attention):
+class Glm53FlashKdaAttention(Attention):
     """KDA linear-attention layer (conv1d + delta-rule + gated norm + o_proj).
 
     Subclasses xllm ``Attention`` (reports num_heads/head_dim/scale for the
@@ -797,7 +797,7 @@ class Glm5NextKdaAttention(Attention):
     ``GLM5NEXT_KDA_BACKEND=fla_npu``); see their docstrings.
     """
 
-    def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, layer_id: int, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__(
             num_heads=cfg.kda_num_heads, num_kv_heads=cfg.kda_num_heads,
@@ -845,7 +845,7 @@ class Glm5NextKdaAttention(Attention):
         self.conv1d.weight = nn.Parameter(
             self.conv1d.weight.detach().to(torch.float32)
         )
-        self.forget_gate = Glm5NextForgetGate(cfg, dtype, device)
+        self.forget_gate = Glm53FlashForgetGate(cfg, dtype, device)
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads_local, bias=False)
         self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
@@ -888,7 +888,7 @@ class Glm5NextKdaAttention(Attention):
         backend = getattr(ctx, "attention_backend", None) if ctx is not None else None
         if backend is None or getattr(backend, "execute_linear", None) is None:
             raise RuntimeError(
-                "Glm5NextKdaAttention requires an attention backend with "
+                "Glm53FlashKdaAttention requires an attention backend with "
                 "execute_linear; run inside the engine."
             )
         core_attn_out = backend.execute_linear(mixed_qkv, g, beta, self)
@@ -928,10 +928,10 @@ def _current_q_seq_lens(num_seqs: int, num_tokens: int) -> list[int]:
 # ---------------------------------------------------------------------------
 # kPool DSA indexer (assembled from small ops, faithful to transformers)
 # ---------------------------------------------------------------------------
-class Glm5NextIndexer(nn.Module):
+class Glm53FlashIndexer(nn.Module):
     """GlmMoeDsaRecomputeKPoolIndexer port: packed [k, gate, valid] cache."""
 
-    def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, layer_id: int, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1334,7 +1334,7 @@ class Glm5NextIndexer(nn.Module):
 # ---------------------------------------------------------------------------
 # MLA (absorbed, NoPE) + DSA sparse attention via the SFA op
 # ---------------------------------------------------------------------------
-class Glm5NextMlaAttention(Attention):
+class Glm53FlashMlaAttention(Attention):
     """Absorbed MLA (NoPE, qk_rope=0) + DSA sparse attention via SFA op.
 
     Mirrors ``DeepseekV3MlaAttention``'s forward: q_latent = bmm(q_nope,
@@ -1346,7 +1346,7 @@ class Glm5NextMlaAttention(Attention):
     q_pe/k_pe = None).
     """
 
-    def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, layer_id: int, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__(
             num_heads=cfg.n_heads, num_kv_heads=cfg.n_kv_heads,
@@ -1372,7 +1372,7 @@ class Glm5NextMlaAttention(Attention):
         self.scaling = self.qk_head_dim ** -0.5
         self.eps = cfg.rms_norm_eps
         shared = cfg.indexer_shared(layer_id)
-        self.indexer = None if shared else Glm5NextIndexer(cfg, layer_id, dtype, device)
+        self.indexer = None if shared else Glm53FlashIndexer(cfg, layer_id, dtype, device)
 
         dev, dt = device, dtype
         # q_a_proj: replicated (hidden -> q_lora)
@@ -1419,7 +1419,7 @@ class Glm5NextMlaAttention(Attention):
 
     def process_weights_after_loading(self) -> None:
         # Split kv_b_proj.weight into absorbed W_UK / W_UV (mirrors
-        # deepseek_v32.process_weights_after_loading split). glm5_next is NoPE
+        # deepseek_v32.process_weights_after_loading split). glm5_3_flash is NoPE
         # (qk_rope_head_dim=0), so qk_head_dim == qk_nope_head_dim.
         w = self.kv_b_proj.weight.data
         w = w.view(
@@ -1501,8 +1501,8 @@ class Glm5NextMlaAttention(Attention):
 # ---------------------------------------------------------------------------
 # MLP (dense + MoE)
 # ---------------------------------------------------------------------------
-class Glm5NextMLP(nn.Module):
-    def __init__(self, cfg: Glm5NextConfig, intermediate_size: int,
+class Glm53FlashMLP(nn.Module):
+    def __init__(self, cfg: Glm53FlashConfig, intermediate_size: int,
                  dtype: torch.dtype, device: torch.device,
                  skip_tp_reduce: bool = False) -> None:
         super().__init__()
@@ -1529,7 +1529,7 @@ class Glm5NextMLP(nn.Module):
         # ``W8A8DynamicLinear.process_weights_after_loading`` transpose, which
         # flips the loaded ``[out, in]`` weight into ``[in, out]`` that
         # ``quant_matmul`` (transpose2=False) consumes. ``_call_process_weights``
-        # is non-recursive, so without this forward Glm5NextMLP leaves the
+        # is non-recursive, so without this forward Glm53FlashMLP leaves the
         # ``gate_up_proj`` / ``down_proj`` int8 weights untransposed and the
         # matmul aborts on a dim mismatch (hidden vs 2*inter_local). The bf16
         # path is a no-op (QLinear.process_weights_after_loading guards on
@@ -1540,7 +1540,7 @@ class Glm5NextMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.chunk(2, dim=-1)
-        # GLM-5-Next SwiGLU clamp (matches HF Glm5NextTextMLP).
+        # GLM-5.3-Flash SwiGLU clamp (matches HF Glm53FlashTextMLP).
         gate = gate.clamp(min=None, max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         out = self.down_proj(F.silu(gate) * up)
@@ -1549,7 +1549,7 @@ class Glm5NextMLP(nn.Module):
         return out
 
 
-class Glm5NextExperts(nn.Module):
+class Glm53FlashExperts(nn.Module):
     """3D-stacked experts (SwiGLU) dispatched via one-hot mask + index_add_.
 
     The 3D params are sized by the LOCAL (TP-sharded) intermediate so each rank
@@ -1558,7 +1558,7 @@ class Glm5NextExperts(nn.Module):
     combines across ranks.
     """
 
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.num_experts = cfg.n_routed_experts
@@ -1614,7 +1614,7 @@ class Glm5NextExperts(nn.Module):
             top_k_pos, token_idx = torch.where(mask[expert_idx])
             gate_up = F.linear(hidden_states[token_idx], self.gate_up_proj[expert_idx])
             gate, up = gate_up.chunk(2, dim=-1)
-            # GLM-5-Next SwiGLU clamp (matches HF Glm5NextTextExperts).
+            # GLM-5.3-Flash SwiGLU clamp (matches HF Glm53FlashTextExperts).
             gate = gate.clamp(min=None, max=self.swiglu_limit)
             up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             current = F.linear(F.silu(gate) * up, self.down_proj[expert_idx])
@@ -1674,8 +1674,8 @@ class Glm5NextExperts(nn.Module):
         return final_f32.sum(1).to(hidden_states.dtype)
 
 
-class Glm5NextMoE(nn.Module):
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+class Glm53FlashMoE(nn.Module):
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -1707,11 +1707,11 @@ class Glm5NextMoE(nn.Module):
         # with the bf16 experts OOMs the card (KV-cache estimation aborts with
         # 0 available bytes).
         # --- bf16 experts branch: LAZY too (built only in _load_experts_bf16).
-        # Eagerly building Glm5NextExperts' 3D bf16 params (~38GB/card at TP8)
+        # Eagerly building Glm53FlashExperts' 3D bf16 params (~38GB/card at TP8)
         # alongside the int8 experts OOMs the 60GB card.
-        self.experts: Optional[Glm5NextExperts] = None
+        self.experts: Optional[Glm53FlashExperts] = None
 
-        self.shared_experts = Glm5NextMLP(
+        self.shared_experts = Glm53FlashMLP(
             cfg, cfg.moe_intermediate_size * cfg.n_shared_experts, dtype, device,
             skip_tp_reduce=True,
         )
@@ -1724,10 +1724,10 @@ class Glm5NextMoE(nn.Module):
             _call_process_weights_after_loading(self.shared_experts)
             return
         assert torch.all(self.experts_w13_offset == 0), (
-            "Glm5NextMoE int8-grouped path needs symmetric int8 experts "
+            "Glm53FlashMoE int8-grouped path needs symmetric int8 experts "
             "(experts_w13_offset == 0)")
         assert torch.all(self.experts_w2_offset == 0), (
-            "Glm5NextMoE int8-grouped path needs symmetric int8 experts "
+            "Glm53FlashMoE int8-grouped path needs symmetric int8 experts "
             "(experts_w2_offset == 0)")
         # Transpose + NZ format-cast with the raw layout released before the
         # cast (mirrors DeepseekV3MoE._format_and_release_expert_weight): ACL
@@ -1801,7 +1801,7 @@ class Glm5NextMoE(nn.Module):
             routed = routed * self.routed_scaling
             out = routed.view(*orig_shape)
         else:
-            # bf16: existing _topk routing + Glm5NextExperts per-expert loop.
+            # bf16: existing _topk routing + Glm53FlashExperts per-expert loop.
             _, topk_weights, topk_indices = self._topk(hidden_states)
             # Debug hooks read these to compare the router against the reference.
             self._last_topk_weights = topk_weights.detach()
@@ -1816,15 +1816,15 @@ class Glm5NextMoE(nn.Module):
         return final
 
     def gate_call(self, hidden_states: torch.Tensor):
-        # routed via the local _topk (mirrors Glm5NextTopkRouter).
+        # routed via the local _topk (mirrors Glm53FlashTopkRouter).
         return self._topk(hidden_states)
 
 
 # ---------------------------------------------------------------------------
 # mHC (Manifold-constrained Hyper-Connection) residual — faithful port of
-# transformers Glm5NextTextHyperConnection / Glm5NextTextHyperHead.
+# transformers Glm53FlashTextHyperConnection / Glm53FlashTextHyperHead.
 # ---------------------------------------------------------------------------
-class Glm5NextHyperConnection(nn.Module):
+class Glm53FlashHyperConnection(nn.Module):
     """4-stream hyper-connection residual (reference 216-292).
 
     Owns the learned (fn, base, scale) parameters that turn the incoming
@@ -1834,7 +1834,7 @@ class Glm5NextHyperConnection(nn.Module):
     ``collapsed`` is the single-sequence input to feed the sublayer.
     """
 
-    def __init__(self, cfg: "Glm5NextConfig", dtype: torch.dtype,
+    def __init__(self, cfg: "Glm53FlashConfig", dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.hc_mult = cfg.hc_mult
@@ -1889,7 +1889,7 @@ class Glm5NextHyperConnection(nn.Module):
             return post, comb, collapsed
 
 
-class Glm5NextHyperHead(nn.Module):
+class Glm53FlashHyperHead(nn.Module):
     """Final mHC stream collapse — unweighted mean over the hc_mult streams."""
 
     def forward(self, hidden_streams: torch.Tensor) -> torch.Tensor:
@@ -1899,24 +1899,24 @@ class Glm5NextHyperHead(nn.Module):
 # ---------------------------------------------------------------------------
 # Decoder layer + model
 # ---------------------------------------------------------------------------
-class Glm5NextDecoderLayer(nn.Module):
-    def __init__(self, cfg: Glm5NextConfig, layer_id: int, dtype: torch.dtype,
+class Glm53FlashDecoderLayer(nn.Module):
+    def __init__(self, cfg: Glm53FlashConfig, layer_id: int, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.input_layernorm = _RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         if cfg.is_dsa(layer_id):
-            self.self_attn = Glm5NextMlaAttention(cfg, layer_id, dtype, device)
+            self.self_attn = Glm53FlashMlaAttention(cfg, layer_id, dtype, device)
         else:
-            self.self_attn = Glm5NextKdaAttention(cfg, layer_id, dtype, device)
+            self.self_attn = Glm53FlashKdaAttention(cfg, layer_id, dtype, device)
         self.post_attention_layernorm = _RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         if cfg.is_moe(layer_id):
-            self.mlp = Glm5NextMoE(cfg, dtype, device)
+            self.mlp = Glm53FlashMoE(cfg, dtype, device)
         else:
-            self.mlp = Glm5NextMLP(cfg, cfg.intermediate_size, dtype, device)
+            self.mlp = Glm53FlashMLP(cfg, cfg.intermediate_size, dtype, device)
         # mHC residual sites (always on, per reference — `mhc` config is not consulted).
-        self.attn_hc = Glm5NextHyperConnection(cfg, dtype, device)
-        self.ffn_hc = Glm5NextHyperConnection(cfg, dtype, device)
+        self.attn_hc = Glm53FlashHyperConnection(cfg, dtype, device)
+        self.ffn_hc = Glm53FlashHyperConnection(cfg, dtype, device)
 
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
@@ -2005,8 +2005,8 @@ class Glm5NextDecoderLayer(nn.Module):
         return hidden_states, topk
 
 
-class Glm5NextModel(nn.Module):
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+class Glm53FlashModel(nn.Module):
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -2015,10 +2015,10 @@ class Glm5NextModel(nn.Module):
             dtype=dtype, device=device,
         )
         self.layers = nn.ModuleList(
-            [Glm5NextDecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)]
+            [Glm53FlashDecoderLayer(cfg, i, dtype, device) for i in range(cfg.n_layers)]
         )
         self.norm = _RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
-        self.hc_head = Glm5NextHyperHead()
+        self.hc_head = Glm53FlashHyperHead()
         # Set externally by the VL composer (get_input_embeddings) before the
         # runner drives forward(); when set, it replaces embed_tokens(input_ids)
         # so image/video embeddings merged into the sequence are used as-is. The
@@ -2064,7 +2064,7 @@ class Glm5NextModel(nn.Module):
         return h
 
 
-def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
+def _install_dump_hooks(model: "Glm53FlashModel", lm_head: nn.Module,
                         outdir: str) -> list:
     """Capture per-layer/submodule + final-norm tensors during the engine's
     forward and save them after every ``model.forward``: the first (prefill)
@@ -2146,7 +2146,7 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
                 if cs is not None:
                     store[_p + "mlp.experts_current_sum"] = cs.to(torch.float32).cpu()
             handles.append(layer.mlp.experts.register_forward_hook(_moe_cur))
-            # router topk weights/indices (stored by Glm5NextMoE.forward)
+            # router topk weights/indices (stored by Glm53FlashMoE.forward)
             def _moe_router(_m, _i, _o, _l=layer, _p=p):
                 if hasattr(_l.mlp, "_last_topk_weights"):
                     store[_p + "mlp.topk_weights"] = (
@@ -2167,7 +2167,7 @@ def _install_dump_hooks(model: "Glm5NextModel", lm_head: nn.Module,
         else:
             fname = os.path.join(outdir, f"decode_{step[0] - 1}.safetensors")
         save_file(_save_file, fname)
-        print(f"[glm5_next dump] saved {len(_save_file)} tensors to {fname}",
+        print(f"[glm5_3_flash dump] saved {len(_save_file)} tensors to {fname}",
               flush=True)
         store.clear()
         step[0] += 1
@@ -2246,12 +2246,12 @@ def _real_ckpt_aliases(name: str) -> list:
     return out
 
 
-class Glm5NextForCausalLM(PyModelBase):
-    """glm5_next causal LM. Registered under model_type='glm5_next'."""
+class Glm53FlashForCausalLM(PyModelBase):
+    """glm5_3_flash causal LM. Registered under model_type='glm5_3_flash'."""
 
     def __init__(self, config: dict) -> None:
         super().__init__()
-        self.cfg = Glm5NextConfig.from_dict(config)
+        self.cfg = Glm53FlashConfig.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
         self.cfg.tp_rank = int(config.get("tp_rank", 0))
         for name, val in (("n_heads", self.cfg.n_heads),
@@ -2266,7 +2266,7 @@ class Glm5NextForCausalLM(PyModelBase):
         device = torch.device(config.get("device", "npu:0" if torch_npu else "cpu"))
         self.dtype = dtype
         self.device = device
-        self.model = Glm5NextModel(self.cfg, dtype, device)
+        self.model = Glm53FlashModel(self.cfg, dtype, device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size, self.cfg.vocab_size // self.cfg.tp_size,
             self.cfg.tp_size, gather_output=True, dtype=dtype, device=device,
@@ -2444,7 +2444,7 @@ class Glm5NextForCausalLM(PyModelBase):
         _call_process_weights_after_loading(self.model.layers[i].self_attn)
 
     def _load_mlp_fp_or_w8a8(self, L, mlp_pfx: str) -> None:
-        """Load a ``Glm5NextMLP`` (gate_up_proj + down_proj) from the OLD-style
+        """Load a ``Glm53FlashMLP`` (gate_up_proj + down_proj) from the OLD-style
         checkpoint keys ``gate_proj`` / ``up_proj`` / ``down_proj``.
 
         fp path: cat gate+up on dim 0, shard dim 0 -> ``gate_up_proj.weight``;
@@ -2485,7 +2485,7 @@ class Glm5NextForCausalLM(PyModelBase):
 
         Per expert: gate+up cat after shard dim0 -> experts_w13[j]; down shard
         dim1 -> experts_w2[j]; scale/offset copied likewise. Writes the int8
-        expert params + buffers, leaving the bf16 ``Glm5NextExperts`` params
+        expert params + buffers, leaving the bf16 ``Glm53FlashExperts`` params
         unset (the W8A8 forward branch never reads them).
         """
         se = mlp + "experts."
@@ -2546,12 +2546,12 @@ class Glm5NextForCausalLM(PyModelBase):
     def _load_experts_bf16(self, L, mlp: str, n: int) -> None:
         """bf16 expert load (existing 3D cat-stack path, extracted from _load_mlp).
 
-        Lazily constructs ``self.experts`` (Glm5NextExperts) — it is left unbuilt
+        Lazily constructs ``self.experts`` (Glm53FlashExperts) — it is left unbuilt
         in __init__ to avoid the int8+bf16 double allocation OOMing the card.
         Fills the bf16 3D params (gate_up_proj / down_proj); the W8A8 int8 expert
         params are left unset (bf16 forward never reads them).
         """
-        # Lazily construct the bf16 Glm5NextExperts (left unbuilt in __init__ to
+        # Lazily construct the bf16 Glm53FlashExperts (left unbuilt in __init__ to
         # avoid int8+bf16 double allocation OOMing the card). Derive dtype/device
         # from the already-built int8 expert param.
         layer_idx = int(mlp.split("layers.")[1].split(".")[0])
@@ -2560,7 +2560,7 @@ class Glm5NextForCausalLM(PyModelBase):
             # bf16 experts — dtype/device from the shared experts (the int8
             # params are lazily created only on the W8A8 path).
             ref = moe_mod.shared_experts.gate_up_proj.weight
-            moe_mod.experts = Glm5NextExperts(
+            moe_mod.experts = Glm53FlashExperts(
                 self.cfg, ref.dtype, ref.device)
         # Build per-expert [2*inter, hidden] gate_up as [n_exp, 2*inter, hidden]
         # with layout [gate | up] along dim 1. Shard gate/up SEPARATELY then cat

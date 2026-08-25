@@ -23,7 +23,7 @@ def _gather_rows(src: torch.Tensor, safe_indices: torch.Tensor) -> torch.Tensor:
 
 def pooled_states(packed_states: torch.Tensor, key_valid: torch.Tensor,
                   ape: torch.Tensor, head_dim: int, rate: int):
-    """与 Glm5NextIndexer.get_pooled_states 全量输出逐 bit 相同。"""
+    """与 Glm53FlashIndexer.get_pooled_states 全量输出逐 bit 相同。"""
     keys, gate_scores, _ = torch.split(
         packed_states, [head_dim, head_dim, 1], dim=-1
     )

@@ -1,13 +1,13 @@
-"""CPU unit tests for Glm5NextMoE W8A8 expert path (kernels stubbed)."""
+"""CPU unit tests for Glm53FlashMoE W8A8 expert path (kernels stubbed)."""
 import pytest
 import torch
 
 from tests.python.conftest import _install_python_package_stub  # noqa: F401
-from xllm.python.models.glm5_next import Glm5NextConfig, Glm5NextMoE
+from xllm.python.models.glm5_3_flash import Glm53FlashConfig, Glm53FlashMoE
 
 
 def _cfg(tp=1, n_experts=4, moe_inter=64, hidden=32, topk=2):
-    return Glm5NextConfig(
+    return Glm53FlashConfig(
         hidden_size=hidden, moe_intermediate_size=moe_inter,
         n_routed_experts=n_experts, num_experts_per_tok=topk,
         n_group=1, topk_group=1, routed_scaling_factor=2.5,
@@ -18,7 +18,7 @@ def _cfg(tp=1, n_experts=4, moe_inter=64, hidden=32, topk=2):
 
 def test_moe_has_w8a8_int8_expert_params():
     cfg = _cfg(tp=1)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     inter_local = cfg.moe_intermediate_size // cfg.tp_size
     # int8 expert weights present
     assert moe.experts_w13.shape == (cfg.n_routed_experts, 2*inter_local, cfg.hidden_size)
@@ -40,7 +40,7 @@ def test_moe_has_w8a8_int8_expert_params():
 
 def test_moe_tp_shards_expert_intermediate():
     cfg = _cfg(tp=2, moe_inter=64)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     inter_local = cfg.moe_intermediate_size // cfg.tp_size  # 32
     assert moe.experts_w13.shape == (cfg.n_routed_experts, 2*inter_local, cfg.hidden_size)
     assert moe.experts_w2.shape == (cfg.n_routed_experts, cfg.hidden_size, inter_local)
@@ -48,7 +48,7 @@ def test_moe_tp_shards_expert_intermediate():
 
 def test_process_weights_w8a8_transposes_and_flattens(monkeypatch):
     cfg = _cfg(tp=1)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     moe.use_w8a8 = True
     # prepare_grouped_moe_weights 走 stub — 用 identity 让我们能断言 transpose 发生
     import xllm.python.kernels as K
@@ -70,7 +70,7 @@ def test_process_weights_w8a8_transposes_and_flattens(monkeypatch):
 
 def test_process_weights_bf16_branch_calls_shared_only(monkeypatch):
     cfg = _cfg(tp=1)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     moe.use_w8a8 = False
     called = {"shared": False}
     def _shared():
@@ -86,7 +86,7 @@ def test_process_weights_bf16_branch_calls_shared_only(monkeypatch):
 
 def test_forward_w8a8_branch_calls_grouped_moe(monkeypatch):
     cfg = _cfg(tp=1)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     moe.use_w8a8 = True
     calls = {}
     def _fake_grouped_moe(hidden, logits, w13, w2, s13, s2, bias, topk, tg, ng, renorm):
@@ -112,10 +112,10 @@ def test_forward_w8a8_branch_calls_grouped_moe(monkeypatch):
 
 def test_forward_bf16_branch_uses_old_experts(monkeypatch):
     cfg = _cfg(tp=1)
-    moe = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+    moe = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
     # bf16 experts are lazily constructed — build them now (bf16 path only).
-    from xllm.python.models.glm5_next import Glm5NextExperts
-    moe.experts = Glm5NextExperts(cfg, torch.bfloat16, torch.device("cpu"))
+    from xllm.python.models.glm5_3_flash import Glm53FlashExperts
+    moe.experts = Glm53FlashExperts(cfg, torch.bfloat16, torch.device("cpu"))
     moe.use_w8a8 = False
     grouped_called = {"v": False}
     import xllm.python.kernels as K
@@ -140,7 +140,7 @@ def test_forward_bf16_branch_uses_old_experts(monkeypatch):
 
 import torch.nn as nn
 from xllm.python.layers.qlinear import QLinearWeightLoader
-from xllm.python.models.glm5_next import Glm5NextForCausalLM
+from xllm.python.models.glm5_3_flash import Glm53FlashForCausalLM
 
 
 class _FakeSD:
@@ -171,17 +171,17 @@ def _w8a8_expert_tensors(mlp_pfx, n, moe_inter, hidden):
     return sd
 
 
-class _DummyModel(Glm5NextForCausalLM):
-    """Lightweight Glm5NextForCausalLM shell: skip heavy construction, expose
+class _DummyModel(Glm53FlashForCausalLM):
+    """Lightweight Glm53FlashForCausalLM shell: skip heavy construction, expose
     model.layers[i].mlp so _load_mlp (inherited) + helpers run on the MoE."""
     def __init__(self, cfg):
-        nn.Module.__init__(self)  # bypass Glm5NextForCausalLM.__init__
+        nn.Module.__init__(self)  # bypass Glm53FlashForCausalLM.__init__
         self.cfg = cfg
         self.model = nn.Module()
         self.model.layers = nn.ModuleList()
         for i in range(cfg.n_layers):
             layer = nn.Module()
-            layer.mlp = Glm5NextMoE(cfg, torch.bfloat16, torch.device("cpu"))
+            layer.mlp = Glm53FlashMoE(cfg, torch.bfloat16, torch.device("cpu"))
             self.model.layers.append(layer)
 
 
@@ -235,8 +235,8 @@ def test_load_mlp_bf16_keeps_flag_false():
     sd[mlp + "shared_experts.down_proj.weight"] = torch.zeros(32, 64, dtype=torch.bfloat16)
     # Pre-construct the bf16 experts so the loader's named_parameters() cache
     # (built in QLinearWeightLoader.__init__) sees experts.gate_up_proj.
-    from xllm.python.models.glm5_next import Glm5NextExperts
-    dummy.model.layers[moe_i].mlp.experts = Glm5NextExperts(
+    from xllm.python.models.glm5_3_flash import Glm53FlashExperts
+    dummy.model.layers[moe_i].mlp.experts = Glm53FlashExperts(
         cfg, torch.bfloat16, torch.device("cpu"))
     L = QLinearWeightLoader(dummy, [_FakeSD(sd)], tp_size=1, tp_rank=0)
     dummy._load_mlp(L, mlp, moe_i)

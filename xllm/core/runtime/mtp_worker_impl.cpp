@@ -536,12 +536,12 @@ bool is_qwen3_5_draft_model_type(const std::string& model_type) {
          mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
 }
 
-// The GLM-5-Next python MTP draft checkpoint carries its own embed_tokens /
+// The GLM-5.3-Flash python MTP draft checkpoint carries its own embed_tokens /
 // lm_head copies (the exporter materializes them), so it needs no
 // target->draft weight sharing (the python CausalLM set_lm_head path is not
 // implemented for PyCausalLM).
-bool is_glm5_next_mtp_draft_model_type(const std::string& model_type) {
-  return model_type == "glm5_next_mtp";
+bool is_glm5_3_flash_mtp_draft_model_type(const std::string& model_type) {
+  return model_type == "glm5_3_flash_mtp";
 }
 
 }  // namespace
@@ -599,9 +599,9 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
         (options_.enable_mtp_draft_body_tp1() &&
          is_qwen3_5_draft_model_type(
              draft_impl_->context_.get_model_args().model_type())) ||
-        is_glm5_next_mtp_draft_model_type(
+        is_glm5_3_flash_mtp_draft_model_type(
             draft_impl_->context_.get_model_args().model_type());
-    // Qwen3.5 and GLM-5-Next draft checkpoints contain complete embedding and
+    // Qwen3.5 and GLM-5.3-Flash draft checkpoints contain complete embedding and
     // LMHead weights. Other MTP drafts retain their existing target-weight
     // sharing contract; only their transformer body is replicated with TP1
     // parallel arguments.

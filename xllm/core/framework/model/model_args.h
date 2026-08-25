@@ -598,7 +598,7 @@ inline bool is_full_attention_layer(const ModelArgs& args, int64_t layer_id) {
   if (layer_id >= 0 &&
       layer_id < static_cast<int64_t>(hybrid_layer_types.size())) {
     const auto& layer_type = hybrid_layer_types[layer_id];
-    // deepseek_sparse_attention (glm5_next DSA layers) is a full-attention
+    // deepseek_sparse_attention (glm5_3_flash DSA layers) is a full-attention
     // variant: it uses paged KV, not the linear (conv/ssm) state cache. Treat
     // it as full attention here so capacity estimation and per-layer dispatch
     // classify it correctly (mirrors is_linear_attention_layer's exclusion).

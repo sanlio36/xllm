@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLM-5-Next-VL multimodal model (Python model executor target).
+"""GLM-5.3-Flash-VL multimodal model (Python model executor target).
 
-Architecture: GlmOcr-based ViT + GLM-5-Next LLM + lm_head.
+Architecture: GlmOcr-based ViT + GLM-5.3-Flash LLM + lm_head.
 
 This module contains both the vision tower and the VLM composition logic,
 mirroring the qwen3_vl.py structure. The LLM backbone is imported from
-``glm5_next.py``.
+``glm5_3_flash.py``.
 
 Vision tower (GlmOcr-based):
   - ``VisionPatchEmbed``: 3D-conv patch projection (no bias).
@@ -27,7 +27,7 @@ Vision tower (GlmOcr-based):
   - ``VisionMLP``: gated MLP (gate_proj / up_proj / down_proj).
   - ``VisionBlock``: pre-norm (RMSNorm) transformer block.
   - ``VisionPatchMerger``: proj + LayerNorm + gated MLP, with
-    ``context_dim = projection_intermediate_size`` for GLM-5-Next.
+    ``context_dim = projection_intermediate_size`` for GLM-5.3-Flash.
   - ``downsample``: Conv2d spatial merge.
   - ``post_layernorm``: RMSNorm after blocks.
 
@@ -50,10 +50,10 @@ import torch.nn.functional as F
 
 from xllm.python.layers import ColumnParallelLinear, RowParallelLinear
 from xllm.python.models.base import PyModelBase
-from xllm.python.models.glm5_next import (
-    Glm5NextConfig,
-    Glm5NextModel,
-    Glm5NextForCausalLM,
+from xllm.python.models.glm5_3_flash import (
+    Glm53FlashConfig,
+    Glm53FlashModel,
+    Glm53FlashForCausalLM,
 )
 
 
@@ -109,16 +109,16 @@ def get_vision_position_ids(
 
 
 @dataclass
-class Glm5NextVisionConfig:
-    """Configuration for the GLM-5-Next-VL vision tower (GlmOcr-based).
+class Glm53FlashVisionConfig:
+    """Configuration for the GLM-5.3-Flash-VL vision tower (GlmOcr-based).
 
     Field names match the HuggingFace ``GlmOcrVisionConfig`` plus the
-    GLM-5-Next-specific ``projection_intermediate_size`` used by the SGLang
+    GLM-5.3-Flash-specific ``projection_intermediate_size`` used by the SGLang
     adaptation to override the merger context dimension.
 
     ``projection_intermediate_size`` defaults to ``None``: when unset, the
     merger context_dim falls back to ``out_hidden_size * in_channels`` (the
-    base GlmOcr behavior used by GLM-OCR). When set (GLM-5-Next SGLang
+    base GlmOcr behavior used by GLM-OCR). When set (GLM-5.3-Flash SGLang
     adaptation), it overrides the merger context_dim.
     """
 
@@ -137,10 +137,10 @@ class Glm5NextVisionConfig:
     out_hidden_size: int = 1536
     intermediate_size: int = 4096
     initializer_range: float = 0.02
-    # GLM-5-Next override: merger context dim. None = fall back to
+    # GLM-5.3-Flash override: merger context dim. None = fall back to
     # out_hidden_size * in_channels (base GlmOcr / GLM-OCR behavior).
     projection_intermediate_size: Optional[int] = None
-    # GLM-5-Next SwiGLU clamp limit. HF's Glm5NextConfig injects this into the
+    # GLM-5.3-Flash SwiGLU clamp limit. HF's Glm53FlashConfig injects this into the
     # vision config from text_config.swiglu_limit (always 10.0 for this
     # checkpoint). Applied to gate/up projections in VisionMLP + VisionPatchMerger.
     swiglu_limit: float = 10.0
@@ -148,7 +148,7 @@ class Glm5NextVisionConfig:
     tp_rank: int = 0
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Glm5NextVisionConfig":
+    def from_dict(cls, d: dict) -> "Glm53FlashVisionConfig":
         def pick(*keys, default=None):
             for k in keys:
                 if k in d and d[k] is not None and d[k] != -1 and d[k] != "":
@@ -191,7 +191,7 @@ class Glm5NextVisionConfig:
                 "projection_intermediate_size",
                 "context_size",
                 "mm_projection_intermediate_size",
-                # GLM-5-Next vision projector (config.json
+                # GLM-5.3-Flash vision projector (config.json
                 # vision_config.projection_intermediate_size = 10240). The C++
                 # ModelArgs loader should expose it as mm_projection_intermediate_size;
                 # 10240 is the fallback so the merger matches the checkpoint when the
@@ -206,7 +206,7 @@ class Glm5NextVisionConfig:
     def merger_context_dim(self) -> int:
         """Resolve the merger context_dim.
 
-        - GLM-5-Next (SGLang override): ``projection_intermediate_size``.
+        - GLM-5.3-Flash (SGLang override): ``projection_intermediate_size``.
         - GLM-OCR (base): ``out_hidden_size * in_channels``.
         """
         if self.projection_intermediate_size is not None:
@@ -238,7 +238,7 @@ class VisionRMSNorm(nn.Module):
 class VisionPatchEmbed(nn.Module):
     """3D-conv patch embedding (temporal, height, width), no bias."""
 
-    def __init__(self, cfg: Glm5NextVisionConfig) -> None:
+    def __init__(self, cfg: Glm53FlashVisionConfig) -> None:
         super().__init__()
         self.patch_size = cfg.patch_size
         self.temporal_patch_size = cfg.temporal_patch_size
@@ -315,7 +315,7 @@ class VisionAttention(nn.Module):
     skip their collectives, so the path is byte-identical to plain ``nn.Linear``.
     """
 
-    def __init__(self, cfg: Glm5NextVisionConfig) -> None:
+    def __init__(self, cfg: Glm53FlashVisionConfig) -> None:
         super().__init__()
         self.dim = cfg.hidden_size
         self.num_heads = cfg.num_heads
@@ -405,7 +405,7 @@ class VisionMLP(nn.Module):
     and skip their collectives, so the path is byte-identical to ``nn.Linear``.
     """
 
-    def __init__(self, cfg: Glm5NextVisionConfig, bias: bool = True) -> None:
+    def __init__(self, cfg: Glm53FlashVisionConfig, bias: bool = True) -> None:
         super().__init__()
         assert cfg.intermediate_size % cfg.tp_size == 0, (
             f"vision intermediate_size {cfg.intermediate_size} not divisible by tp_size {cfg.tp_size}"
@@ -428,7 +428,7 @@ class VisionMLP(nn.Module):
             self.act_fn = lambda x: F.gelu(x, approximate="tanh")
         else:
             raise ValueError(f"Unsupported hidden_act: {cfg.hidden_act}")
-        # GLM-5-Next SwiGLU clamp (HF Glm5NextVisionMLP): clamp gate/up before
+        # GLM-5.3-Flash SwiGLU clamp (HF Glm53FlashVisionMLP): clamp gate/up before
         # the gated multiply. gate is upper-clamped only; up is +/- clamped.
         self.swiglu_limit = cfg.swiglu_limit
 
@@ -443,7 +443,7 @@ class VisionMLP(nn.Module):
 class VisionBlock(nn.Module):
     """Pre-norm transformer block with RMSNorm: LN -> attn -> residual, LN -> mlp -> residual."""
 
-    def __init__(self, cfg: Glm5NextVisionConfig) -> None:
+    def __init__(self, cfg: Glm53FlashVisionConfig) -> None:
         super().__init__()
         self.norm1 = VisionRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.norm2 = VisionRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -470,7 +470,7 @@ class VisionPatchMerger(nn.Module):
 
     proj -> GELU(LayerNorm(proj(x))) -> down_proj(act_fn(gate_proj(x)) * up_proj(x))
 
-    For GLM-5-Next: ``dim = out_hidden_size``, ``context_dim =
+    For GLM-5.3-Flash: ``dim = out_hidden_size``, ``context_dim =
     projection_intermediate_size``, ``bias = False``.
 
     TP sharding (mirrors vLLM ``Qwen2VisionPatchMerger``): ``proj`` (dim->dim,
@@ -510,7 +510,7 @@ class VisionPatchMerger(nn.Module):
             self.act_fn = F.gelu
         else:
             raise ValueError(f"Unsupported hidden_act: {hidden_act}")
-        # GLM-5-Next SwiGLU clamp (HF Glm5NextVisionPatchMerger).
+        # GLM-5.3-Flash SwiGLU clamp (HF Glm53FlashVisionPatchMerger).
         self.swiglu_limit = swiglu_limit
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
@@ -545,10 +545,10 @@ class VisionModelOutput:
 # ---------------------------------------------------------------------------
 
 
-class Glm5NextVisionModel(nn.Module):
-    """GLM-5-Next-VL vision tower (GlmOcr-based), checkpoint-compatible with HF.
+class Glm53FlashVisionModel(nn.Module):
+    """GLM-5.3-Flash-VL vision tower (GlmOcr-based), checkpoint-compatible with HF.
 
-    Forward contract matches the GLM-5-Next-VL ``self.visual`` usage:
+    Forward contract matches the GLM-5.3-Flash-VL ``self.visual`` usage:
     ``self.visual(pixel_values, grid_thw=image_grid_thw)`` returns an object with
     ``.pooler_output`` and ``.last_hidden_state``.
 
@@ -559,7 +559,7 @@ class Glm5NextVisionModel(nn.Module):
 
     def __init__(
         self,
-        cfg: Glm5NextVisionConfig,
+        cfg: Glm53FlashVisionConfig,
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
@@ -578,7 +578,7 @@ class Glm5NextVisionModel(nn.Module):
         self.blocks = nn.ModuleList(
             [VisionBlock(cfg) for _ in range(cfg.depth)]
         )
-        # GLM-5-Next merger: context_dim from projection_intermediate_size if
+        # GLM-5.3-Flash merger: context_dim from projection_intermediate_size if
         # set, else fall back to GlmOcr base (out_hidden_size * in_channels).
         # bias=False matches the SGLang adaptation. Pass tp_size so the
         # gate/up/down projections shard per the vLLM Qwen2VisionPatchMerger map.
@@ -708,7 +708,7 @@ class Glm5NextVisionModel(nn.Module):
 
         ``state_dicts`` is the list of ``StateDict`` objects from the xLLM weight
         loader. ``prefix`` is the key prefix in the checkpoint (``model.visual.``
-        for a full GLM-5-Next-VL checkpoint).
+        for a full GLM-5.3-Flash-VL checkpoint).
         """
 
         def find(name: str):
@@ -752,7 +752,7 @@ class Glm5NextVisionModel(nn.Module):
             re-cat'd, giving the local layout ``[q_local | k_local | v_local]``
             that matches the ``reshape(seq, 3, num_heads_local, head_dim)`` in
             :meth:`VisionAttention.forward`. Mirrors the KDA conv1d / MoE
-            gate_up shard-then-cat fix in ``glm5_next.py``. At ``tp==1`` the
+            gate_up shard-then-cat fix in ``glm5_3_flash.py``. At ``tp==1`` the
             shard is a no-op, leaving the merged tensor byte-identical.
             """
             if tp <= 1:
@@ -803,7 +803,7 @@ class Glm5NextVisionModel(nn.Module):
 
         # merger: proj (nn.Linear dim->dim) + post_projection_norm (LayerNorm)
         # stay REPLICATED; gate/up (ColumnParallel) shard dim 0; down_proj
-        # (RowParallel) shards dim 1. bias=False for GLM-5-Next so no biases.
+        # (RowParallel) shards dim 1. bias=False for GLM-5.3-Flash so no biases.
         copy_in("merger.proj.weight", load_tensor("merger.proj.weight"))
         copy_in("merger.post_projection_norm.weight", load_tensor("merger.post_projection_norm.weight"))
         copy_in("merger.post_projection_norm.bias", load_tensor("merger.post_projection_norm.bias"))
@@ -813,7 +813,7 @@ class Glm5NextVisionModel(nn.Module):
 
         # Let each RowParallelLinear prepare its weight layout for the active
         # device backend (mirrors ``_call_process_weights_after_loading`` in
-        # glm5_next.py). At the standalone CPU stub this is a no-op; in the
+        # glm5_3_flash.py). At the standalone CPU stub this is a no-op; in the
         # engine it transposes for the NPU row-parallel kernel.
         for m in self.modules():
             fn = getattr(m, "process_weights_after_loading", None)
@@ -827,8 +827,8 @@ class Glm5NextVisionModel(nn.Module):
 
 
 @dataclass
-class Glm5NextVLConfig:
-    """Top-level config for GLM-5-Next-VL (vision + text + connection params)."""
+class Glm53FlashVLConfig:
+    """Top-level config for GLM-5.3-Flash-VL (vision + text + connection params)."""
 
     vision_config: dict
     text_config: dict
@@ -845,7 +845,7 @@ class Glm5NextVLConfig:
     tp_rank: int = 0
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Glm5NextVLConfig":
+    def from_dict(cls, d: dict) -> "Glm53FlashVLConfig":
         return cls(
             vision_config=d.get("vision_config", {}),
             text_config=d.get("text_config", {}),
@@ -868,8 +868,8 @@ class Glm5NextVLConfig:
 # ---------------------------------------------------------------------------
 
 
-class Glm5NextVLModel(Glm5NextForCausalLM):
-    """GLM-5-Next-VL composition: ViT + LLM + lm_head.
+class Glm53FlashVLModel(Glm53FlashForCausalLM):
+    """GLM-5.3-Flash-VL composition: ViT + LLM + lm_head.
 
     Wiring (``forward``):
       pixel_values + grid_thw → vision_model → image_embeds
@@ -884,7 +884,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
     """
 
     def __init__(self, config: dict) -> None:
-        # NOTE: we inherit Glm5NextForCausalLM to reuse its weight-loader helpers
+        # NOTE: we inherit Glm53FlashForCausalLM to reuse its weight-loader helpers
         # (_load_kda_attn / _load_dsa_attn / _load_mlp / ...), but we deliberately
         # do NOT call its __init__ (it requires a text-only config and would build
         # a redundant language model). Initialize nn.Module directly instead.
@@ -893,17 +893,17 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # PyCausalLM hands us a FLAT ModelArgs dict (built by build_config_dict
         # via visit_properties): text fields are top-level (hidden_size,
         # n_layers, n_heads, tie_word_embeddings, tp_size, ...), vision fields
-        # are "mm_"-prefixed. Both Glm5NextTextConfig.from_dict and
-        # Glm5NextVisionConfig.from_dict read this flat layout directly.
+        # are "mm_"-prefixed. Both Glm53FlashTextConfig.from_dict and
+        # Glm53FlashVisionConfig.from_dict read this flat layout directly.
         # Fall back to nested vision_config/text_config for standalone tests.
         vision_cfg_dict = config.get("vision_config", config)
         text_cfg_dict = config.get("text_config", config)
 
-        vcfg = Glm5NextVisionConfig.from_dict(vision_cfg_dict)
+        vcfg = Glm53FlashVisionConfig.from_dict(vision_cfg_dict)
         vcfg.tp_size = int(config.get("tp_size", 1))
         vcfg.tp_rank = int(config.get("tp_rank", 0))
 
-        tcfg = Glm5NextConfig.from_dict(text_cfg_dict)
+        tcfg = Glm53FlashConfig.from_dict(text_cfg_dict)
         tcfg.tp_size = int(config.get("tp_size", 1))
         tcfg.tp_rank = int(config.get("tp_rank", 0))
 
@@ -927,17 +927,17 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
 
         # --- Vision tower ---
         self.vision_cfg = vcfg
-        self.vision_model = Glm5NextVisionModel(vcfg, dtype=dtype, device=device)
+        self.vision_model = Glm53FlashVisionModel(vcfg, dtype=dtype, device=device)
 
         # --- Language model ---
         self.text_cfg = tcfg
         # Register under ``self.model`` FIRST (the primary name). The weight
         # loader builds its param table from ``named_parameters()``, and PyTorch
         # de-duplicates a module bound to two attribute names — the prefix of
-        # the FIRST binding is the one kept. Glm5NextForCausalLM.load_weights
+        # the FIRST binding is the one kept. Glm53FlashForCausalLM.load_weights
         # (delegated below) looks up params as ``model.<...>``, so ``self.model``
         # must be registered before the ``self.language_model`` alias.
-        self.model = Glm5NextModel(tcfg, dtype=dtype, device=device)
+        self.model = Glm53FlashModel(tcfg, dtype=dtype, device=device)
         self.language_model = self.model
 
         # --- LM head ---
@@ -952,8 +952,8 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
             device=device,
         )
         # Cast the whole graph (vision + LM + lm_head) to the target dtype/device
-        # — mirrors Glm5NextForCausalLM.__init__ so KDA conv1d / indexer params
-        # (which default to float32 inside Glm5NextModel) are bf16 like the rest.
+        # — mirrors Glm53FlashForCausalLM.__init__ so KDA conv1d / indexer params
+        # (which default to float32 inside Glm53FlashModel) are bf16 like the rest.
         self.to(device=device, dtype=dtype)
 
         # Rotation-quantized checkpoints (QuaRot-style) fold a hidden-space
@@ -982,9 +982,9 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
             self._hidden_rot = _sd["global_rotation"].to(device=device,
                                                          dtype=dtype)
 
-        # Install per-layer dump hooks. Glm5NextForCausalLM.__init__ installs
+        # Install per-layer dump hooks. Glm53FlashForCausalLM.__init__ installs
         # these too, but VLModel deliberately skips that __init__, so the
-        # engine (which instantiates Glm5NextVLModel for model_type=glm5_next)
+        # engine (which instantiates Glm53FlashVLModel for model_type=glm5_3_flash)
         # would otherwise never install them. Mirrors the ForCausalLM logic incl.
         # the per-rank subdir split (TP ranks clobber a single file otherwise).
         _dump_dir = os.environ.get("GLM5_NEXT_DUMP_DIR")
@@ -995,7 +995,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
             except Exception:
                 _rk = 0
             _dump_dir = os.path.join(_dump_dir, f"rank{_rk}")
-            from xllm.python.models.glm5_next import _install_dump_hooks
+            from xllm.python.models.glm5_3_flash import _install_dump_hooks
             _install_dump_hooks(self.model, self.lm_head, _dump_dir)
 
     # ------------------------------------------------------------------
@@ -1071,7 +1071,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         ``image_embeds.shape[0]``.
         """
         # Normalise to 2-D [B, S] — the C++ EagerRunner passes a flattened
-        # 1-D [num_tokens] tensor (same convention Glm5NextModel.forward
+        # 1-D [num_tokens] tensor (same convention Glm53FlashModel.forward
         # normalises). Without this, embed_tokens produces a 2-D [S, H] output
         # and the downstream forward's hc_mult expand hits a shape mismatch.
         if input_ids.dim() == 1:
@@ -1114,7 +1114,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
     ) -> None:
         """Load ViT + LLM + lm_head weights from checkpoint.
 
-        Checkpoint key layout (GLM-5-Next-VL):
+        Checkpoint key layout (GLM-5.3-Flash-VL):
           - ``model.visual.*``      → vision_model
           - ``model.language_model.*`` → language_model (Side A aliases
             ``model.`` ↔ ``model.language_model.`` so both prefixes load)
@@ -1123,21 +1123,21 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # 1. Vision tower — TP-sharded per rank (reads self.cfg.tp_size /
         #    tp_rank set in __init__ from the flat ModelArgs). Conv + norms +
         #    merger.proj stay replicated; qkv/proj/gate/up/down shard per the
-        #    vLLM Qwen2-VL ViT map (see Glm5NextVisionModel.load_weights).
+        #    vLLM Qwen2-VL ViT map (see Glm53FlashVisionModel.load_weights).
         self.vision_model.load_weights(state_dicts, prefix="model.visual.")
 
-        # 2. LLM + lm_head: delegate to the full Glm5NextForCausalLM loader
+        # 2. LLM + lm_head: delegate to the full Glm53FlashForCausalLM loader
         #    (handles MoE expert stacking, absorbed-MLA W_UK/W_UV split, mHC,
         #    TP sharding, and the model.↔model.language_model. checkpoint alias).
         self.cfg = self.text_cfg
-        Glm5NextForCausalLM.load_weights(self, state_dicts, tp_rank, tp_size)
+        Glm53FlashForCausalLM.load_weights(self, state_dicts, tp_rank, tp_size)
 
     def _load_language_weights(
         self, state_dicts: list, tp_rank: int, tp_size: int
     ) -> None:
         """Load language model weights.
 
-        TODO: implement full GLM-5-Next LLM weight loading (MLA + MoE).
+        TODO: implement full GLM-5.3-Flash LLM weight loading (MLA + MoE).
         For now this is a placeholder that loads embed_tokens + norm, enough
         to demonstrate the connection logic.
         """

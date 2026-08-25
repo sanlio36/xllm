@@ -409,7 +409,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
   const bool enable_linear_attention = has_linear_attention_layers(args);
   const bool enable_lighting_indexer = args.index_n_heads() > 0;
   // A model may be BOTH linear-attention (KDA layers) AND have a lighting
-  // indexer (DSA layers) — e.g. glm5_next. create_kv_cache_impl dispatches ONE
+  // indexer (DSA layers) — e.g. glm5_3_flash. create_kv_cache_impl dispatches ONE
   // impl per layer, each reading only its own shape, so coexistence is
   // harmless. The prior exclusivity CHECK guarded a non-problem.
 

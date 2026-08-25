@@ -73,7 +73,7 @@ bool is_torch_only_model_type(const std::string& model_type) {
   static const std::unordered_set<std::string> kTorchOnlyModelTypes = {
       "deepseek_v4",
       "deepseek_v4_mtp",
-      "glm5_next_mtp",
+      "glm5_3_flash_mtp",
       "qwen3_5",
       "qwen3_5_text",
       "qwen3_5_moe",
@@ -100,6 +100,19 @@ bool resolve_model_registration(const std::string& model_type,
     return false;
   }
 
+  // Backward compatibility: map old model_type names to the new naming scheme.
+  // Checkpoints exported before the GLM-5-Next → GLM-5.3-Flash rename still use
+  // "glm5_next" / "glm5_next_mtp" in their config.json.
+  const std::string effective_model_type = [&model_type]() -> std::string {
+    static const std::unordered_map<std::string, std::string> kModelTypeAliases =
+        {
+            {"glm5_next", "glm5_3_flash"},
+            {"glm5_next_mtp", "glm5_3_flash_mtp"},
+        };
+    auto it = kModelTypeAliases.find(model_type);
+    return it != kModelTypeAliases.end() ? it->second : model_type;
+  }();
+
 #if defined(USE_NPU)
   const std::string backend = requested_npu_kernel_backend.empty()
                                   ? kAutoBackend
@@ -116,14 +129,14 @@ bool resolve_model_registration(const std::string& model_type,
   std::string effective_backend = backend;
   if (backend == kAutoBackend) {
     effective_backend =
-        is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
-  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
-             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
-             model_type == "qwen3_vl" || model_type == "glm5_next") {
-    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/glm5_next support both
-    // backends. glm5_next is served via --model_impl=python, which forces
+        is_torch_only_model_type(effective_model_type) ? kTorchBackend : kAtbBackend;
+  } else if (effective_model_type == "qwen3" || effective_model_type == "qwen3_moe" ||
+             effective_model_type == "deepseek_v32" || effective_model_type == "glm_moe_dsa" ||
+             effective_model_type == "qwen3_vl" || effective_model_type == "glm5_3_flash") {
+    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl/glm5_3_flash support both
+    // backends. glm5_3_flash is served via --model_impl=python, which forces
     // npu_kernel_backend=TORCH; the python graph owns all attention.
-  } else if (is_torch_only_model_type(model_type)) {
+  } else if (is_torch_only_model_type(effective_model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
         *error_message = "Model type " + model_type +
@@ -142,18 +155,18 @@ bool resolve_model_registration(const std::string& model_type,
   if (effective_npu_kernel_backend != nullptr) {
     *effective_npu_kernel_backend = effective_backend;
   }
-  if (model_type == "qwen3" && effective_backend == kAtbBackend) {
+  if (effective_model_type == "qwen3" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_atb";
-  } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
+  } else if (effective_model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_moe_atb";
-  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
+  } else if (effective_model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_vl_atb";
   } else {
-    *resolved_name = model_type;
+    *resolved_name = effective_model_type;
   }
   return true;
 #else
-  *resolved_name = model_type;
+  *resolved_name = effective_model_type;
   return true;
 #endif
 }
@@ -529,8 +542,8 @@ std::unique_ptr<CausalLM> create_rec_model(const ModelContext& context) {
 }
 
 std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
-  // Python model executor: build the graph in Python (e.g. GLM-5-Next-VL via
-  // xllm.python.models.glm5_next_vl.Glm5NextVLModel). PyCausalLM is-a
+  // Python model executor: build the graph in Python (e.g. GLM-5.3-Flash-VL via
+  // xllm.python.models.glm5_3_flash_vl.Glm53FlashVLModel). PyCausalLM is-a
   // CausalVLM so it satisfies this factory's return type; PyExecutorImpl drives
   // encode/get_input_embeddings via pybind. Read from the global ModelConfig:
   // the VLM worker does not populate context.model_impl, unlike the LLM worker.

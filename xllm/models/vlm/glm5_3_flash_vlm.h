@@ -14,11 +14,11 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
-// Multimodal-processor registration for glm5_next served as a VLM via
+// Multimodal-processor registration for glm5_3_flash served as a VLM via
 // --backend=vlm --model_impl=python (PyCausalLM + the pure-torch
-// xllm.python.models.glm5_next_vl.Glm5NextVLModel).
+// xllm.python.models.glm5_3_flash_vl.Glm53FlashVLModel).
 //
-// glm5_next has no C++ VLM model object (the language model and the GlmOcr
+// glm5_3_flash has no C++ VLM model object (the language model and the GlmOcr
 // vision tower both live in Python). The framework still requires a
 // multimodal processor to satisfy VLMMaster's create_multimodal_processor
 // CHECK, so this header registers one that:
@@ -44,9 +44,9 @@ limitations under the License.
 namespace xllm {
 
 // Image-only on the python path; video defaults to VideoNoneProcessor.
-using Glm5NextVLMultimodalProcessor =
+using Glm53FlashVLMultimodalProcessor =
     MultimodalProcessor<GLM4VPromptProcessor, Qwen2VLImageProcessor>;
 
-REGISTER_MULTIMODAL_PROCESSOR(glm5_next, Glm5NextVLMultimodalProcessor);
+REGISTER_MULTIMODAL_PROCESSOR(glm5_3_flash, Glm53FlashVLMultimodalProcessor);
 
 }  // namespace xllm

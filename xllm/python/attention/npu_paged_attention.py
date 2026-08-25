@@ -187,7 +187,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # MHA graph buffers must not be initialized for an MLA instance. The
         # pr2199 constructor heuristic (head_dim > 192 and num_kv_heads == 1)
         # covers DS V3.2 / glm5_2 (head_dim == qk_nope + qk_rope == 576) but
-        # misses glm5_next, whose NoPE DSA layers report head_dim == 128 and
+        # misses glm5_3_flash, whose NoPE DSA layers report head_dim == 128 and
         # the model-level n_kv_heads; bind_kv_caches therefore refines the
         # flag from the actual cache layout (a latent-only key slot or a
         # paged sparse-index cache implies MLA).
@@ -220,7 +220,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
     @property
     def num_kv_blocks(self) -> int:
-        # Hybrid models (glm5_next) interleave KDA layers (key is None) with
+        # Hybrid models (glm5_3_flash) interleave KDA layers (key is None) with
         # DSA layers; scan for the first real KV cache instead of assuming
         # layer 0 is full attention.
         for cache in self._kv_caches:
@@ -264,7 +264,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         self._kv_caches = kv_caches
         has_sparse_index = any(cache.index is not None for cache in kv_caches)
-        # glm5_next DSA layers are NoPE: the latent lives in the key slot and
+        # glm5_3_flash DSA layers are NoPE: the latent lives in the key slot and
         # the value/rope slot is a 0-dim tensor normalized to None, while the
         # kPool indexer adds a paged index cache. Either signal marks this
         # backend instance as MLA even though the constructor heuristic
@@ -1383,7 +1383,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         against the transformers reference); only the state I/O moved here so
         both attention layer types dispatch through the backend.
         """
-        from xllm.python.models.glm5_next import (
+        from xllm.python.models.glm5_3_flash import (
             _causal_conv1d_fn,
             _causal_conv1d_update,
             _l2norm,
@@ -1902,7 +1902,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 if in_graph:
                     # F.conv1d is an aclop NPUGraph cannot capture; the manual
                     # depthwise mul-add is capture-safe. Eager keeps F.conv1d.
-                    from xllm.python.models.glm5_next import (
+                    from xllm.python.models.glm5_3_flash import (
                         _causal_conv1d_update_graph,
                     )
                     mixed_qkv = _causal_conv1d_update_graph(

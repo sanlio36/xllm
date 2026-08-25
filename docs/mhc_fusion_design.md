@@ -12,7 +12,7 @@ GLM5-next 模型使用 **Manifold-constrained Hyper-Connection (mHC)** 机制，
 
 ### 1.2 纯 Python 实现的性能问题
 
-原始实现中，`Glm5NextHyperConnection.forward()` 包含以下纯 Python 操作：
+原始实现中，`Glm53FlashHyperConnection.forward()` 包含以下纯 Python 操作：
 
 1. **Unweighted RMSNorm**：计算 `rsqrt(mean(x^2))`
 2. **Linear 投影**：大矩阵乘法 `[B, S, hc*D] @ [mix, hc*D]^T`
@@ -24,7 +24,7 @@ GLM5-next 模型使用 **Manifold-constrained Hyper-Connection (mHC)** 机制，
 
 ## 2. vLLM 参考实现
 
-vLLM 已在 `vllm-ascend-glm-next` 中接入了 mHC 融合算子，核心代码位于 `vllm_ascend/models/glm5_next.py`。
+vLLM 已在 `vllm-ascend-glm-next` 中接入了 mHC 融合算子，核心代码位于 `vllm_ascend/models/glm5_3_flash.py`。
 
 ### 2.1 vLLM 的 hc_pre
 
@@ -76,7 +76,7 @@ self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 xLLM 底层已有 NPU 融合 kernel（`hc_pre` / `hc_post`），实现在 `xllm/core/kernels/npu/xllm_ops/` 下。接入方案：
 
 1. 通过 pybind11 将 C++ kernel 暴露到 `xllm_runtime` Python 模块
-2. 修改 `glm5_next.py` 中的 `Glm5NextHyperConnection` 和 `Glm5NextDecoderLayer`，用融合算子替代纯 Python 操作
+2. 修改 `glm5_3_flash.py` 中的 `Glm53FlashHyperConnection` 和 `Glm53FlashDecoderLayer`，用融合算子替代纯 Python 操作
 3. 通过 feature flag 实现融合路径/原始路径的 fallback 切换
 
 ### 3.2 新增文件
@@ -137,7 +137,7 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
 
 添加 `py_hyper_connection.h` 和 `py_hyper_connection.cpp`，通过 `USE_NPU` 条件编译。
 
-#### `xllm/python/models/glm5_next.py`
+#### `xllm/python/models/glm5_3_flash.py`
 
 ##### 3.3.1 Feature Flag
 
@@ -179,7 +179,7 @@ collapsed, post, comb = xllm_runtime.hc_pre(
 )
 ```
 
-##### 3.3.3 Glm5NextHyperConnection.forward() 双路径
+##### 3.3.3 Glm53FlashHyperConnection.forward() 双路径
 
 ```python
 def forward(self, hidden_streams):
@@ -197,7 +197,7 @@ def forward(self, hidden_streams):
         ...
 ```
 
-##### 3.3.4 Glm5NextDecoderLayer 双路径
+##### 3.3.4 Glm53FlashDecoderLayer 双路径
 
 ```python
 def forward(self, hidden_states, ...):
@@ -222,7 +222,7 @@ def forward(self, hidden_states, ...):
 
 ### 3.5 MLA Attention 输出 reshape
 
-xLLM 的 `Glm5NextMlaAttention.forward()` 将输入从 `[B, S, D]` 压平为 `[B*S, D]` 进行计算，返回 2D 输出。这导致 `hc_post` 收到的 `x` 为 2D，而 kernel 要求 3D。
+xLLM 的 `Glm53FlashMlaAttention.forward()` 将输入从 `[B, S, D]` 压平为 `[B*S, D]` 进行计算，返回 2D 输出。这导致 `hc_post` 收到的 `x` 为 2D，而 kernel 要求 3D。
 
 解决方式：在 `_forward_fused` 和 `_forward_ref` 中，attention 输出后检查 dim，若为 2D 则 reshape 回 `[B, S, D]`：
 
@@ -233,7 +233,7 @@ if hidden_states.dim() == 2:
         residual.shape[0], residual.shape[1], -1)
 ```
 
-> 注：`Glm5NextKdaAttention` 返回 3D `[B, S, D]`，不受此逻辑影响。
+> 注：`Glm53FlashKdaAttention` 返回 3D `[B, S, D]`，不受此逻辑影响。
 
 ## 4. 数据流总览
 
@@ -295,7 +295,7 @@ Output: [B, S, hc_mult, D]
 | `xllm/core/runtime/py_hyper_connection.cpp` | 新增 | pybind11 绑定，暴露 `hc_pre` / `hc_post` |
 | `xllm/core/runtime/py_executor_impl.cpp` | 修改 | 添加 `#include` 和 `register_hyper_connection_kernels(m)` |
 | `xllm/core/runtime/CMakeLists.txt` | 修改 | 添加 `py_hyper_connection.h/.cpp`（`USE_NPU` 条件编译） |
-| `xllm/python/models/glm5_next.py` | 修改 | 添加 feature flag、双路径实现、参数 dtype 对齐、MLA reshape |
+| `xllm/python/models/glm5_3_flash.py` | 修改 | 添加 feature flag、双路径实现、参数 dtype 对齐、MLA reshape |
 
 ## 6. 测试验证
 

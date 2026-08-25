@@ -103,10 +103,10 @@ class ModelExecutor:
         # config across all layers" check is skipped. Non-GLM-Next models keep
         # the upstream behavior: backend from the first layer plus the
         # identical-config check.
-        from xllm.python.models.glm5_next import Glm5NextMlaAttention
+        from xllm.python.models.glm5_3_flash import Glm53FlashMlaAttention
         dsa_layers = [
             layer for layer in attention_layers
-            if isinstance(layer, Glm5NextMlaAttention)
+            if isinstance(layer, Glm53FlashMlaAttention)
         ]
         if dsa_layers:
             first_attention = dsa_layers[0]

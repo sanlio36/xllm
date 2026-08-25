@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Export the GLM-5-Next MTP draft layer into a standalone draft-model dir.
+"""Export the GLM-5.3-Flash MTP draft layer into a standalone draft-model dir.
 
 The appended draft layer lives in the main checkpoint as
 ``model.language_model.layers.<num_hidden_layers>`` (a full DSA sparse-
 attention MoE layer with indexer, WITHOUT mHC residual streams) plus its
 ``enorm`` / ``hnorm`` / ``eh_proj`` fusion weights and ``shared_head.norm``.
-The draft engine loads this dir with ``model_type=glm5_next_mtp`` and the
-python draft model (``xllm/python/models/glm5_next_mtp.py``).
+The draft engine loads this dir with ``model_type=glm5_3_flash_mtp`` and the
+python draft model (``xllm/python/models/glm5_3_flash_mtp.py``).
 
 Output layout (loader-native names, no aliasing needed at load time):
   - ``model.layers.0.*``                <- ``model.language_memory.layers.<n>.*``
@@ -32,7 +32,7 @@ Quantized (w8a8) expert weights and their scales are copied as-is — the
 python loader probes them per module.
 
 Usage:
-  python3 tools/export_mtp_glm5_next.py \
+  python3 tools/export_mtp_glm5_3_flash.py \
       --input-dir /export/home/models/GLM-next-w8a8 \
       --output-dir /export/home/models/GLM-next-w8a8-mtp
 """
@@ -49,8 +49,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.logger import logger  # noqa: E402
 
-DRAFT_MODEL_TYPE = "glm5_next_mtp"
-DRAFT_ARCHITECTURE = "Glm5NextMtpForCausalLM"
+DRAFT_MODEL_TYPE = "glm5_3_flash_mtp"
+DRAFT_ARCHITECTURE = "Glm53FlashMtpForCausalLM"
 TEXT_PREFIX = "model.language_model."
 TOKENIZER_FILES = (
     "tokenizer.json",
@@ -154,7 +154,7 @@ def export_draft(input_dir: str, output_dir: str) -> None:
     draft_text["mlp_layer_types"] = ["sparse"]
     draft_text["indexer_types"] = ["full"]
     draft_text["first_k_dense_replace"] = 0
-    draft_text["model_type"] = "glm5_next_text"
+    draft_text["model_type"] = "glm5_3_flash_text"
     draft_config = dict(config)
     draft_config["model_type"] = DRAFT_MODEL_TYPE
     draft_config["architectures"] = [DRAFT_ARCHITECTURE]
@@ -176,7 +176,7 @@ def export_draft(input_dir: str, output_dir: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", required=True,
-                        help="GLM-5-Next checkpoint dir (bf16 or w8a8)")
+                        help="GLM-5.3-Flash checkpoint dir (bf16 or w8a8)")
     parser.add_argument("--output-dir", required=True,
                         help="draft model output dir")
     args = parser.parse_args()

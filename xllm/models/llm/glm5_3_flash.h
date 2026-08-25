@@ -21,28 +21,37 @@ limitations under the License.
 
 namespace xllm {
 
-// glm5_next is served via --model_impl=python (PyCausalLM + the pure-torch
-// xllm.python.models.glm5_next.Glm5NextForCausalLM, or Glm5NextVLModel for
+// glm5_3_flash is served via --model_impl=python (PyCausalLM + the pure-torch
+// xllm.python.models.glm5_3_flash.Glm53FlashForCausalLM, or Glm53FlashVLModel for
 // --backend=vlm). No C++ model class is needed; this header only registers the
 // config.json -> ModelArgs loader so PyCausalLM::build_config_dict forwards
 // the right fields to the python model.
 // KDA (linear_attn_config: gate_lower_bound/safe_gate/full_attn_layers) and mHC
 // (hc_mult/hc_eps/hc_sinkhorn_iters) fields are intentionally NOT plumbed here:
-// the python Glm5NextConfig.from_dict defaults match the real 300B config, so
+// the python Glm53FlashConfig.from_dict defaults match the real 300B config, so
 // the python side resolves them correctly without C++ plumbing.
 // VLM note: the multimodal token ids and vision_config.* fields ARE plumbed
 // (see the VLM block below) so the C++ multimodal processor
-// (GLM4VPromptProcessor, registered in vlm/glm5_next_vlm.h) resolves GLM image
-// token ids / merge size, and the Python GlmOcr ViT (glm5_next_vl.py) receives
+// (GLM4VPromptProcessor, registered in vlm/glm5_3_flash_vlm.h) resolves GLM image
+// token ids / merge size, and the Python GlmOcr ViT (glm5_3_flash_vl.py) receives
 // the real vision dims instead of its (different) defaults.
 
-namespace glm5_next_args {
+namespace glm5_3_flash_args {
 
-// Shared config.json -> ModelArgs loader for glm5_next and the
-// glm5_next_mtp draft (same field set; the draft config.json only differs in
+// Shared config.json -> ModelArgs loader for glm5_3_flash and the
+// glm5_3_flash_mtp draft (same field set; the draft config.json only differs in
 // num_hidden_layers / layer schedules / model_type).
 inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
-  LOAD_ARG_OR(model_type, "model_type", "glm5_next");
+  LOAD_ARG_OR(model_type, "model_type", "glm5_3_flash");
+  // Backward compatibility: checkpoints exported before the GLM-5-Next →
+  // GLM-5.3-Flash rename still carry "glm5_next" / "glm5_next_mtp" in
+  // config.json. Normalize to the new name so downstream model_type checks
+  // (e.g. is_glm5_3_flash_mtp_draft_model_type) match.
+  if (args->model_type() == "glm5_next") {
+    SET_ARG(model_type, "glm5_3_flash");
+  } else if (args->model_type() == "glm5_next_mtp") {
+    SET_ARG(model_type, "glm5_3_flash_mtp");
+  }
   LOAD_ARG_OR(dtype, "torch_dtype", "bfloat16");
   LOAD_ARG_OR(vocab_size, "vocab_size", 154880);
   LOAD_ARG_OR(hidden_size, "hidden_size", 4096);
@@ -132,12 +141,12 @@ inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
 
   // VLM (vision) config + multimodal token ids. Plumbed so that
   // --backend=vlm --model_impl=python forwards the real GlmOcr vision
-  // dims to the Python ViT (xllm.python.models.glm5_next_vl) via the flat
+  // dims to the Python ViT (xllm.python.models.glm5_3_flash_vl) via the flat
   // mm_-prefixed ModelArgs dict, and so the C++ multimodal processor
-  // (GLM4VPromptProcessor, registered in vlm/glm5_next_vlm.h) resolves the
+  // (GLM4VPromptProcessor, registered in vlm/glm5_3_flash_vlm.h) resolves the
   // GLM-family image token ids and merge size. Defaults match the real
-  // GLM-5-Next-VL config so the ViT computes correct dims even if a field
-  // is absent from config.json (the Python Glm5NextVisionConfig defaults
+  // GLM-5.3-Flash-VL config so the ViT computes correct dims even if a field
+  // is absent from config.json (the Python Glm53FlashVisionConfig defaults
   // differ — e.g. image_size=336, out_hidden_size=1536 — and would
   // miscompute if relied upon).
   LOAD_ARG_OR(image_token_id, "image_token_id", 154854);
@@ -176,9 +185,9 @@ inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
   return true;
 }
 
-}  // namespace glm5_next_args
+}  // namespace glm5_3_flash_args
 
-REGISTER_MODEL_ARGS_LOADER(glm5_next, &glm5_next_args::load_model_args);
-REGISTER_MODEL_ARGS_LOADER(glm5_next_mtp, &glm5_next_args::load_model_args);
+REGISTER_MODEL_ARGS_LOADER(glm5_3_flash, &glm5_3_flash_args::load_model_args);
+REGISTER_MODEL_ARGS_LOADER(glm5_3_flash_mtp, &glm5_3_flash_args::load_model_args);
 
 }  // namespace xllm

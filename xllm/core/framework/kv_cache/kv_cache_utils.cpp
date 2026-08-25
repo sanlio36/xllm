@@ -139,7 +139,7 @@ bool is_linear_attention_layer(int64_t layer_idx,
     }
     const std::string& layer_type = layer_types[static_cast<size_t>(layer_idx)];
     // Layers whose type is an explicit full-attention marker (including the
-    // glm5_next deepseek_sparse_attention label) use paged KV, not the linear
+    // glm5_3_flash deepseek_sparse_attention label) use paged KV, not the linear
     // (conv/ssm) cache.
     return layer_type != "full_attention" && layer_type != "attention" &&
            layer_type != "deepseek_sparse_attention";

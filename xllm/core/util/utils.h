@@ -139,8 +139,10 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "glm4_moe_lite",
       "glm_moe_dsa",  // glm5 model type
       "glm_moe_dsa_mtp",
-      "glm5_next",      // glm5_next: absorbed MLA (NoPE, kv_lora=512)
-      "glm5_next_mtp",  // MTP draft: same absorbed-MLA attention as glm5_next
+      "glm5_next",         // backward compat: old name for glm5_3_flash
+      "glm5_next_mtp",     // backward compat: old name for glm5_3_flash_mtp
+      "glm5_3_flash",      // glm5_3_flash: absorbed MLA (NoPE, kv_lora=512)
+      "glm5_3_flash_mtp",  // MTP draft: same absorbed-MLA attention as glm5_3_flash
       "joyai_llm_flash"};
   return kMlaModelTypeSet;
 }

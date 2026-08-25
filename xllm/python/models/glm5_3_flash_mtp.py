@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""GLM-5-Next MTP (multi-token prediction) draft model.
+"""GLM-5.3-Flash MTP (multi-token prediction) draft model.
 
 The speculative worker and MTP scheduling remain in C++ (MTPWorkerImpl). This
 module only describes the draft computation, mirroring the DeepSeek-V3.2
@@ -45,19 +45,19 @@ from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.linear import ColumnParallelLinear
 from xllm.python.layers.qlinear import QLinearWeightLoader
 from xllm.python.models.base import PyModelBase
-from xllm.python.models.glm5_next import (
-    Glm5NextConfig,
-    Glm5NextForCausalLM,
-    Glm5NextMlaAttention,
-    Glm5NextMoE,
+from xllm.python.models.glm5_3_flash import (
+    Glm53FlashConfig,
+    Glm53FlashForCausalLM,
+    Glm53FlashMlaAttention,
+    Glm53FlashMoE,
     _RMSNorm,
 )
 
 
-class Glm5NextMtpDecoderLayer(nn.Module):
+class Glm53FlashMtpDecoderLayer(nn.Module):
     """One pre-norm decoder layer without mHC (the MTP checkpoint layer shape)."""
 
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.layer_id = 0
@@ -65,11 +65,11 @@ class Glm5NextMtpDecoderLayer(nn.Module):
                                         dtype, device)
         # Draft schedule: layer 0 is deepseek_sparse_attention (the appended
         # MTP layer carries a full indexer), MoE MLP (first_k_dense_replace=0).
-        self.self_attn = Glm5NextMlaAttention(cfg, 0, dtype, device)
+        self.self_attn = Glm53FlashMlaAttention(cfg, 0, dtype, device)
         self.post_attention_layernorm = _RMSNorm(cfg.hidden_size,
                                                  cfg.rms_norm_eps, dtype,
                                                  device)
-        self.mlp = Glm5NextMoE(cfg, dtype, device)
+        self.mlp = Glm53FlashMoE(cfg, dtype, device)
 
     def forward(self, hidden_states: torch.Tensor,
                 position_ids: torch.Tensor,
@@ -93,10 +93,10 @@ class Glm5NextMtpDecoderLayer(nn.Module):
         return hidden_states, topk
 
 
-class Glm5NextMtpModel(nn.Module):
+class Glm53FlashMtpModel(nn.Module):
     """MTP draft body: eh_proj fusion + one decoder layer + shared-head norm."""
 
-    def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype,
+    def __init__(self, cfg: Glm53FlashConfig, dtype: torch.dtype,
                  device: torch.device) -> None:
         super().__init__()
         self.cfg = cfg
@@ -114,7 +114,7 @@ class Glm5NextMtpModel(nn.Module):
             gather_output=True, dtype=dtype, device=device,
         )
         self.layers = nn.ModuleList(
-            [Glm5NextMtpDecoderLayer(cfg, dtype, device)
+            [Glm53FlashMtpDecoderLayer(cfg, dtype, device)
              for _ in range(cfg.n_layers)]
         )
         # Checkpoint name: model.layers.<n>.shared_head.norm — exported as
@@ -125,7 +125,7 @@ class Glm5NextMtpModel(nn.Module):
                 position_ids: torch.Tensor,
                 input_embedding: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
-        # Normalize flat [N] runner inputs to [B, S] like Glm5NextModel.
+        # Normalize flat [N] runner inputs to [B, S] like Glm53FlashModel.
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         if position_ids is not None and position_ids.dim() == 1:
@@ -156,16 +156,16 @@ class Glm5NextMtpModel(nn.Module):
         return hidden_states.view(-1, self.cfg.hidden_size)
 
 
-class Glm5NextMtpForCausalLM(Glm5NextForCausalLM):
-    """GLM-5-Next MTP draft calculator; scheduling stays in the C++ worker."""
+class Glm53FlashMtpForCausalLM(Glm53FlashForCausalLM):
+    """GLM-5.3-Flash MTP draft calculator; scheduling stays in the C++ worker."""
 
     def __init__(self, config: dict) -> None:
-        # Inherit Glm5NextForCausalLM for its weight-loader helpers
+        # Inherit Glm53FlashForCausalLM for its weight-loader helpers
         # (_load_dsa_attn / _load_mlp / ...), but deliberately skip its
         # __init__ (it builds the full 45-layer text model). Mirror the VL
         # composer: initialize nn.Module directly.
         nn.Module.__init__(self)
-        self.cfg = Glm5NextConfig.from_dict(config)
+        self.cfg = Glm53FlashConfig.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
         self.cfg.tp_rank = int(config.get("tp_rank", 0))
         dtype = self.resolve_dtype(
@@ -175,7 +175,7 @@ class Glm5NextMtpForCausalLM(Glm5NextForCausalLM):
         self.dtype = dtype
         self.device = device
 
-        self.model = Glm5NextMtpModel(self.cfg, dtype, device)
+        self.model = Glm53FlashMtpModel(self.cfg, dtype, device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size, self.cfg.vocab_size // self.cfg.tp_size,
             self.cfg.tp_size, gather_output=True, dtype=dtype, device=device,
@@ -186,7 +186,7 @@ class Glm5NextMtpForCausalLM(Glm5NextForCausalLM):
                      tp_size: int) -> None:
         """Load the exported MTP draft checkpoint (loader-native key names).
 
-        The exporter (tools/export_mtp_glm5_next.py) remaps the appended
+        The exporter (tools/export_mtp_glm5_3_flash.py) remaps the appended
         checkpoint layer ``model.language_model.layers.<n>`` to
         ``model.layers.0`` plus top-level ``model.{enorm,hnorm,eh_proj}``,
         ``model.norm`` (shared_head.norm), ``model.embed_tokens`` and
