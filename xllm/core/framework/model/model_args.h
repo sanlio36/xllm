@@ -409,10 +409,21 @@ struct ModelArgs {
   PROPERTY(int, mm_image_temporal_patch_size) = 0;
   PROPERTY(int, mm_image_merge_size) = 0;
 
+  // GLM-5.3-Flash (0826) per-token resize budget. When both are > 0 the image
+  // processor uses the token-budget smart_resize (pixels_per_token =
+  // temporal_patch_size * (patch_size * merge_size)^2); otherwise it falls back
+  // to the legacy pixel-budget resize.
+  PROPERTY(int, mm_image_min_tokens) = 0;
+  PROPERTY(int, mm_image_max_tokens) = 0;
+
   // GLM
   PROPERTY(int, mm_video_patch_size) = 0;
   PROPERTY(int, mm_video_temporal_patch_size) = 0;
   PROPERTY(int, mm_video_merge_size) = 0;
+
+  // GLM-5.3-Flash (0826) per-token resize budget for video (see mm_image_*).
+  PROPERTY(int, mm_video_min_tokens) = 0;
+  PROPERTY(int, mm_video_max_tokens) = 0;
 
   PROPERTY(int, mm_image_feature_size) = 0;
   PROPERTY(int, mm_scale_resolution) = 0;
@@ -766,6 +777,8 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_image_temporal_patch_size: "
      << args.mm_image_temporal_patch_size();
   os << ", mm_image_merge_size: " << args.mm_image_merge_size();
+  os << ", mm_image_min_tokens: " << args.mm_image_min_tokens();
+  os << ", mm_image_max_tokens: " << args.mm_image_max_tokens();
   os << ", mm_image_token_index: " << args.mm_image_token_index();
   os << ", mm_video_normalize_mean: [";
   for (const auto& mean : args.mm_video_normalize_mean()) {
@@ -782,6 +795,8 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_video_temporal_patch_size: "
      << args.mm_video_temporal_patch_size();
   os << ", mm_video_merge_size: " << args.mm_video_merge_size();
+  os << ", mm_video_min_tokens: " << args.mm_video_min_tokens();
+  os << ", mm_video_max_tokens: " << args.mm_video_max_tokens();
   os << ", mm_pad_token_id: " << args.mm_pad_token_id();
   os << ", tie_word_embeddings: " << args.tie_word_embeddings();
   os << ", use_sliding_window: " << args.use_sliding_window();
