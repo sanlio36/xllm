@@ -73,6 +73,12 @@ from xllm.python.model_executor.forward_context import (
 )
 
 _has_mhc_fused = hasattr(kernels, "hc_pre") and kernels.hc_pre is not None
+
+# Per-chunk cap (bytes) for the indexer scores slab [B, sub, n_heads, n_pools]
+# in Glm53FlashIndexer.select_topk. The unchunked tensor grows with n_pools
+# (= kv_len / index_kpool): 8 GiB at 32K context, 16 GiB at 64K — beyond the
+# activation headroom and a hard device OOM mid prefill.
+_SCORES_SLAB_CAP_BYTES = int(1.5 * 1024 ** 3)
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_3_flash_kpool import (
     alloc_pool_cache,
@@ -1058,22 +1064,41 @@ class Glm53FlashIndexer(nn.Module):
                 packed_states, key_valid
             )
 
-        scores = torch.matmul(
-            q.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1)
-        )
-        # In-place relu/scale: bit-identical elementwise math, but avoids a
-        # second [B, S, n_heads, n_pools] fp32 allocation. The full-length
-        # prefill warmup (10k tokens) otherwise peaks ~3.1 GiB here per copy
-        # and OOMs once the graph runner's startup reservations shrink the
-        # activation headroom under NPU_MEMORY_FRACTION.
-        scores = torch.relu_(scores)
-        scores *= self.softmax_scale
         weights = self.weights_proj(
             hidden_states.to(self.weights_proj.weight.dtype)
         ).float()
-        pool_scores = torch.einsum(
-            "bshp,bsh->bsp", scores, weights * (self.n_heads ** -0.5)
+        # Query-dim sub-chunking: each query row's logits are
+        # q[row] @ pool_keys.T and its pool score a head-weighted sum of those
+        # logits — independent of every other row — so slicing the query dim
+        # is bit-exact while keeping each transient scores slab under
+        # _SCORES_SLAB_CAP_BYTES. Without it the full [B, S, n_heads, n_pools]
+        # fp32 scores tensor grows linearly with n_pools (= kv_len /
+        # index_kpool) and OOMs mid prefill. When the full tensor already fits
+        # (decode: S=1; short prefills) sub == seq_len and the loop degenerates
+        # to the original single matmul.
+        n_pools = pool_keys.shape[1]
+        pool_keys_t = pool_keys.transpose(-1, -2).float().unsqueeze(1)
+        q_f = q.float()
+        slab_elems = self.n_heads * n_pools
+        sub = (
+            seq_len
+            if slab_elems == 0
+            else max(1, min(seq_len, _SCORES_SLAB_CAP_BYTES // (slab_elems * 4)))
         )
+        pool_scores = torch.empty(
+            batch_size, seq_len, n_pools, dtype=torch.float32, device=device
+        )
+        for start in range(0, seq_len, sub):
+            end = min(start + sub, seq_len)
+            slab = torch.matmul(q_f[:, start:end], pool_keys_t)
+            # In-place relu/scale: bit-identical elementwise math, but avoids a
+            # second [B, sub, n_heads, n_pools] fp32 allocation.
+            slab = torch.relu_(slab)
+            slab *= self.softmax_scale
+            pool_scores[:, start:end] = torch.einsum(
+                "bshp,bsh->bsp", slab, weights[:, start:end] * (self.n_heads ** -0.5)
+            )
+            del slab
 
         if pool_keys.shape[1] != 0:
             # Pool visibility uses the pool's FIRST slot (start), not its last
