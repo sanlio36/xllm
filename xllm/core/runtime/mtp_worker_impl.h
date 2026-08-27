@@ -235,6 +235,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     std::vector<uint64_t> dp_global_batch_generations;
     std::optional<ForwardOutput> output;
     ForwardInput prepared_input;
+    StreamEventPtr completion_event;
   };
 
   void stage_target_context_write(const ForwardInput& input,
@@ -263,6 +264,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                 ForwardInput combined_input);
   void submit_pending_first_draft(const ForwardInput& batch_identity_input,
                                   ForwardInput draft_input);
+  void publish_pending_first_draft_cache_fence(ForwardOutput& output) const;
+  void retire_pending_first_draft(const char* reason);
   bool pending_draft_context_matches(const ForwardInput& input) const;
   bool prelaunch_metadata_batch_matches(const ForwardInput& input) const;
 

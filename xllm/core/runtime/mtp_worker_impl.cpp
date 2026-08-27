@@ -1207,14 +1207,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
       can_use_combined_first_draft() && pending_draft_context_matches(input);
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
-    // The preceding validation may have speculatively submitted draft-0 before
-    // the scheduler learned that the batch had finished.  Keep its graph/input
-    // buffers alive until the queued work completes, then discard the result.
-    // This is a batch-exit slow path and is never taken in steady decode.
-    const int32_t ret = compute_stream_->synchronize();
-    CHECK_EQ(ret, 0) << "failed to drain final MTP draft prelaunch, ret="
-                     << ret;
-    pending_draft_context_ = PendingDraftContext();
+    retire_pending_first_draft("empty_batch_mismatch");
   }
   flush_pending_target_context();
 
@@ -1322,6 +1315,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
         token_num *= 2;
       }
       submit_pending_first_draft(input, std::move(next_first_draft_input));
+      publish_pending_first_draft_cache_fence(output);
     }
     // Empty DP ranks do not stage a target context. Publish the generation
     // after this turn's decision so they skip exactly the same first turn as
@@ -1509,13 +1503,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       pending_target_context_.ready_event;
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
-    // A batch transition invalidates the speculative prelaunch.  Drain it
-    // before releasing its graph/input buffers; this slow path is outside
-    // steady decode and preserves cache/buffer lifetime correctness.
-    const int32_t ret = compute_stream_->synchronize();
-    CHECK_EQ(ret, 0) << "failed to drain stale MTP draft prelaunch, ret="
-                     << ret;
-    pending_draft_context_ = PendingDraftContext();
+    retire_pending_first_draft("decode_batch_mismatch");
   }
   const auto mark_device_target_context_ready = [&]() {
     device_context_ready_embedding_ids_ =
@@ -2500,6 +2488,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                              target_context_ready_event,
                              std::move(accepted_tokens_host),
                              std::move(failed_sequence_rows));
+  target_output.ready_event = target_context_ready_event;
   if (prelaunch_next_first_draft && !has_failed_sequence_rows) {
     // Submit the next iteration's first draft before returning to the
     // scheduler.  This is the actual asynchronous boundary: scheduler/host
@@ -2510,8 +2499,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                              base_positions,
                              base_kv_seq_lens,
                              std::move(next_first_draft_input));
+    publish_pending_first_draft_cache_fence(target_output);
   }
-  target_output.ready_event = target_context_ready_event;
 
   // Target validation consumes all draft outputs on the same compute stream;
   // keep their prepared inputs alive on target_output until the target-context
@@ -3002,6 +2991,30 @@ void MTPWorkerImpl::submit_pending_first_draft(
                            pending_draft_context_.prepared_input);
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
+  pending_draft_context_.completion_event = compute_stream_->record_event();
+  if (pending_draft_context_.completion_event == nullptr) {
+    const int32_t ret = compute_stream_->synchronize();
+    CHECK_EQ(ret, 0) << "failed to synchronize MTP prelaunch cache fence, ret="
+                     << ret;
+  }
+}
+
+void MTPWorkerImpl::publish_pending_first_draft_cache_fence(
+    ForwardOutput& output) const {
+  CHECK(pending_draft_context_.output.has_value());
+  output.requires_cache_ownership_fence = true;
+  if (pending_draft_context_.completion_event != nullptr) {
+    output.ready_event = pending_draft_context_.completion_event;
+  }
+}
+
+void MTPWorkerImpl::retire_pending_first_draft(const char* reason) {
+  CHECK(pending_draft_context_.output.has_value());
+  (void)reason;
+  CHECK(pending_draft_context_.completion_event == nullptr ||
+        pending_draft_context_.completion_event->synchronize())
+      << "failed to retire stale MTP draft prelaunch";
+  pending_draft_context_ = PendingDraftContext();
 }
 
 bool MTPWorkerImpl::pending_draft_context_matches(
