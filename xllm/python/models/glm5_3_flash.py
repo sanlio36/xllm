@@ -946,6 +946,7 @@ class Glm53FlashIndexer(nn.Module):
         self.rope_dim = cfg.qk_rope_head_dim  # 0 for the 300B default
         self.topk = cfg.index_topk
         self.index_kpool = cfg.index_kpool
+        self.index_kpool_compress = cfg.index_kpool_compress
         self.index_kpool_always_select_tail = cfg.index_kpool_always_select_tail
         self.use_acl_graph = cfg.use_acl_graph
         self.softmax_scale = self.head_dim ** -0.5
@@ -1019,6 +1020,52 @@ class Glm53FlashIndexer(nn.Module):
             packed_states=packed_states,
         )
 
+    def _select_topk_fused(
+        self,
+        query: torch.Tensor,
+        pool_keys: torch.Tensor,
+        weights: torch.Tensor,
+        key_valid: torch.Tensor,
+        pool_valid: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Replace the dense pool scoring and TopK with PoolKeyIndexer."""
+        if (
+            pool_keys.dtype != query.dtype
+            or not bool(attention_mask.all().item())
+        ):
+            return None
+
+        outputs = []
+        for batch_idx in range(query.shape[0]):
+            token_count = int(key_valid[batch_idx].sum().item())
+            pool_count = int(pool_valid[batch_idx].sum().item())
+            if pool_count == 0:
+                return None
+            tail_count = token_count % self.index_kpool
+            pool_tail_k = torch.tensor(
+                [tail_count], dtype=torch.int32, device=query.device
+            )
+            indices, _ = kernels.pool_key_indexer(
+                query[batch_idx:batch_idx + 1].contiguous(),
+                pool_keys[
+                    batch_idx:batch_idx + 1, :pool_count, None
+                ].contiguous(),
+                weights[batch_idx:batch_idx + 1].contiguous(),
+                pool_tail_k,
+                self.topk,
+                self.index_kpool,
+                return_value=False,
+            )
+            outputs.append(indices)
+
+        output_width = self.topk + (
+            self.index_kpool - 1
+            if self.index_kpool_always_select_tail
+            else 0
+        )
+        return torch.cat(outputs, dim=0)[..., :output_width].long()
+
     def select_topk(
         self,
         q_resid: torch.Tensor,
@@ -1066,7 +1113,30 @@ class Glm53FlashIndexer(nn.Module):
 
         weights = self.weights_proj(
             hidden_states.to(self.weights_proj.weight.dtype)
-        ).float()
+        )
+        if (
+            self.index_kpool_compress
+            and q.device.type == "npu"
+            and not _in_acl_graph()
+            and hasattr(kernels, "pool_key_indexer")
+        ):
+            try:
+                scaled_weights = (
+                    weights * (self.n_heads ** -0.5)
+                ).to(q.dtype)
+                fused_indices = self._select_topk_fused(
+                    q,
+                    pool_keys,
+                    scaled_weights,
+                    key_valid,
+                    pool_valid,
+                    attention_mask,
+                )
+                if fused_indices is not None:
+                    return fused_indices
+            except NotImplementedError:
+                pass
+        weights = weights.float()
         # Query-dim sub-chunking: each query row's logits are
         # q[row] @ pool_keys.T and its pool score a head-weighted sum of those
         # logits — independent of every other row — so slicing the query dim

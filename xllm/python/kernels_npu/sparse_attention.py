@@ -18,6 +18,74 @@ from __future__ import annotations
 
 import torch
 
+try:
+    import cann_ops_transformer  # noqa: F401
+except ImportError:
+    cann_ops_transformer = None
+
+
+def pool_key_indexer(
+    query: torch.Tensor,
+    pool_key: torch.Tensor,
+    weights: torch.Tensor,
+    pool_tail_k: torch.Tensor,
+    topk: int,
+    pool_size: int,
+    *,
+    return_value: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run CANN's fused pool-key indexer with dense BSND inputs."""
+    if query.dim() != 4 or query.size(-1) != 128 or query.numel() == 0:
+        raise ValueError("query must have shape [B, S1, N1, 128]")
+    if (
+        pool_key.dim() != 4
+        or pool_key.size(0) != query.size(0)
+        or pool_key.size(2) != 1
+        or pool_key.size(-1) != 128
+        or pool_key.numel() == 0
+    ):
+        raise ValueError("pool_key must have shape [B, S2, 1, 128]")
+    if query.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("query must be float16 or bfloat16")
+    if pool_key.dtype != query.dtype or weights.dtype != query.dtype:
+        raise TypeError("query, pool_key, and weights must have the same dtype")
+    if weights.shape != query.shape[:3]:
+        raise ValueError("weights must have shape [B, S1, N1]")
+    if pool_tail_k.dtype != torch.int32 or pool_tail_k.dim() != 1:
+        raise TypeError("pool_tail_k must be a rank-1 int32 tensor")
+    inputs = (pool_key, weights, pool_tail_k)
+    if query.device.type != "npu" or any(
+        tensor.device != query.device for tensor in inputs
+    ):
+        raise ValueError("all inputs must be on the same NPU device")
+    if pool_tail_k.numel() != query.size(0):
+        raise ValueError("pool_tail_k must have one element per batch")
+    if pool_size < 1 or pool_size > 128:
+        raise ValueError("pool_size must be in [1, 128]")
+    if topk < 1 or topk > 8192 or topk % pool_size != 0:
+        raise ValueError("topk must be in [1, 8192] and divisible by pool_size")
+    try:
+        op = torch.ops.cann_ops_transformer.pool_key_indexer
+    except (AttributeError, RuntimeError) as exc:
+        raise NotImplementedError(
+            "CANN pool_key_indexer is unavailable in this runtime"
+        ) from exc
+    return op(
+        query,
+        pool_key,
+        weights,
+        pool_tail_k,
+        q_descale=None,
+        k_descale=None,
+        layout_q="BSND",
+        layout_k="BSND",
+        topk=topk,
+        pool_size=pool_size,
+        mask_mode=3,
+        quant_mode=-1,
+        return_value=return_value,
+    )
+
 
 def lightning_indexer(
     query: torch.Tensor,
@@ -290,6 +358,7 @@ def sparse_flash_attention_out(
 __all__ = [
     "lightning_indexer",
     "lightning_indexer_out",
+    "pool_key_indexer",
     "quant_lightning_indexer",
     "quant_lightning_indexer_metadata",
     "scatter_nd_update",
