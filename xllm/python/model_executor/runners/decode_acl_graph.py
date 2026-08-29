@@ -466,6 +466,20 @@ class DecodeAclGraphRunner(BaseRunner):
                 and linear_idx.numel() > 0
             ):
                 return False
+            if is_expanded:
+                q_seq_lens = getattr(metadata, "q_seq_lens", None)
+                logical_sequences = (
+                    q_seq_lens.numel()
+                    if q_seq_lens is not None
+                    else linear_idx.numel()
+                )
+                if (
+                    logical_sequences <= 0
+                    or batch_size % logical_sequences != 0
+                    or batch_size // logical_sequences > 2
+                ):
+                    # KDA V2/V3 keep only base and draft state slots.
+                    return False
         # The kPool indexer's graph gather densifies each sequence to a
         # static max_kv (graph_index_history_max_kv). A sequence whose block
         # table outgrows that cap must take the eager runner's dynamic

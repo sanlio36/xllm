@@ -1487,8 +1487,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 n_groups = (int(q_seq_lens.numel())
                             if q_seq_lens is not None
                             else int(q_cu_raw.numel()) - 1)
-                if num_seqs > 0 and n_groups > 0 and (
-                        num_rows % n_groups == 0):
+                if (num_seqs > 0 and n_groups > 0
+                        and num_rows % n_groups == 0
+                        and num_rows // n_groups <= 2):
                     if idx.numel() == num_rows:
                         group_idx = idx.view(
                             n_groups, num_rows // n_groups)[:, 0].contiguous()
@@ -1572,9 +1573,12 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 idx = torch.tensor(
                     merged_slots, dtype=torch.int64, device=idx.device)
                 num_seqs = idx.shape[0]
-                if _KDA_VERIFY_V2 or _KDA_VERIFY_V3:
+                rows_per_seq = mixed_qkv.shape[2] // num_seqs
+                if (_KDA_VERIFY_V2 or _KDA_VERIFY_V3) and rows_per_seq <= 2:
                     # Graph-shaped verify path: fixed-shape ops and device
                     # tensors only (see _spec_verify_v2 / _spec_verify_v3).
+                    # Their persistent state is dual-slot, so wider MTP
+                    # verifies stay on the generic eager lazy-commit path.
                     from fla_npu.ops.ascendc import recurrent_kda as _rk
                     _fn = (self._spec_verify_v3 if _KDA_VERIFY_V3
                            else self._spec_verify_v2)
