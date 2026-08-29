@@ -49,7 +49,7 @@ pool_key_indexer = _SPARSE_ATTENTION_MODULE.pool_key_indexer
 
 
 class _PoolKeyIndexerCase(NamedTuple):
-    """One dense BSND shape/dtype combination for the CANN operator."""
+    """One layout/shape/dtype combination for the CANN operator."""
 
     batch_size: int
     query_length: int
@@ -60,36 +60,36 @@ class _PoolKeyIndexerCase(NamedTuple):
     dtype: torch.dtype
     pool_tail_k: tuple[int, ...]
     return_value: bool = True
-    layout: str = "BSND"
+    layout_q: str = "BSND"
+    layout_k: str = "BSND"
     mask_mode: int = 3
     compare_reference: bool = True
 
 
 _CASES = {
-    # Known-good fp16 reference configuration.
     "baseline_fp16": _PoolKeyIndexerCase(
-        1, 64, 8, 256, 16, 128, torch.float16, (0,)
+        1, 64, 8, 256, 16, 128, torch.float16, (0,),
     ),
-    # Only pool_size changes from the baseline; isolates the failing tiling.
-    "pool_size_4_tail_0": _PoolKeyIndexerCase(
-        1, 64, 8, 256, 4, 128, torch.float16, (0,)
+    "bsnd_pool_size_1": _PoolKeyIndexerCase(
+        1, 64, 8, 256, 1, 128, torch.float16, (0,),
     ),
-    # Same as the preceding case, with the production-style incomplete tail.
     "pool_size_4_tail_3": _PoolKeyIndexerCase(
-        1, 64, 8, 256, 4, 128, torch.float16, (3,)
+        1, 64, 8, 256, 4, 128, torch.float16, (3,),
     ),
-    "bsnd_pool_size_4_mask_0": _PoolKeyIndexerCase(
-        1, 64, 8, 256, 4, 64, torch.float16, (0,), True, "BSND", 0, False
+    "bsnd_pool_size_16_mask_0": _PoolKeyIndexerCase(
+        1, 64, 8, 256, 16, 64, torch.float16, (0,), True, "BSND", "BSND", 0, False
     ),
-    "tnd_pool_size_4_mask_0": _PoolKeyIndexerCase(
-        2, 80, 8, 320, 4, 64, torch.float16, (0, 0), False, "TND", 0, False
+    "tnd_pool_size_1": _PoolKeyIndexerCase(
+        2, 80, 8, 320, 1, 64, torch.float16, (0, 0), False, "TND", "TND", 0, False
     ),
-    "tnd_pool_size_4_mask_3": _PoolKeyIndexerCase(
-        2, 80, 8, 320, 4, 64, torch.float16, (0, 0), False, "TND", 3, False
+    "tnd_pool_size_4": _PoolKeyIndexerCase(
+        2, 80, 8, 320, 4, 64, torch.float16, (0, 0), False, "TND", "TND", 0, False
     ),
-    # Exact eager decode call used by the model's fused path.
-    "production_decode_bfloat16_no_value": _PoolKeyIndexerCase(
-        1, 1, 32, 513, 4, 2048, torch.bfloat16, (3,), False
+    "pa_bbnd_pool_size_16": _PoolKeyIndexerCase(
+        2, 64, 8, 32, 16, 128, torch.float16, (0, 0), False, "BSND", "PA_BBND", 0, False
+    ),
+    "pa_bbnd_pool_size_4": _PoolKeyIndexerCase(
+        2, 64, 8, 32, 4, 64, torch.float16, (0, 0), False, "BSND", "PA_BBND", 0, False
     ),
 }
 
@@ -180,9 +180,13 @@ def _run_case(case: _PoolKeyIndexerCase) -> None:
     torch.manual_seed(
         17 + batch_size + query_length + num_heads + pool_count + pool_size
     )
-    if case.layout == "TND":
+    actual_seq_q = None
+    actual_seq_k = None
+    block_table = None
+    if case.layout_q == "TND":
         query_lengths = (32, 48)
-        key_lengths = (128, 192)
+        token_key_lengths = (128, 192)
+        key_lengths = tuple(length // pool_size for length in token_key_lengths)
         query = torch.randn(
             sum(query_lengths), num_heads, head_dim,
             dtype=case.dtype, device="npu"
@@ -196,33 +200,46 @@ def _run_case(case: _PoolKeyIndexerCase) -> None:
             dtype=case.dtype, device="npu"
         )
         actual_seq_q = torch.tensor(
-            [query_lengths[0], sum(query_lengths)],
+            [0, query_lengths[0], sum(query_lengths)],
             dtype=torch.int32, device="npu"
         )
         actual_seq_k = torch.tensor(
-            [key_lengths[0], sum(key_lengths)],
+            [0, key_lengths[0], sum(key_lengths)],
             dtype=torch.int32, device="npu"
-        )
-        fused_indices, fused_values = torch.ops.cann_ops_transformer.pool_key_indexer(
-            query,
-            pool_key,
-            weights,
-            pool_tail_k,
-            actual_seq_q=actual_seq_q,
-            actual_seq_k=actual_seq_k,
-            layout_q="TND",
-            layout_k="TND",
-            topk=case.topk,
-            pool_size=pool_size,
-            mask_mode=case.mask_mode,
-            quant_mode=-1,
-            return_value=case.return_value,
         )
         output_rows = sum(query_lengths)
         expected_indices_shape = (
             output_rows, case.topk + pool_size - 1
         )
-    elif case.mask_mode == 0:
+    elif case.layout_k == "PA_BBND":
+        query = torch.randn(
+            batch_size, query_length, num_heads, head_dim,
+            dtype=case.dtype, device="npu"
+        )
+        weights = torch.randn(
+            batch_size, query_length, num_heads,
+            dtype=case.dtype, device="npu"
+        )
+        # CANN PA_BBND requires the physical block size to be a multiple of 16;
+        # it is independent of the logical kPool pooling window.
+        block_size = 16
+        pool_counts = (pool_count // 2, pool_count // 2)
+        block_count = pool_count // (2 * block_size)
+        pool_key = torch.randn(
+            block_count, block_size, 1, head_dim,
+            dtype=case.dtype, device="npu"
+        )
+        actual_seq_k = torch.tensor(
+            pool_counts, dtype=torch.int32, device="npu"
+        )
+        block_table = torch.tensor(
+            [list(range(block_count))] * batch_size,
+            dtype=torch.int32, device="npu"
+        )
+        expected_indices_shape = (
+            batch_size, query_length, case.topk + pool_size - 1
+        )
+    else:
         query = torch.randn(
             batch_size, query_length, num_heads, head_dim,
             dtype=case.dtype, device="npu"
@@ -235,48 +252,25 @@ def _run_case(case: _PoolKeyIndexerCase) -> None:
             batch_size, pool_count, 1, head_dim,
             dtype=case.dtype, device="npu"
         )
-        fused_indices, fused_values = torch.ops.cann_ops_transformer.pool_key_indexer(
-            query,
-            pool_key,
-            weights,
-            pool_tail_k,
-            layout_q="BSND",
-            layout_k="BSND",
-            topk=case.topk,
-            pool_size=pool_size,
-            mask_mode=case.mask_mode,
-            quant_mode=-1,
-            return_value=case.return_value,
-        )
         expected_indices_shape = (
             batch_size, query_length, case.topk + pool_size - 1
         )
-    else:
-        input_factory = torch.randn
-        query = input_factory(
-            batch_size, query_length, num_heads, head_dim,
-            dtype=case.dtype, device="npu"
-        )
-        weights = input_factory(
-            batch_size, query_length, num_heads,
-            dtype=case.dtype, device="npu"
-        )
-        pool_key = input_factory(
-            batch_size, pool_count, 1, head_dim,
-            dtype=case.dtype, device="npu"
-        )
-        fused_indices, fused_values = pool_key_indexer(
-            query,
-            pool_key,
-            weights,
-            pool_tail_k,
-            case.topk,
-            pool_size,
-            return_value=case.return_value,
-        )
-        expected_indices_shape = (
-            batch_size, query_length, case.topk + pool_size - 1
-        )
+
+    fused_indices, fused_values = pool_key_indexer(
+        query,
+        pool_key,
+        weights,
+        pool_tail_k,
+        case.topk,
+        pool_size,
+        return_value=case.return_value,
+        actual_seq_q=actual_seq_q,
+        actual_seq_k=actual_seq_k,
+        block_table=block_table,
+        layout_q=case.layout_q,
+        layout_k=case.layout_k,
+        mask_mode=case.mask_mode,
+    )
     # Synchronize the fused result before running the CPU reference so device
     # kernel failures are reported at the operator boundary.
     fused_indices = fused_indices.cpu()

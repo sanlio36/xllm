@@ -1076,6 +1076,8 @@ class Glm53FlashIndexer(nn.Module):
         packed_states: torch.Tensor | None = None,
         pool_data: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         key_valid: torch.Tensor | None = None,
+        pool_block_table: torch.Tensor | None = None,
+        pool_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Top-k pool selection over the FULL packed index history.
 
@@ -1117,21 +1119,50 @@ class Glm53FlashIndexer(nn.Module):
         if (
             self.index_kpool_compress
             and q.device.type == "npu"
-            and not _in_acl_graph()
             and hasattr(kernels, "pool_key_indexer")
         ):
             try:
                 scaled_weights = (
                     weights * (self.n_heads ** -0.5)
                 ).to(q.dtype)
-                fused_indices = self._select_topk_fused(
-                    q,
-                    pool_keys,
-                    scaled_weights,
-                    key_valid,
-                    pool_valid,
-                    attention_mask,
-                )
+                if _in_acl_graph():
+                    if pool_cache is None or pool_block_table is None:
+                        fused_indices = None
+                    else:
+                        indices, _ = kernels.pool_key_indexer(
+                            q,
+                            pool_cache,
+                            scaled_weights,
+                            torch.remainder(
+                                key_valid.to(torch.int32).sum(-1),
+                                self.index_kpool,
+                            ).to(dtype=torch.int32).contiguous(),
+                            self.topk,
+                            self.index_kpool,
+                            return_value=False,
+                            actual_seq_k=pool_valid.sum(-1).to(
+                                dtype=torch.int32
+                            ).contiguous(),
+                            block_table=pool_block_table.to(
+                                dtype=torch.int32
+                            ).contiguous(),
+                            layout_k="PA_BBND",
+                        )
+                        output_width = self.topk + (
+                            self.index_kpool - 1
+                            if self.index_kpool_always_select_tail
+                            else 0
+                        )
+                        fused_indices = indices[..., :output_width]
+                else:
+                    fused_indices = self._select_topk_fused(
+                        q,
+                        pool_keys,
+                        scaled_weights,
+                        key_valid,
+                        pool_valid,
+                        attention_mask,
+                    )
                 if fused_indices is not None:
                     return fused_indices
             except NotImplementedError:
@@ -1282,9 +1313,10 @@ class Glm53FlashIndexer(nn.Module):
             and ctx.actual_seq_kv is not None
         ):
             pool_cache = self._pool_caches.get(layer.layer_id)
-            if pool_cache is None and not _in_acl_graph():
-                # Lazy alloc on the first eager forward (before capture);
-                # never allocate inside a capture.
+            if pool_cache is None:
+                # The ACL graph runner executes a non-captured static warmup
+                # before capture. Allocate there so the captured decode graph
+                # sees the stable PA_BBND pool-cache address.
                 pool_cache = alloc_pool_cache(ctx.index_cache)
                 self._pool_caches[layer.layer_id] = pool_cache
                 print(
@@ -1365,6 +1397,8 @@ class Glm53FlashIndexer(nn.Module):
                         kv_len=kv_len, current_length=kv_len,
                         pool_data=(pool_keys, pool_indices, pool_valid),
                         key_valid=key_valid,
+                        pool_cache=pool_cache,
+                        pool_block_table=ctx.block_table,
                     )
                     return (
                         topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
