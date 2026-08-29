@@ -467,12 +467,7 @@ class DecodeAclGraphRunner(BaseRunner):
             ):
                 return False
             if is_expanded:
-                q_seq_lens = getattr(metadata, "q_seq_lens", None)
-                logical_sequences = (
-                    q_seq_lens.numel()
-                    if q_seq_lens is not None
-                    else linear_idx.numel()
-                )
+                logical_sequences = linear_idx.numel()
                 if (
                     logical_sequences <= 0
                     or batch_size % logical_sequences != 0
