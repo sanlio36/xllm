@@ -963,7 +963,7 @@ class Glm53FlashIndexer(nn.Module):
             torch.empty(self.head_dim, cfg.hidden_size, dtype=dtype, device=device)
         )
         # Paged pool cache per DSA layer (lazily allocated on first eager
-        # forward, before graph capture): layer_id -> [blocks, bs//4, 1, D].
+        # forward, before graph capture): layer_id -> [blocks, bs/rate, 1, D].
         self._pool_caches: dict[int, torch.Tensor] = {}
 
     def get_token_visible(self, key_valid: torch.Tensor,
@@ -1100,10 +1100,11 @@ class Glm53FlashIndexer(nn.Module):
             packed_states is not None
             and packed_states.shape[-1] == self.head_dim
         )
-        if raw_key_cache and self.index_kpool != 1:
-            raise ValueError(
-                "index_kpool_compress=false requires index_kpool=1"
-            )
+        # The non-compressed cache stores one raw key per token. In that mode
+        # the fused/pool-granularity path is unavailable, so the dense
+        # fallback treats every token as a one-token pool regardless of the
+        # configured compression rate.
+        effective_pool_size = 1 if raw_key_cache else self.index_kpool
 
         if pool_data is not None:
             # Pool-cache path: pools were compressed at write time; only the
@@ -1133,6 +1134,10 @@ class Glm53FlashIndexer(nn.Module):
             self.index_kpool_compress
             and q.device.type == "npu"
             and hasattr(kernels, "pool_key_indexer")
+            and (
+                not hasattr(kernels, "pool_key_indexer_available")
+                or kernels.pool_key_indexer_available()
+            )
             and pool_cache is not None
             and pool_block_table is not None
         ):
@@ -1155,13 +1160,13 @@ class Glm53FlashIndexer(nn.Module):
         if pool_data is None:
             if pool_cache is not None and pool_block_table is not None:
                 kv_lens = key_valid.to(torch.int64).sum(-1)
-                n_pools = (kv_len + self.index_kpool - 1) // self.index_kpool
+                n_pools = (kv_len + effective_pool_size - 1) // effective_pool_size
                 pool_keys, pool_indices, pool_valid = read_pools(
                     pool_cache,
                     pool_block_table,
                     kv_lens,
                     n_pools,
-                    self.index_kpool,
+                    effective_pool_size,
                 )
             else:
                 if raw_key_cache:
@@ -1237,7 +1242,7 @@ class Glm53FlashIndexer(nn.Module):
         else:
             candidate_valid = pool_valid[:, None].expand(batch_size, seq_len, -1).to(torch.bool)
 
-        group_budget = self.topk // self.index_kpool
+        group_budget = self.topk // effective_pool_size
         select_k = min(group_budget, pool_scores.shape[-1])
         if select_k == 0:
             topk_indices = torch.empty(
@@ -1252,7 +1257,7 @@ class Glm53FlashIndexer(nn.Module):
             # dim=1 by selected [B, S_q, select_k] -> [B, S_q, select_k, rate].
             # Flatten (n_pools*rate) rows and gather, matching the
             # get_pooled_states pattern.
-            rate = self.index_kpool
+            rate = effective_pool_size
             rate_off = torch.arange(rate, device=device)
             sel_flat = (selected[..., None] * rate + rate_off).reshape(
                 batch_size, -1
@@ -1279,7 +1284,11 @@ class Glm53FlashIndexer(nn.Module):
             pos_visible = token_visible.to(torch.uint8).gather(2, safe_pos).to(torch.bool)
             topk_indices = topk_indices.masked_fill(~pos_visible, -1)
 
-        output_width = self.topk + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
+        output_width = self.topk + (
+            effective_pool_size - 1
+            if self.index_kpool_always_select_tail and not raw_key_cache
+            else 0
+        )
         if topk_indices.shape[-1] < output_width:
             topk_indices = F.pad(
                 topk_indices, (0, output_width - topk_indices.shape[-1]), value=-1
@@ -1329,13 +1338,17 @@ class Glm53FlashIndexer(nn.Module):
             and ctx.block_table is not None
             and ctx.slot_mapping is not None
             and ctx.actual_seq_kv is not None
+            and (
+                not hasattr(kernels, "pool_key_indexer_available")
+                or kernels.pool_key_indexer_available()
+            )
         ):
             pool_cache = self._pool_caches.get(layer.layer_id)
             if pool_cache is None:
                 # The ACL graph runner executes a non-captured static warmup
                 # before capture. Allocate there so the captured decode graph
                 # sees the stable PA_BBND pool-cache address.
-                pool_cache = alloc_pool_cache(ctx.index_cache)
+                pool_cache = alloc_pool_cache(ctx.index_cache, self.index_kpool)
                 self._pool_caches[layer.layer_id] = pool_cache
                 print(
                     f"[kpool] layer {layer.layer_id}: pool cache "

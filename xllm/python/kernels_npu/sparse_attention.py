@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import torch
 
-try:
-    import cann_ops_transformer  # noqa: F401
-except ImportError:
-    cann_ops_transformer = None
+
+def pool_key_indexer_available() -> bool:
+    """Return whether the CANN fused pool-key op is registered."""
+    try:
+        import cann_ops_transformer  # noqa: F401
+
+        return hasattr(torch.ops.cann_ops_transformer, "pool_key_indexer")
+    except (ImportError, AttributeError, RuntimeError):
+        return False
 
 
 def pool_key_indexer(
@@ -173,8 +178,12 @@ def pool_key_indexer(
     if topk < 1 or topk > 8192 or topk % pool_size != 0:
         raise ValueError("topk must be in [1, 8192] and divisible by pool_size")
     try:
+        # Import lazily so an unavailable or partially registered CANN wheel
+        # only disables this fused operator; other NPU kernels remain usable.
+        import cann_ops_transformer  # noqa: F401
+
         op = torch.ops.cann_ops_transformer.pool_key_indexer
-    except (AttributeError, RuntimeError) as exc:
+    except (ImportError, AttributeError, RuntimeError) as exc:
         raise NotImplementedError(
             "CANN pool_key_indexer is unavailable in this runtime"
         ) from exc
@@ -470,6 +479,7 @@ __all__ = [
     "lightning_indexer",
     "lightning_indexer_out",
     "pool_key_indexer",
+    "pool_key_indexer_available",
     "quant_lightning_indexer",
     "quant_lightning_indexer_metadata",
     "scatter_nd_update",

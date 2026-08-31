@@ -62,22 +62,29 @@ def pooled_states(packed_states: torch.Tensor, key_valid: torch.Tensor,
 # Paged pool cache: write-time incremental compression + direct read.
 #
 # Physical blocks reuse the token block table: pool logical block L covers
-# pools [L*bs/4, (L+1)*bs/4) = tokens [L*bs, (L+1)*bs) = token logical block
-# L, so pool_slot(p) = bt[s, p//(bs//4)] * (bs//4) + p%(bs//4) — linear
+# pools [L*bs/rate, (L+1)*bs/rate) = tokens [L*bs, (L+1)*bs) = token logical
+# block L, so pool_slot(p) = bt[s, p//(bs/rate)] * (bs/rate) + p%(bs/rate).
 # addressing without engine-side pool-granular allocation. The 257-wide
 # token-granular index cache is kept untouched: compression inputs are read
 # from it, which also solves chunked-prefill pools spanning chunk boundaries
 # (vllm's dual-cache design).
 # ---------------------------------------------------------------------------
 
-def alloc_pool_cache(index_cache: torch.Tensor) -> torch.Tensor:
-    """每 DSA 层的池粒度 cache: ``[num_blocks, bs//4, 1, head_dim]`` bf16 全零。"""
+def alloc_pool_cache(index_cache: torch.Tensor, rate: int) -> torch.Tensor:
+    """Allocate a pool-granularity cache matching the configured pool rate."""
+    if rate < 1:
+        raise ValueError("pool rate must be positive")
     bs = index_cache.shape[1]
-    assert bs % 4 == 0, f"block_size {bs} 不是 4 的倍数, 池化寻址不成立"
+    if bs % rate != 0:
+        raise ValueError(
+            f"block_size {bs} must be divisible by index_kpool {rate}"
+        )
+    if index_cache.shape[-1] < 3 or (index_cache.shape[-1] - 1) % 2 != 0:
+        raise ValueError("compressed index cache width must be 2 * head_dim + 1")
     head_dim = (index_cache.shape[-1] - 1) // 2
     return torch.zeros(
-        index_cache.shape[0], bs // 4, 1, head_dim,
-        dtype=torch.bfloat16, device=index_cache.device,
+        index_cache.shape[0], bs // rate, 1, head_dim,
+        dtype=index_cache.dtype, device=index_cache.device,
     )
 
 
@@ -114,11 +121,12 @@ def compress_completed_pools(index_cache: torch.Tensor,
     gate = rows[..., head_dim:2 * head_dim].float()
     logits = gate + ape.float()[None]                    # ape [rate, head_dim]
     logits = logits.masked_fill(~member_valid[..., None], float("-inf"))
-    weights = torch.nan_to_num(logits.softmax(1)).to(torch.bfloat16)
+    cache_dtype = pool_cache.dtype
+    weights = torch.nan_to_num(logits.softmax(1)).to(cache_dtype)
     keys = rows[..., :head_dim].float()
-    # 镜像 pooled_states 的 (w * k).sum: 逐积 bf16 round + fp32 累加
-    prod = (weights.float() * keys).to(torch.bfloat16).float()
-    compressed = prod.sum(1).to(torch.bfloat16)          # [N, head_dim]
+    # Mirror pooled_states' per-product cache-dtype rounding and fp32 sum.
+    prod = (weights.float() * keys).to(cache_dtype).float()
+    compressed = prod.sum(1).to(cache_dtype)             # [N, head_dim]
     # 写入槽位: bt[p // pool_bs] * pool_bs + p % pool_bs
     pool_id = (pos // rate).reshape(-1)                  # [N]
     pool_blk = (pool_id // pool_bs).clamp(max=bt.shape[0] - 1)
