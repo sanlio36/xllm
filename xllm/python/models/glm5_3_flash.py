@@ -1020,51 +1020,51 @@ class Glm53FlashIndexer(nn.Module):
             packed_states=packed_states,
         )
 
-    def _select_topk_fused(
+    def _select_topk_fused_pa(
         self,
         query: torch.Tensor,
-        pool_keys: torch.Tensor,
         weights: torch.Tensor,
         key_valid: torch.Tensor,
-        pool_valid: torch.Tensor,
         attention_mask: torch.Tensor,
+        pool_cache: torch.Tensor,
+        pool_block_table: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Replace the dense pool scoring and TopK with PoolKeyIndexer."""
-        if (
-            pool_keys.dtype != query.dtype
-            or not bool(attention_mask.all().item())
-        ):
+        """Run PoolKeyIndexer through the paged PA_BBND pool cache."""
+        if pool_cache.dtype != query.dtype:
+            return None
+        if not _in_acl_graph() and not bool(attention_mask.all().item()):
             return None
 
-        outputs = []
-        for batch_idx in range(query.shape[0]):
-            token_count = int(key_valid[batch_idx].sum().item())
-            pool_count = int(pool_valid[batch_idx].sum().item())
-            if pool_count == 0:
-                return None
-            tail_count = token_count % self.index_kpool
-            pool_tail_k = torch.tensor(
-                [tail_count], dtype=torch.int32, device=query.device
-            )
-            indices, _ = kernels.pool_key_indexer(
-                query[batch_idx:batch_idx + 1].contiguous(),
-                pool_keys[
-                    batch_idx:batch_idx + 1, :pool_count, None
-                ].contiguous(),
-                weights[batch_idx:batch_idx + 1].contiguous(),
-                pool_tail_k,
-                self.topk,
-                self.index_kpool,
-                return_value=False,
-            )
-            outputs.append(indices)
+        token_count = key_valid.to(torch.int32).sum(-1)
+        # PA_BBND addresses complete pooled keys and uses pool_tail_k for the
+        # remaining tokens in the current tail pool.
+        pool_tail_k = torch.remainder(
+            token_count, self.index_kpool
+        ).to(torch.int32).contiguous()
+        actual_seq_k = torch.div(
+            token_count, self.index_kpool, rounding_mode="floor"
+        ).to(torch.int32).contiguous()
+        indices, _ = kernels.pool_key_indexer(
+            query,
+            pool_cache,
+            weights,
+            pool_tail_k,
+            self.topk,
+            self.index_kpool,
+            return_value=False,
+            actual_seq_k=actual_seq_k,
+            block_table=pool_block_table.to(
+                dtype=torch.int32
+            ).contiguous(),
+            layout_k="PA_BBND",
+        )
 
         output_width = self.topk + (
             self.index_kpool - 1
             if self.index_kpool_always_select_tail
             else 0
         )
-        return torch.cat(outputs, dim=0)[..., :output_width].long()
+        return indices[..., :output_width].long()
 
     def select_topk(
         self,
@@ -1096,6 +1096,15 @@ class Glm53FlashIndexer(nn.Module):
 
         q = self.wq_b(q_resid).view(batch_size, seq_len, self.n_heads, self.head_dim)
 
+        raw_key_cache = (
+            packed_states is not None
+            and packed_states.shape[-1] == self.head_dim
+        )
+        if raw_key_cache and self.index_kpool != 1:
+            raise ValueError(
+                "index_kpool_compress=false requires index_kpool=1"
+            )
+
         if pool_data is not None:
             # Pool-cache path: pools were compressed at write time; only the
             # visibility mask is derived here (rows past each sequence's live
@@ -1105,12 +1114,16 @@ class Glm53FlashIndexer(nn.Module):
                 key_valid, attention_mask, kv_len, seq_len, current_length
             )
         else:
-            key_valid = packed_states[..., -1].gt(0)
+            if key_valid is None:
+                if raw_key_cache:
+                    key_valid = torch.ones(
+                        batch_size, packed_states.shape[1],
+                        dtype=torch.bool, device=device,
+                    )
+                else:
+                    key_valid = packed_states[..., -1].gt(0)
             token_visible = self.get_token_visible(
                 key_valid, attention_mask, kv_len, seq_len, current_length
-            )
-            pool_keys, pool_indices, pool_valid = self.get_pooled_states(
-                packed_states, key_valid
             )
 
         weights = self.weights_proj(
@@ -1120,53 +1133,49 @@ class Glm53FlashIndexer(nn.Module):
             self.index_kpool_compress
             and q.device.type == "npu"
             and hasattr(kernels, "pool_key_indexer")
+            and pool_cache is not None
+            and pool_block_table is not None
         ):
             try:
                 scaled_weights = (
                     weights * (self.n_heads ** -0.5)
                 ).to(q.dtype)
-                if _in_acl_graph():
-                    if pool_cache is None or pool_block_table is None:
-                        fused_indices = None
-                    else:
-                        indices, _ = kernels.pool_key_indexer(
-                            q,
-                            pool_cache,
-                            scaled_weights,
-                            torch.remainder(
-                                key_valid.to(torch.int32).sum(-1),
-                                self.index_kpool,
-                            ).to(dtype=torch.int32).contiguous(),
-                            self.topk,
-                            self.index_kpool,
-                            return_value=False,
-                            actual_seq_k=pool_valid.sum(-1).to(
-                                dtype=torch.int32
-                            ).contiguous(),
-                            block_table=pool_block_table.to(
-                                dtype=torch.int32
-                            ).contiguous(),
-                            layout_k="PA_BBND",
-                        )
-                        output_width = self.topk + (
-                            self.index_kpool - 1
-                            if self.index_kpool_always_select_tail
-                            else 0
-                        )
-                        fused_indices = indices[..., :output_width]
-                else:
-                    fused_indices = self._select_topk_fused(
-                        q,
-                        pool_keys,
-                        scaled_weights,
-                        key_valid,
-                        pool_valid,
-                        attention_mask,
-                    )
+                fused_indices = self._select_topk_fused_pa(
+                    q,
+                    scaled_weights,
+                    key_valid,
+                    attention_mask,
+                    pool_cache,
+                    pool_block_table,
+                )
                 if fused_indices is not None:
                     return fused_indices
             except NotImplementedError:
                 pass
+        if pool_data is None:
+            if pool_cache is not None and pool_block_table is not None:
+                kv_lens = key_valid.to(torch.int64).sum(-1)
+                n_pools = (kv_len + self.index_kpool - 1) // self.index_kpool
+                pool_keys, pool_indices, pool_valid = read_pools(
+                    pool_cache,
+                    pool_block_table,
+                    kv_lens,
+                    n_pools,
+                    self.index_kpool,
+                )
+            else:
+                if raw_key_cache:
+                    pool_keys = packed_states
+                    if pool_keys.dim() == 4:
+                        pool_keys = pool_keys.squeeze(-2)
+                    pool_indices = torch.arange(
+                        pool_keys.shape[1], device=device,
+                    ).expand(batch_size, -1).unsqueeze(-1)
+                    pool_valid = key_valid
+                else:
+                    pool_keys, pool_indices, pool_valid = self.get_pooled_states(
+                        packed_states, key_valid
+                    )
         weights = weights.float()
         # Query-dim sub-chunking: each query row's logits are
         # q[row] @ pool_keys.T and its pool score a head-weighted sum of those
@@ -1300,14 +1309,23 @@ class Glm53FlashIndexer(nn.Module):
         """
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
-        packed = self.get_packed_states(hidden_states, attention_mask)
+        if self.index_kpool_compress:
+            packed = self.get_packed_states(hidden_states, attention_mask)
+        else:
+            # The non-compressed cache stores one raw K per token. This is the
+            # original small-operator path (index_kpool=1), so no gate/valid
+            # channels are written to the narrower cache.
+            packed = self.k_norm(self.wk(hidden_states)).view(
+                hidden_states.shape[0], hidden_states.shape[1], -1, self.head_dim
+            ).squeeze(2)
         if ctx.index_cache is not None and ctx.slot_mapping is not None:
             # kPool index cache is unquantized (no scale side-channel).
             ctx.update_index_cache(packed.reshape(num_tokens, -1), None)
 
         pool_cache = None
         if (
-            ctx.index_cache is not None
+            self.index_kpool_compress
+            and ctx.index_cache is not None
             and ctx.block_table is not None
             and ctx.slot_mapping is not None
             and ctx.actual_seq_kv is not None
@@ -1378,13 +1396,9 @@ class Glm53FlashIndexer(nn.Module):
                     max_kv = None
                 if max_kv is not None:
                     n_pools = (max_kv + self.index_kpool - 1) // self.index_kpool
-                    pool_keys, pool_indices, pool_valid = read_pools(
-                        pool_cache, ctx.block_table, kv_lens_t,
-                        n_pools, self.index_kpool,
-                    )
                     key_valid = (
                         torch.arange(
-                            n_pools * self.index_kpool, device=pool_keys.device
+                            n_pools * self.index_kpool, device=pool_cache.device
                         )[None, :]
                         < kv_lens_t.reshape(-1, 1)
                     )
@@ -1395,7 +1409,6 @@ class Glm53FlashIndexer(nn.Module):
                     topk_indices = self.select_topk(
                         qr_bsd, hidden_bsd, mask_bsd,
                         kv_len=kv_len, current_length=kv_len,
-                        pool_data=(pool_keys, pool_indices, pool_valid),
                         key_valid=key_valid,
                         pool_cache=pool_cache,
                         pool_block_table=ctx.block_table,
@@ -1450,10 +1463,19 @@ class Glm53FlashIndexer(nn.Module):
                 & valid
             )
         kv_len = packed_history.shape[1]
+        history_key_valid = None
+        if not self.index_kpool_compress:
+            history_key_valid = (
+                torch.arange(kv_len, device=packed_history.device)[None, :]
+                < ctx.actual_seq_kv[:num_seqs].to(torch.int64)[:, None]
+            )
         topk_indices = self.select_topk(
             qr_bsd, hidden_bsd, mask_bsd,
             kv_len=kv_len, current_length=kv_len,
             packed_states=packed_history,
+            key_valid=history_key_valid,
+            pool_cache=pool_cache,
+            pool_block_table=ctx.block_table,
         )
         if is_varlen:
             topk_indices = topk_indices[valid]
