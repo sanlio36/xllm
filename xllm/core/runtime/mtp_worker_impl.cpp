@@ -1974,6 +1974,71 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                           pending_draft_context_.prepared_inputs[
                               static_cast<size_t>(draft_idx)],
                           draft_impl_.get());
+      if (draft_idx == 0 &&
+          ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+        std::ostringstream launch_ids;
+        for (size_t i = 0; i < pending_draft_context_.embedding_ids.size();
+             ++i) {
+          if (i > 0) {
+            launch_ids << ',';
+          }
+          launch_ids << pending_draft_context_.embedding_ids[i];
+        }
+        std::ostringstream cur_ids;
+        for (size_t i = 0; i < input.input_params.embedding.embedding_ids.size();
+             ++i) {
+          if (i > 0) {
+            cur_ids << ',';
+          }
+          cur_ids << input.input_params.embedding.embedding_ids[i];
+        }
+        std::ostringstream draft_tokens;
+        for (size_t i = 0; i < pending_draft_context_.outputs.size(); ++i) {
+          if (i > 0) {
+            draft_tokens << '|';
+          }
+          const auto& tokens =
+              pending_draft_context_.outputs[i].sample_output.next_tokens;
+          draft_tokens << '[';
+          if (tokens.defined()) {
+            const torch::Tensor tokens_cpu =
+                tokens.device().is_cpu() ? tokens : tokens.to(torch::kCPU);
+            for (int64_t j = 0; j < tokens_cpu.numel(); ++j) {
+              if (j > 0) {
+                draft_tokens << ',';
+              }
+              draft_tokens << tokens_cpu[j].item<int64_t>();
+            }
+          }
+          draft_tokens << ']';
+        }
+        std::ostringstream launch_rids;
+        for (size_t i = 0; i < pending_draft_context_.request_ids.size(); ++i) {
+          if (i > 0) {
+            launch_rids << ',';
+          }
+          launch_rids << pending_draft_context_.request_ids[i];
+        }
+        std::ostringstream cur_rids;
+        for (size_t i = 0; i < input.input_params.embedding.request_ids.size();
+             ++i) {
+          if (i > 0) {
+            cur_rids << ',';
+          }
+          cur_rids << input.input_params.embedding.request_ids[i];
+        }
+        LOG(INFO) << "[DP_MTP_PRELAUNCH_BINDING] consume rank="
+                  << parallel_args_.rank()
+                  << ", launch_embedding_ids=[" << launch_ids.str()
+                  << "], cur_embedding_ids=[" << cur_ids.str()
+                  << "], launch_request_ids=[" << launch_rids.str()
+                  << "], cur_request_ids=[" << cur_rids.str()
+                  << "], launch_generations="
+                  << pending_draft_context_.dp_global_batch_generations
+                  << ", cur_generations="
+                  << input.input_params.parallel.dp_global_batch_generations
+                  << ", draft_tokens=" << draft_tokens.str();
+      }
 #endif
       draft_output_opt = std::move(
           pending_draft_context_.outputs[static_cast<size_t>(draft_idx)]);

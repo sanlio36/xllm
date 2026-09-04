@@ -28,6 +28,7 @@ limitations under the License.
 #include "batch_input_builder.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -571,6 +572,16 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
     }
 
     const auto& raw_sample_output = raw_output.outputs[output_idx];
+#if defined(USE_NPU)
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output output_idx="
+                << output_idx << ", tokens_count="
+                << raw_sample_output.tokens.size()
+                << ", replace_fake_token=" << replace_fake_token
+                << ", from_sample_slot=" << target.from_sample_slot
+                << ", seq_finished_before=" << seq->finished();
+    }
+#endif
     for (size_t token_idx = 0; token_idx < raw_sample_output.tokens.size();
          ++token_idx) {
       const auto& raw_token = raw_sample_output.tokens[token_idx];
@@ -588,6 +599,15 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
       // Speculative decoding may append an EOS token at the beginning,
       // followed by bonus tokens, causing the sequence stopping check to fail.
       if (!target.from_sample_slot && seq->finished()) {
+#if defined(USE_NPU)
+        if (::xllm::ExecutionConfig::get_instance()
+                .debug_log_dp_mtp_overlap()) {
+          LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output_break_finished "
+                       "output_idx="
+                    << output_idx << ", token_idx=" << token_idx
+                    << ", token_id=" << raw_token.id;
+        }
+#endif
         break;
       }
     }

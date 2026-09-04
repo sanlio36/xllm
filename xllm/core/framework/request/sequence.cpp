@@ -26,6 +26,7 @@ limitations under the License.
 #include <limits>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -452,6 +453,13 @@ void Sequence::append_token(const Token& token) {
 
   // skip update in enable_schedule_overlap
   if (sequence_params_.enable_schedule_overlap && token_id < 0) {
+#if defined(USE_NPU)
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      LOG(INFO) << "[DP_MTP_TOKEN_ACCT] append_token_fake_skip token_id="
+                << token_id << ", num_tokens=" << num_tokens_
+                << ", cur_generated_token_idx=" << cur_generated_token_idx_;
+    }
+#endif
     finish_status_invalidated_ = true;
     return;
   }
@@ -479,6 +487,18 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   if (error_status().has_value()) {
     return;
   }
+
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_TOKEN_ACCT] update_last_step_token_begin token_id="
+              << token.id << ", token_offset=" << token_offset
+              << ", cur_generated_token_idx=" << cur_generated_token_idx_
+              << ", num_tokens=" << num_tokens_
+              << ", num_prompt_tokens=" << num_prompt_tokens_
+              << ", finished=" << finished_
+              << ", finish_status_invalidated=" << finish_status_invalidated_;
+  }
+#endif
 
   const int32_t token_id = static_cast<int32_t>(token.id);
   if (!try_commit_json_object_token(token_id,
@@ -529,6 +549,14 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   ++cur_generated_token_idx_;
   finish_status_invalidated_ = true;
   updated_since_last_beam_search_ = true;
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_TOKEN_ACCT] update_last_step_token_end token_id="
+              << token_id << ", token_offset=" << token_offset
+              << ", cur_generated_token_idx=" << cur_generated_token_idx_
+              << ", num_tokens=" << num_tokens_;
+  }
+#endif
 }
 
 void Sequence::update_token(size_t index, const Token& token) {
@@ -986,9 +1014,36 @@ bool Sequence::finished() const {
       sequence_params_.enable_schedule_overlap
           ? tokens().slice(/*start=*/0, /*end=*/cur_generated_token_idx_)
           : tokens();
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    std::ostringstream token_preview;
+    for (size_t i = 0; i < valid_tokens.size() && i < 8; ++i) {
+      if (i > 0) {
+        token_preview << ',';
+      }
+      token_preview << valid_tokens[i];
+    }
+    if (valid_tokens.size() > 8) {
+      token_preview << ",...";
+    }
+    LOG(INFO) << "[DP_MTP_TOKEN_ACCT] finished_check valid_tokens_count="
+              << valid_tokens.size() << ", first_tokens=[" << token_preview.str()
+              << "], cur_generated_token_idx=" << cur_generated_token_idx_
+              << ", last_valid_token_id="
+              << (valid_tokens.size() > 0 ? valid_tokens.back() : -1);
+  }
+#endif
   const FinishReason finish_reason = sequence_params_.stopping_checker->check(
       valid_tokens, num_prompt_tokens_, &matched_stop_token_count);
   matched_stop_token_count_ = matched_stop_token_count;
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_TOKEN_ACCT] finished_check_result is_finished="
+              << (finish_reason != FinishReason::NONE)
+              << ", is_stop=" << (finish_reason == FinishReason::STOP)
+              << ", matched_stop_token_count=" << matched_stop_token_count;
+  }
+#endif
   if (finish_reason != FinishReason::NONE) {
     finish_reason_ = finish_reason;
     finished_ = true;
