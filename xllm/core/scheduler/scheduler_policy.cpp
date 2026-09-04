@@ -77,6 +77,27 @@ size_t estimate_decode_extra_blocks(Sequence* sequence,
   return 0;
 }
 
+size_t get_decode_allocation_tokens(
+    Sequence* sequence,
+    size_t baseline_tokens,
+    int32_t num_speculative_tokens,
+    int32_t min_speculative_tokens_required,
+    bool enable_schedule_overlap) {
+  if (!enable_schedule_overlap || num_speculative_tokens <= 0) {
+    return baseline_tokens;
+  }
+  CHECK_GT(min_speculative_tokens_required, 0);
+  const size_t overlap_horizon =
+      static_cast<size_t>(min_speculative_tokens_required) + 1;
+  // The scheduler token count can lag the device KV cursor during a
+  // speculative handoff. Reserve the whole overlap horizon (target validate
+  // plus the prelaunch handoff) from the cursor.
+  const size_t kv_cache_tokens = sequence->kv_state().kv_cache_tokens_num();
+  CHECK_LE(kv_cache_tokens,
+           std::numeric_limits<size_t>::max() - overlap_horizon);
+  return std::max(baseline_tokens, kv_cache_tokens + overlap_horizon);
+}
+
 size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
                                          int32_t dp_rank) {
   const auto free_blocks = kv_cache_manager->num_free_blocks();
@@ -522,8 +543,12 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
         const size_t block_size = state.kv_cache_manager->block_size();
         size_t needed_blocks = 0;
         for (auto* sequence : active_sequences) {
-          const size_t updated_num_tokens =
-              sequence->num_tokens() + state.min_speculative_tokens_required;
+          const size_t updated_num_tokens = get_decode_allocation_tokens(
+              sequence,
+              sequence->num_tokens() + state.min_speculative_tokens_required,
+              state.options.num_speculative_tokens(),
+              state.min_speculative_tokens_required,
+              state.options.enable_schedule_overlap());
           needed_blocks += estimate_decode_extra_blocks(
               sequence, updated_num_tokens, block_size);
         }
@@ -538,8 +563,12 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
       if (has_enough_budget && has_enough_blocks) {
         bool allocate_failed = false;
         for (auto* sequence : active_sequences) {
-          const size_t updated_num_tokens =
-              sequence->num_tokens() + state.min_speculative_tokens_required;
+          const size_t updated_num_tokens = get_decode_allocation_tokens(
+              sequence,
+              sequence->num_tokens() + state.min_speculative_tokens_required,
+              state.options.num_speculative_tokens(),
+              state.min_speculative_tokens_required,
+              state.options.enable_schedule_overlap());
           if (!state.kv_cache_manager->allocate(sequence, updated_num_tokens)) {
             allocate_failed = true;
             break;
@@ -598,8 +627,12 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
           has_enough_budget = false;
           break;
         }
-        size_t updated_num_tokens =
-            sequence->num_tokens() + state.min_speculative_tokens_required;
+        const size_t updated_num_tokens = get_decode_allocation_tokens(
+            sequence.get(),
+            sequence->num_tokens() + state.min_speculative_tokens_required,
+            state.options.num_speculative_tokens(),
+            state.min_speculative_tokens_required,
+            state.options.enable_schedule_overlap());
         if (!state.kv_cache_manager->allocate(sequence.get(),
                                               updated_num_tokens)) {
           has_enough_blocks = false;

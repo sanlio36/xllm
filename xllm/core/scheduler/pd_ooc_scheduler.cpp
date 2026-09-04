@@ -21,6 +21,7 @@ limitations under the License.
 #include <brpc/server.h>
 
 #include <chrono>
+#include <limits>
 #include <random>
 
 #include "common/global_flags.h"
@@ -63,6 +64,27 @@ size_t estimate_decode_extra_blocks(Sequence* sequence,
     return 1;
   }
   return 0;
+}
+
+size_t get_decode_allocation_tokens(
+    Sequence* sequence,
+    size_t baseline_tokens,
+    int32_t num_speculative_tokens,
+    int32_t min_speculative_tokens_required,
+    bool enable_schedule_overlap) {
+  if (!enable_schedule_overlap || num_speculative_tokens <= 0) {
+    return baseline_tokens;
+  }
+  CHECK_GT(min_speculative_tokens_required, 0);
+  const size_t overlap_horizon =
+      static_cast<size_t>(min_speculative_tokens_required) + 1;
+  // The scheduler token count can lag the device KV cursor during a
+  // speculative handoff. Reserve the whole overlap horizon (target validate
+  // plus the prelaunch handoff) from the cursor.
+  const size_t kv_cache_tokens = sequence->kv_state().kv_cache_tokens_num();
+  CHECK_LE(kv_cache_tokens,
+           std::numeric_limits<size_t>::max() - overlap_horizon);
+  return std::max(baseline_tokens, kv_cache_tokens + overlap_horizon);
 }
 
 size_t get_sequence_free_blocks_for_rank(KVCacheManager* kv_cache_manager,
@@ -899,8 +921,12 @@ void PDOOCScheduler::handle_decode_requests_impl(
         const size_t block_size = kv_cache_manager_->block_size();
         size_t needed_blocks = 0;
         for (auto* sequence : active_sequences) {
-          const size_t updated_num_tokens =
-              sequence->num_tokens() + min_speculative_tokens_required_;
+          const size_t updated_num_tokens = get_decode_allocation_tokens(
+              sequence,
+              sequence->num_tokens() + min_speculative_tokens_required_,
+              options_.num_speculative_tokens(),
+              min_speculative_tokens_required_,
+              options_.enable_schedule_overlap());
           needed_blocks += estimate_decode_extra_blocks(
               sequence, updated_num_tokens, block_size);
         }
@@ -916,8 +942,12 @@ void PDOOCScheduler::handle_decode_requests_impl(
       if (has_enough_budget && has_enough_blocks) {
         bool allocate_failed = false;
         for (auto* sequence : active_sequences) {
-          const size_t updated_num_tokens =
-              sequence->num_tokens() + min_speculative_tokens_required_;
+          const size_t updated_num_tokens = get_decode_allocation_tokens(
+              sequence,
+              sequence->num_tokens() + min_speculative_tokens_required_,
+              options_.num_speculative_tokens(),
+              min_speculative_tokens_required_,
+              options_.enable_schedule_overlap());
           if (!kv_cache_manager_->allocate(sequence, updated_num_tokens)) {
             allocate_failed = true;
             break;
@@ -985,8 +1015,12 @@ void PDOOCScheduler::handle_decode_requests_impl(
           break;
         }
         // sequence token already appended
-        size_t updated_num_tokens =
-            sequence->num_tokens() + min_speculative_tokens_required_;
+        const size_t updated_num_tokens = get_decode_allocation_tokens(
+            sequence.get(),
+            sequence->num_tokens() + min_speculative_tokens_required_,
+            options_.num_speculative_tokens(),
+            min_speculative_tokens_required_,
+            options_.enable_schedule_overlap());
         // no blocks left
         if (!kv_cache_manager_->allocate(sequence.get(), updated_num_tokens)) {
           has_enough_blocks = false;
@@ -1203,8 +1237,12 @@ void PDOOCScheduler::handle_decode_requests(
         break;
       }
       // sequence token already appended
-      size_t updated_num_tokens =
-          sequence->num_tokens() + options_.num_speculative_tokens();
+      const size_t updated_num_tokens = get_decode_allocation_tokens(
+          sequence.get(),
+          sequence->num_tokens() + options_.num_speculative_tokens(),
+          options_.num_speculative_tokens(),
+          min_speculative_tokens_required_,
+          options_.enable_schedule_overlap());
       // no blocks left
       if (!kv_cache_manager_->allocate(sequence.get(), updated_num_tokens)) {
         has_enough_blocks = false;

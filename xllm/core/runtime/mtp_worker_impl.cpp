@@ -2840,10 +2840,9 @@ bool MTPWorkerImpl::prelaunch_positions_fit_block_table(
   // row is written at base_positions + accepted_lengths and the "repair" row
   // one position ahead on rejection. With the maximum accepted length the
   // largest position any prelaunch row can touch is
-  // kv_seq_len + num_speculative_tokens. The scheduler allocates exactly
-  // ceil(kv_seq_len / block_size) blocks per sequence, so any sequence whose
-  // extended length crosses into a new block is a candidate for the
-  // LightningIndexer "DDR address out of range" fault.
+  // kv_seq_len + num_speculative_tokens. The scheduler reserves enough
+  // blocks for the speculative horizon using the device KV cursor, so this
+  // check is the final guard against a stale or incomplete block table.
   //
   // In DP the prelaunch decision must be identical on every rank, otherwise
   // the HCCL collectives inside the prelaunched draft forward deadlock when
