@@ -1406,6 +1406,32 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.outTensors.at(node.variantPack.outTensors.size() - 1) =
         atb_speed::Utils::AtTensor2Tensor(*output_topk_indices);
   }
+
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs() &&
+      uses_dsa_attention) {
+    const auto tensor_address = [](const torch::Tensor& tensor) -> const void* {
+      return tensor.defined() && tensor.numel() > 0 ? tensor.data_ptr()
+                                                    : nullptr;
+    };
+    LOG(INFO) << "[DP_MTP_LIGHTNING_INDEXER_DEBUG] layer_bind rank="
+              << parallel_args_.rank() << ", layer=" << layer_id_
+              << ", prefill=" << is_prefill << ", skip_topk=" << skip_topk
+              << ", output_topk=" << output_topk
+              << ", batch_type="
+              << input_params.meta.batch_forward_type.to_string()
+              << ", num_sequences=" << input_params.meta.num_sequences
+              << ", node=" << static_cast<const void*>(&node)
+              << ", operation="
+              << static_cast<const void*>(node.operation.get())
+              << ", index_cache=" << tensor_address(kv_cache.get_index_cache())
+              << ", kv_seq_lens="
+              << tensor_address(input_params.attention.device.kv_seq_lens)
+              << ", block_tables="
+              << tensor_address(input_params.attention.device.block_tables)
+              << ", shared_topk=" << tensor_address(shared_topk_indices);
+  }
+#endif
 }
 
 }  // namespace layer

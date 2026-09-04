@@ -19,9 +19,11 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/execution_config.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -33,6 +35,57 @@ torch::Tensor to_cpu_int64_contiguous(const torch::Tensor& tensor) {
     cpu_tensor = cpu_tensor.to(torch::kInt64);
   }
   return cpu_tensor;
+}
+
+std::string format_cache_tokens(const torch::Tensor& tensor,
+                                size_t max_values = 64) {
+  const torch::Tensor values = tensor.flatten().contiguous();
+  const int64_t* data = values.const_data_ptr<int64_t>();
+  const size_t count = std::min<size_t>(values.numel(), max_values);
+  std::ostringstream stream;
+  stream << '[';
+  for (size_t i = 0; i < count; ++i) {
+    if (i != 0) {
+      stream << ',';
+    }
+    stream << data[i];
+  }
+  if (values.numel() > static_cast<int64_t>(count)) {
+    stream << ",...";
+  }
+  stream << ']';
+  return stream.str();
+}
+
+std::string format_cache_ids(const std::vector<int32_t>& ids) {
+  std::ostringstream stream;
+  stream << '[';
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i != 0) {
+      stream << ',';
+    }
+    stream << ids[i];
+  }
+  stream << ']';
+  return stream.str();
+}
+
+std::string format_cache_request_ids(
+    const std::vector<std::string>& request_ids) {
+  std::ostringstream stream;
+  stream << '[';
+  for (size_t i = 0; i < request_ids.size(); ++i) {
+    if (i != 0) {
+      stream << ',';
+    }
+    stream << request_ids[i];
+  }
+  stream << ']';
+  return stream.str();
+}
+
+bool cache_debug_enabled() {
+  return ::xllm::ExecutionConfig::get_instance().debug_log_mtp_cache_state();
 }
 
 }  // namespace
@@ -73,6 +126,16 @@ void EmbeddingCache::write_prefill_target_context(
       << "prefill target embedding count mismatch";
 
   torch::Tensor next_tokens_cpu = to_cpu_int64_contiguous(next_tokens);
+  if (cache_debug_enabled()) {
+    LOG(INFO) << "[MTP_CACHE_DEBUG] write_prefill ids="
+              << format_cache_ids(ids) << ", request_ids="
+              << format_cache_request_ids(request_ids)
+              << ", tokens=" << format_cache_tokens(next_tokens_cpu)
+              << ", embedding_addr="
+              << (target_embeddings.numel() == 0
+                      ? nullptr
+                      : target_embeddings.data_ptr());
+  }
   const int64_t* next_tokens_data = next_tokens_cpu.const_data_ptr<int64_t>();
   const int32_t num_ids = static_cast<int32_t>(ids.size());
   for (int32_t i = 0; i < num_ids; ++i) {
@@ -140,6 +203,19 @@ void EmbeddingCache::write_target_context(
   CHECK_GE(num_speculative_tokens, 0) << "invalid speculative token count";
 
   torch::Tensor accepted_tokens_cpu = to_cpu_int64_contiguous(accepted_tokens);
+  if (cache_debug_enabled()) {
+    LOG(INFO) << "[MTP_CACHE_DEBUG] write_validate ids="
+              << format_cache_ids(ids) << ", request_ids="
+              << format_cache_request_ids(request_ids)
+              << ", token_shape=" << accepted_tokens_cpu.sizes()
+              << ", accepted_tokens="
+              << format_cache_tokens(accepted_tokens_cpu)
+              << ", num_speculative_tokens=" << num_speculative_tokens
+              << ", embeddings_addr="
+              << (accepted_embeddings.numel() == 0
+                      ? nullptr
+                      : accepted_embeddings.data_ptr());
+  }
   const int64_t* accepted_tokens_data =
       accepted_tokens_cpu.const_data_ptr<int64_t>();
   const int32_t num_ids = static_cast<int32_t>(ids.size());
@@ -212,6 +288,11 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
       << "decode request id count mismatch";
   std::vector<DecodeState> states;
   states.reserve(ids.size());
+  if (cache_debug_enabled()) {
+    LOG(INFO) << "[MTP_CACHE_DEBUG] read_begin ids="
+              << format_cache_ids(ids) << ", request_ids="
+              << format_cache_request_ids(request_ids);
+  }
   for (int32_t i = 0; i < static_cast<int32_t>(ids.size()); ++i) {
     const int32_t id = ids[i];
     const DecodeState& cached_state = get_tail(id);
@@ -232,6 +313,23 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
         CHECK(state.prev_embedding.defined())
             << "decode entry missing previous target embedding";
       }
+    }
+    if (cache_debug_enabled()) {
+      LOG(INFO) << "[MTP_CACHE_DEBUG] read_state index=" << i
+                << ", embedding_id=" << id
+                << ", request_id=" << (request_ids.empty()
+                                             ? std::string()
+                                             : request_ids[i])
+                << ", cached_request_id=" << state.request_id
+                << ", valid=" << state.valid
+                << ", token_id=" << state.token_id
+                << ", position_offset=" << state.position_offset
+                << ", correction_token_id=" << state.correction_token_id
+                << ", correction_position_offset="
+                << state.correction_position_offset << ", embedding_addr="
+                << (state.embedding.defined() && state.embedding.numel() > 0
+                        ? state.embedding.data_ptr()
+                        : nullptr);
     }
     states.emplace_back(std::move(state));
   }
@@ -261,6 +359,13 @@ std::vector<int32_t> EmbeddingCache::read_accepted_prefix_lengths(
       accepted_length = state.correction_position_offset + 1;
     }
     accepted_prefix_lengths.emplace_back(accepted_length);
+  }
+  if (cache_debug_enabled()) {
+    LOG(INFO) << "[MTP_CACHE_DEBUG] read_prefix ids="
+              << format_cache_ids(ids) << ", request_ids="
+              << format_cache_request_ids(request_ids)
+              << ", accepted_prefix_lengths="
+              << format_cache_ids(accepted_prefix_lengths);
   }
   return accepted_prefix_lengths;
 }

@@ -213,7 +213,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const std::vector<EmbeddingCache::DecodeState>& last_states,
       ForwardInput& extend_input,
       bool force_two_rows = false,
-      bool wait_for_compute_stream = true);
+      bool wait_for_compute_stream = true,
+      const char* prepare_phase = "unknown");
 
   struct PendingTargetContext {
     std::vector<int32_t> embedding_ids;

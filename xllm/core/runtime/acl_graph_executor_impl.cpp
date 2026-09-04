@@ -753,6 +753,35 @@ ModelOutput AclGraph::replay(CausalLM* model,
       << "num_tokens mismatch: expected <= " << num_tokens_ << ", got "
       << actual_num_tokens;
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+#if defined(USE_NPU)
+  const bool debug_graph_inputs =
+      ::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs();
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] replay_begin graph=" << this
+              << ", bucket_tokens=" << num_tokens_
+              << ", actual_tokens=" << actual_num_tokens
+              << ", is_spec_verify=" << params.is_spec_verify
+              << ", batch_type="
+              << params.meta.batch_forward_type.to_string()
+              << ", num_sequences=" << params.meta.num_sequences
+              << ", tokens_addr="
+              << (tokens.numel() > 0 ? tokens.data_ptr() : nullptr)
+              << ", positions_addr="
+              << (positions.numel() > 0 ? positions.data_ptr() : nullptr)
+              << ", graph_tokens_override_addr="
+              << (params.graph.input_tokens_override.defined()
+                      ? params.graph.input_tokens_override.data_ptr()
+                      : nullptr)
+              << ", kv_seq_lens_addr="
+              << (params.attention.device.kv_seq_lens.defined()
+                      ? params.attention.device.kv_seq_lens.data_ptr()
+                      : nullptr)
+              << ", block_tables_addr="
+              << (params.attention.device.block_tables.defined()
+                      ? params.attention.device.block_tables.data_ptr()
+                      : nullptr);
+  }
+#endif
 
   // Update persistent parameters with new input data
   // Note: tiling_data is updated in update() if needed - for hybrid models
@@ -793,6 +822,29 @@ ModelOutput AclGraph::replay(CausalLM* model,
     // inputs. Host-only task parameters remain current and are consumed by
     // update_graph_tasks() below.
     graph_params = params;
+#if defined(USE_NPU)
+    if (debug_graph_inputs) {
+      LOG(INFO) << "[MTP_GRAPH_DEBUG] replay_persistent graph=" << this
+                << ", prepared_inputs=" << replay_inputs_prepared
+                << ", can_use_prepared_inputs=" << can_use_prepared_inputs
+                << ", persistent_tokens_addr="
+                << (persistent_param_.persistent_tokens(num_tokens_).numel() > 0
+                        ? persistent_param_.persistent_tokens(num_tokens_).data_ptr()
+                        : nullptr)
+                << ", persistent_positions_addr="
+                << (persistent_param_.persistent_positions(num_tokens_).numel() > 0
+                        ? persistent_param_.persistent_positions(num_tokens_).data_ptr()
+                        : nullptr)
+                << ", persistent_kv_seq_lens_addr="
+                << (persistent_param_.kv_seq_lens().numel() > 0
+                        ? persistent_param_.kv_seq_lens().data_ptr()
+                        : nullptr)
+                << ", persistent_block_tables_addr="
+                << (persistent_param_.persistent_block_tables().numel() > 0
+                        ? persistent_param_.persistent_block_tables().data_ptr()
+                        : nullptr);
+    }
+#endif
   } else if (can_use_prepared_inputs) {
     persistent_param_.update_tokens(
         tokens, params, actual_num_tokens, num_tokens_);

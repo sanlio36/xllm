@@ -27,6 +27,7 @@ limitations under the License.
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -170,10 +171,41 @@ void wait_metadata_ready_event(const ForwardInput& input, Stream& stream) {
       << "failed to wait speculative metadata ready event";
 }
 
+int32_t synchronize_stream_with_debug(Stream& stream, const char* reason) {
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (!debug_log_dp_mtp_overlap) {
+    return stream.synchronize();
+  }
+  Timer timer;
+  const int32_t ret = stream.synchronize();
+  LOG(INFO) << "[DP_MTP_HOST_SYNC] stream reason=" << reason
+            << ", elapsed_us=" << timer.elapsed_microseconds()
+            << ", ret=" << ret;
+  return ret;
+}
+
+bool synchronize_event_with_debug(const StreamEventPtr& event,
+                                  const char* reason) {
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (!debug_log_dp_mtp_overlap) {
+    return event->synchronize();
+  }
+  Timer timer;
+  const bool success = event->synchronize();
+  LOG(INFO) << "[DP_MTP_HOST_SYNC] event reason=" << reason
+            << ", event=" << event.get()
+            << ", elapsed_us=" << timer.elapsed_microseconds()
+            << ", success=" << success;
+  return success;
+}
+
 void record_output_ready_event(ForwardOutput& output, Stream& stream) {
   StreamEventPtr event = stream.record_event();
   if (event == nullptr) {
-    const int32_t ret = stream.synchronize();
+    const int32_t ret =
+        synchronize_stream_with_debug(stream, "output_ready_event_fallback");
     CHECK_EQ(ret, 0) << "failed to synchronize MTP compute stream, ret=" << ret;
   }
   output.ready_event = event;
@@ -186,7 +218,8 @@ void finalize_output_on_stream(ForwardOutput& output,
     record_output_ready_event(output, stream);
     return;
   }
-  const int32_t ret = stream.synchronize();
+  const int32_t ret =
+      synchronize_stream_with_debug(stream, "finalize_output_sync");
   CHECK_EQ(ret, 0) << "failed to synchronize MTP compute stream, ret=" << ret;
   output.retained_inputs.clear();
 }
@@ -303,20 +336,123 @@ void clear_ready_events(ForwardInput& input) {
   input.metadata_ready_event.reset();
 }
 
+void log_mtp_debug_input(const char* phase,
+                         const ForwardInput& input,
+                         const void* worker) {
+#if defined(USE_NPU)
+  if (!::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs()) {
+    return;
+  }
+  const auto& attention = input.input_params.attention.device;
+  const auto address = [](const torch::Tensor& tensor) -> const void* {
+    return tensor.defined() && tensor.numel() > 0 ? tensor.data_ptr() : nullptr;
+  };
+  const auto host_values = [](const torch::Tensor& tensor) {
+    std::ostringstream stream;
+    if (!tensor.defined()) {
+      return std::string("undefined");
+    }
+    const torch::Tensor values = tensor.to(torch::kCPU)
+                                     .to(torch::kInt64)
+                                     .flatten()
+                                     .contiguous();
+    const int64_t* data = values.const_data_ptr<int64_t>();
+    const size_t count = std::min<size_t>(values.numel(), 32);
+    stream << '[';
+    for (size_t i = 0; i < count; ++i) {
+      if (i != 0) {
+        stream << ',';
+      }
+      stream << data[i];
+    }
+    if (values.numel() > static_cast<int64_t>(count)) {
+      stream << ",...";
+    }
+    stream << ']';
+    return stream.str();
+  };
+  const auto host_vector_values = [](const std::vector<int32_t>& values) {
+    std::ostringstream stream;
+    stream << '[';
+    const size_t count = std::min<size_t>(values.size(), 32);
+    for (size_t i = 0; i < count; ++i) {
+      if (i != 0) {
+        stream << ',';
+      }
+      stream << values[i];
+    }
+    if (values.size() > count) {
+      stream << ",...";
+    }
+    stream << ']';
+    return stream.str();
+  };
+  LOG(INFO) << "[DP_MTP_FORWARD_INPUT_DEBUG] phase=" << phase
+            << ", worker=" << worker
+            << ", batch_type="
+            << input.input_params.meta.batch_forward_type.to_string()
+            << ", num_sequences=" << input.input_params.meta.num_sequences
+            << ", token_ids=" << address(input.token_ids)
+            << ", token_ids_shape=" << input.token_ids.sizes()
+            << ", positions=" << address(input.positions)
+            << ", positions_shape=" << input.positions.sizes()
+            << ", embedding="
+            << address(input.input_params.embedding.input_embedding)
+            << ", embedding_ids="
+            << input.input_params.embedding.embedding_ids
+            << ", request_ids_count="
+            << input.input_params.embedding.request_ids.size()
+            << ", token_ids_host=" << host_values(input.token_ids_host)
+            << ", positions_host=" << host_values(input.positions_host)
+            << ", host_kv_seq_lens="
+            << host_vector_values(input.input_params.attention.host.kv_seq_lens)
+            << ", host_q_seq_lens="
+            << host_vector_values(input.input_params.attention.host.q_seq_lens)
+            << ", kv_seq_lens=" << address(attention.kv_seq_lens)
+            << ", kv_seq_lens_shape=" << attention.kv_seq_lens.sizes()
+            << ", block_tables=" << address(attention.block_tables)
+            << ", block_tables_shape=" << attention.block_tables.sizes()
+            << ", q_seq_lens=" << address(attention.q_seq_lens)
+            << ", q_seq_lens_shape=" << attention.q_seq_lens.sizes()
+            << ", dp_token_nums="
+            << input.input_params.parallel.dp_global_token_nums
+            << ", raw_dp_token_nums="
+            << input.input_params.parallel.raw_dp_global_token_nums
+            << ", batch_generations="
+            << input.input_params.parallel.dp_global_batch_generations;
+#else
+  (void)phase;
+  (void)input;
+  (void)worker;
+#endif
+}
+
 std::optional<ForwardOutput> run_llm_no_sync_impl(
     LLMWorkerImpl& worker,
     const ForwardInput& input,
     Stream& prepare_stream,
     Stream& compute_stream,
-    ForwardInput& processed_input) {
+    ForwardInput& processed_input,
+    const char* launch_kind = nullptr) {
   worker.prepare_work_before_execute_on_stream(
       input,
       processed_input,
       prepare_stream,
       /*record_ready_event=*/&prepare_stream != &compute_stream);
   worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
+  log_mtp_debug_input(launch_kind == nullptr ? "prepared" : launch_kind,
+                      processed_input,
+                      &worker);
   std::optional<ForwardOutput> output = worker.execute_no_sync_on_stream(
       processed_input, compute_stream, /*record_ready_event=*/false);
+#if defined(USE_NPU)
+  const auto& config = ::xllm::ExecutionConfig::get_instance();
+  if (config.debug_log_mtp_forward_lifecycle()) {
+    LOG(INFO) << "[DP_MTP_FORWARD_LIFECYCLE] enqueued worker=" << &worker
+              << ", token_count=" << processed_input.token_ids.numel()
+              << ", output=" << output.has_value();
+  }
+#endif
   return output;
 }
 
@@ -767,16 +903,29 @@ class NpuJsonDraftTokenHandoff final {
   }
 
   void synchronize_after_failed_handoff(Stream& compute_stream) const {
+    Timer timer;
     if (wait_stream_ != nullptr) {
       const aclError wait_ret =
           aclrtSynchronizeStreamWithTimeout(wait_stream_, /*timeout=*/-1);
+      if (::xllm::ExecutionConfig::get_instance()
+              .debug_log_dp_mtp_overlap()) {
+        LOG(INFO) << "[DP_MTP_HOST_SYNC] stream reason=json_handoff_wait_stream"
+                  << ", elapsed_us=" << timer.elapsed_microseconds()
+                  << ", ret=" << wait_ret;
+      }
       if (wait_ret != ACL_SUCCESS) {
         LOG(ERROR) << "Failed to synchronize JSON draft token handoff wait "
                       "stream after fallback: "
                    << wait_ret;
       }
     }
+    timer.reset();
     const int32_t compute_ret = compute_stream.synchronize();
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      LOG(INFO) << "[DP_MTP_HOST_SYNC] stream reason=json_handoff_compute_stream"
+                << ", elapsed_us=" << timer.elapsed_microseconds()
+                << ", ret=" << compute_ret;
+    }
     if (compute_ret != 0) {
       LOG(ERROR) << "Failed to synchronize MTP compute stream after JSON draft "
                     "token handoff fallback: "
@@ -1526,6 +1675,27 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       use_prelaunched_first_draft && matching_device_target_context &&
       combined_draft_execution_path_ ==
           mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
+#if defined(USE_NPU)
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (debug_log_dp_mtp_overlap) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] decode_decision rank="
+              << parallel_args_.rank()
+              << ", prelaunch=" << use_prelaunched_first_draft
+              << ", device_context=" << use_device_target_context
+              << ", matching_target=" << matching_device_target_context
+              << ", defer_materialization="
+              << defer_target_context_materialization
+              << ", pending_draft="
+              << !pending_draft_context_.outputs.empty()
+              << ", pending_target="
+              << pending_target_context_.accepted_tokens.defined()
+              << ", generations="
+              << input.input_params.parallel.dp_global_batch_generations;
+  }
+#else
+  const bool debug_log_dp_mtp_overlap = false;
+#endif
   // Keep the device-side accepted state alive across a first-transition Host
   // cache flush. The prelaunched draft can be valid before the batch is marked
   // device-context ready, while flush_pending_target_context() clears the
@@ -1673,7 +1843,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                 template_states,
                                 current_draft_input,
                                 /*force_two_rows=*/true,
-                                /*wait_for_compute_stream=*/true);
+                                /*wait_for_compute_stream=*/true,
+                                "device_target_context");
     wait_metadata_ready_event(current_draft_input, *compute_stream_);
     clear_ready_events(current_draft_input);
 
@@ -1707,7 +1878,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                 last_states,
                                 current_draft_input,
                                 /*force_two_rows=*/false,
-                                /*wait_for_compute_stream=*/true);
+                                /*wait_for_compute_stream=*/true,
+                                "decode_fallback");
   }
   const bool use_continuous_dsa_drafts =
       (use_device_target_context || use_prelaunched_first_draft) &&
@@ -1797,6 +1969,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     if (use_prelaunched_first_draft &&
         static_cast<size_t>(draft_idx) <
             pending_draft_context_.outputs.size()) {
+#if defined(USE_NPU)
+      log_mtp_debug_input("prelaunch_consume",
+                          pending_draft_context_.prepared_inputs[
+                              static_cast<size_t>(draft_idx)],
+                          draft_impl_.get());
+#endif
       draft_output_opt = std::move(
           pending_draft_context_.outputs[static_cast<size_t>(draft_idx)]);
       draft_prepared[draft_idx] = std::move(
@@ -1810,7 +1988,11 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                               current_draft_input,
                                               *compute_stream_,
                                               *compute_stream_,
-                                              draft_prepared[draft_idx]);
+                                              draft_prepared[draft_idx],
+                                              draft_idx == 0 ? "draft0"
+                                                             : (draft_idx == 1
+                                                                    ? "draft1"
+                                                                    : "draft2"));
     }
 
     if ((use_device_target_context || use_prelaunched_first_draft) &&
@@ -2328,7 +2510,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                                                      validate_input,
                                                      *compute_stream_,
                                                      *compute_stream_,
-                                                     target_prepared)
+                                                     target_prepared,
+                                                     "target_validate")
                                     .value();
   const double target_latency_ms = timer.elapsed_milliseconds();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
@@ -2376,6 +2559,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   const bool prelaunch_next_first_draft =
       pruned_prefix_lengths == nullptr &&
       combined_draft_schedule(input).prelaunch_next_first_draft;
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] validate_decision rank="
+              << parallel_args_.rank() << ", enabled="
+              << prelaunch_next_first_draft << ", pruned="
+              << (pruned_prefix_lengths != nullptr) << ", generations="
+              << input.input_params.parallel.dp_global_batch_generations;
+  }
+#endif
   ForwardInput next_first_draft_input;
   if (prelaunch_next_first_draft) {
     // This input is independent of the accepted token.  Prepare it on the
@@ -2414,7 +2606,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
       broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
     }
 
-    const int32_t ret = compute_stream_->synchronize();
+    const int32_t ret = synchronize_stream_with_debug(
+        *compute_stream_, "adaptive_validate_before_cpu_copy");
     CHECK_EQ(ret, 0) << "failed to synchronize MTP compute stream, ret=" << ret;
     target_output.retained_inputs.clear();
     val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
@@ -2474,7 +2667,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
     target_context_ready_event = compute_stream_->record_event();
   }
   if (target_context_ready_event == nullptr) {
-    const int32_t ret = compute_stream_->synchronize();
+    const int32_t ret = synchronize_stream_with_debug(
+        *compute_stream_, "target_context_event_fallback");
     CHECK_EQ(ret, 0) << "failed to synchronize MTP target context, ret=" << ret;
   }
   std::vector<size_t> failed_sequence_rows;
@@ -2487,7 +2681,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
              input.json_object_states.size())
         << "MTP JSON embedding ids must match grammar state rows";
     CHECK(target_context_ready_event == nullptr ||
-          target_context_ready_event->synchronize())
+          synchronize_event_with_debug(target_context_ready_event,
+                                       "json_replay_target_context"))
         << "failed to wait for accepted MTP tokens before JSON replay";
 
     const torch::Tensor accepted_tokens =
@@ -2619,6 +2814,31 @@ void MTPWorkerImpl::stage_target_context_write(
   }
   pending_target_context_.failed_rows = std::move(failed_rows);
   pending_target_context_.ready_event = std::move(ready_event);
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_cache_state()) {
+    LOG(INFO) << "[MTP_STATE_DEBUG] target_context_staged rank="
+              << parallel_args_.rank() << ", ids="
+              << input.input_params.embedding.embedding_ids
+              << ", generations="
+              << input.input_params.parallel.dp_global_batch_generations
+              << ", accepted_tokens_addr="
+              << (validate_output.next_tokens.defined()
+                      ? validate_output.next_tokens.data_ptr()
+                      : nullptr)
+              << ", accepted_embeddings_addr="
+              << (validate_output.embeddings.defined()
+                      ? validate_output.embeddings.data_ptr()
+                      : nullptr)
+              << ", base_positions_addr="
+              << (pending_target_context_.base_positions.defined()
+                      ? pending_target_context_.base_positions.data_ptr()
+                      : nullptr)
+              << ", base_kv_seq_lens_addr="
+              << (pending_target_context_.base_kv_seq_lens.defined()
+                      ? pending_target_context_.base_kv_seq_lens.data_ptr()
+                      : nullptr);
+  }
+#endif
   mark_dp_batch_validated_for_prelaunch(input);
 }
 
@@ -2687,7 +2907,8 @@ void MTPWorkerImpl::flush_pending_target_context() {
     return;
   }
   CHECK(pending_target_context_.ready_event == nullptr ||
-        pending_target_context_.ready_event->synchronize())
+        synchronize_event_with_debug(pending_target_context_.ready_event,
+                                     "flush_pending_target_context"))
       << "failed to wait for pending MTP target context";
   CHECK(embedding_cache_ != nullptr)
       << "embedding_cache_ must be initialized before target cache write";
@@ -2695,6 +2916,16 @@ void MTPWorkerImpl::flush_pending_target_context() {
   const int32_t num_validation_tokens = num_speculative_tokens + 1;
   const torch::Tensor accepted_tokens =
       pending_target_context_.accepted_tokens_host.contiguous();
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_mtp_cache_state()) {
+    LOG(INFO) << "[MTP_STATE_DEBUG] target_context_flush rank="
+              << parallel_args_.rank() << ", ids="
+              << pending_target_context_.embedding_ids
+              << ", generations="
+              << pending_target_context_.dp_global_batch_generations
+              << ", accepted_tokens_shape=" << accepted_tokens.sizes();
+  }
+#endif
   CHECK_EQ(accepted_tokens.numel() % num_validation_tokens, 0)
       << "MTP validation output width mismatch";
   const torch::Tensor output_tokens =
@@ -2978,7 +3209,8 @@ void MTPWorkerImpl::prepare_next_first_draft_template(
                               template_states,
                               combined_input,
                               /*force_two_rows=*/true,
-                              /*wait_for_compute_stream=*/false);
+                              /*wait_for_compute_stream=*/false,
+                              "next_first_draft_template");
   combined_input.skip_sampling_for_logits_only = false;
 }
 
@@ -3001,6 +3233,16 @@ void MTPWorkerImpl::enqueue_next_first_draft(
       mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
   const bool rebuild_prelaunch_metadata =
       is_glm_moe_dsa_prelaunch && !prelaunch_metadata_batch_matches(input);
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_REBUILD_DEBUG] enqueue rank="
+              << parallel_args_.rank() << ", rebuild_metadata="
+              << rebuild_prelaunch_metadata << ", generations="
+              << input.input_params.parallel.dp_global_batch_generations
+              << ", token_nums="
+              << input.input_params.parallel.dp_global_token_nums;
+  }
+#endif
 
   // Interleave [repair, current] rows in one decode batch. Every transformer
   // layer projects both rows, writes both KV rows, and only then launches
@@ -3063,7 +3305,8 @@ void MTPWorkerImpl::submit_pending_first_draft(
                            draft_input,
                            *compute_stream_,
                            *compute_stream_,
-                           pending_draft_context_.prepared_inputs.back())
+                           pending_draft_context_.prepared_inputs.back(),
+                           "prelaunch_draft0")
           .value());
   CHECK(!pending_draft_context_.outputs.empty())
       << "failed to prelaunch next MTP first draft";
@@ -3081,10 +3324,20 @@ void MTPWorkerImpl::submit_pending_first_draft(
   }
   pending_draft_context_.completion_event = compute_stream_->record_event();
   if (pending_draft_context_.completion_event == nullptr) {
-    const int32_t ret = compute_stream_->synchronize();
+    const int32_t ret = synchronize_stream_with_debug(
+        *compute_stream_, "prelaunch_cache_fence_event_fallback");
     CHECK_EQ(ret, 0) << "failed to synchronize MTP prelaunch cache fence, ret="
                      << ret;
   }
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_STAGE] prelaunch_staged rank="
+              << parallel_args_.rank()
+              << ", generations="
+              << pending_draft_context_.dp_global_batch_generations
+              << ", request_ids=" << pending_draft_context_.request_ids;
+  }
+#endif
 }
 
 void MTPWorkerImpl::submit_pending_followup_drafts(
@@ -3134,7 +3387,8 @@ void MTPWorkerImpl::submit_pending_followup_drafts(
                              next_input,
                              *compute_stream_,
                              *compute_stream_,
-                             prepared_input);
+                             prepared_input,
+                             "prelaunch_followup_draft");
     CHECK(output.has_value()) << "failed to prelaunch MTP follow-up draft";
     pending_draft_context_.prepared_inputs.emplace_back(
         std::move(prepared_input));
@@ -3165,7 +3419,8 @@ void MTPWorkerImpl::submit_pending_empty_followup_drafts(
                              input,
                              *compute_stream_,
                              *compute_stream_,
-                             prepared_input);
+                             prepared_input,
+                             "prelaunch_followup_draft");
     CHECK(output.has_value())
         << "failed to prelaunch empty MTP follow-up draft";
     pending_draft_context_.prepared_inputs.emplace_back(
@@ -3184,6 +3439,15 @@ void MTPWorkerImpl::publish_pending_draft_cache_fence(
 
 void MTPWorkerImpl::retire_pending_first_draft(const char* reason) {
   CHECK(!pending_draft_context_.outputs.empty());
+#if defined(USE_NPU)
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    LOG(INFO) << "[DP_MTP_PRELAUNCH_STAGE] prelaunch_event_retire rank="
+              << parallel_args_.rank() << ", reason=" << reason
+              << ", generations="
+              << pending_draft_context_.dp_global_batch_generations
+              << ", request_ids=" << pending_draft_context_.request_ids;
+  }
+#endif
   std::lock_guard<std::mutex> lock(mtx_);
   const StreamEventPtr completion_event =
       pending_draft_context_.completion_event;
@@ -3193,7 +3457,8 @@ void MTPWorkerImpl::retire_pending_first_draft(const char* reason) {
       !last_step_output_.requires_cache_ownership_fence;
   if (!completion_event_already_synchronized) {
     CHECK(completion_event == nullptr ||
-          completion_event->synchronize())
+          synchronize_event_with_debug(completion_event,
+                                       "retire_pending_first_draft"))
         << "failed to retire stale MTP draft prelaunch";
   }
   if (last_step_output_.cache_ownership_event == completion_event) {
@@ -3983,12 +4248,36 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     const std::vector<EmbeddingCache::DecodeState>& last_states,
     ForwardInput& extend_input,
     bool force_two_rows,
-    bool wait_for_compute_stream) {
+    bool wait_for_compute_stream,
+    const char* prepare_phase) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
+#if defined(USE_NPU)
+  const bool debug_log_dp_mtp_overlap =
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  if (debug_log_dp_mtp_overlap) {
+    LOG(INFO) << "[DP_MTP_PREPARE_DEBUG] begin phase=" << prepare_phase
+              << ", wait_for_compute_stream=" << wait_for_compute_stream
+              << ", force_two_rows=" << force_two_rows
+              << ", prepare_stream=" << *prepare_stream_
+              << ", compute_stream=" << *compute_stream_;
+  }
+#endif
   // Regular draft preparation may consume tensors produced by the previous
   // compute. The placeholder-only first-draft prelaunch has no such dependency.
   if (wait_for_compute_stream) {
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_PREPARE_DEBUG] wait_begin phase="
+                << prepare_phase;
+    }
+#endif
     prepare_stream_->wait_stream(*compute_stream_);
+#if defined(USE_NPU)
+    if (debug_log_dp_mtp_overlap) {
+      LOG(INFO) << "[DP_MTP_PREPARE_DEBUG] wait_submitted phase="
+                << prepare_phase;
+    }
+#endif
   }
   extend_input = base_input;
   // Adaptive pruning needs draft selected-probs; force return_probs on so the
@@ -4237,6 +4526,11 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   }
   extend_input.device_tensors_ready = true;
   finish_metadata_prepare(*prepare_stream_, extend_input);
+#if defined(USE_NPU)
+  if (debug_log_dp_mtp_overlap) {
+    LOG(INFO) << "[DP_MTP_PREPARE_DEBUG] finish phase=" << prepare_phase;
+  }
+#endif
 }
 
 void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
