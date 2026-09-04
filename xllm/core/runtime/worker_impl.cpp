@@ -1560,13 +1560,6 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
       }
 
       auto output = this->step_for_schedule_overlap(input);
-      const bool defer_glm_mtp_cache_ownership_commit =
-          requires_glm_mtp_cache_ownership_fence(
-              options_.enable_schedule_overlap(),
-              options_.num_speculative_tokens(),
-              options_.dp_size(),
-              context_.get_model_args().model_type(),
-              ::xllm::ExecutionConfig::get_instance().enable_graph());
 #if defined(USE_NPU)
       if (output.has_value() && !output->sample_output.next_tokens.defined() &&
           output->ready_event != nullptr && !output->retained_inputs.empty() &&
@@ -1575,10 +1568,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
             << "failed to retire asynchronous output without tokens";
       }
 #endif
-      // Only GLM eager DP has a scheduler-side ownership transaction. Preserve
-      // worker-side acknowledgment for every other combined prelaunch mode.
-      // A prelaunch completion event is carried to the output owner. Do not
-      // turn it into a host wait on the worker path.
+      const bool defer_glm_mtp_cache_ownership_commit =
+          requires_glm_mtp_cache_ownership_fence(
+              options_.enable_schedule_overlap(),
+              options_.num_speculative_tokens(),
+              options_.dp_size(),
+              context_.get_model_args().model_type(),
+              ::xllm::ExecutionConfig::get_instance().enable_graph());
       if (output.has_value() && output->requires_cache_ownership_fence &&
           !defer_glm_mtp_cache_ownership_commit &&
           !::xllm::ExecutionConfig::get_instance().enable_graph()) {
@@ -1651,14 +1647,14 @@ ForwardOutput WorkerImpl::get_last_step_result() {
   ForwardOutput output;
   std::unique_lock<std::mutex> lock(mtx_);
   cv_.wait(lock, [this] { return is_recorded_; });
-  const bool skip_graph_prelaunch_ownership_wait =
-      last_step_output_.requires_cache_ownership_fence &&
-      ::xllm::ExecutionConfig::get_instance().enable_graph();
-  if (last_step_output_.requires_cache_ownership_fence &&
-      !skip_graph_prelaunch_ownership_wait) {
+  if (last_step_output_.requires_cache_ownership_fence) {
     CHECK(last_step_output_.cache_ownership_event == nullptr ||
           last_step_output_.cache_ownership_event->synchronize())
         << "failed to commit MTP prelaunch cache ownership";
+    // The ownership event is shared with the pending-draft retirement path.
+    // Mark it consumed while holding mtx_ so the two host-side consumers never
+    // synchronize the same event concurrently.
+    last_step_output_.requires_cache_ownership_fence = false;
   }
   if (last_step_output_valid_ ||
       ::xllm::EPLBConfig::get_instance().enable_eplb() ||

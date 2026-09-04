@@ -1301,9 +1301,6 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     stride = 1;
   }
-  // GLM eager MTP prelaunch writes cache after target validation. The
-  // ownership fence is local to every worker, so wait for all workers before
-  // scheduler-side batch/cache mutation.
   if (requires_glm_mtp_cache_ownership_fence(
           options_.enable_schedule_overlap(),
           options_.num_speculative_tokens(),

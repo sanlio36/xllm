@@ -463,6 +463,7 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
 
 void ContinuousScheduler::step_with_schedule_overlap(
     const absl::Duration& timeout) {
+  apply_cancel_requests();
   const bool last_batch_all_empty = std::all_of(
       last_batch_.begin(), last_batch_.end(), [](const Batch& one_batch) {
         return one_batch.empty();
@@ -474,17 +475,22 @@ void ContinuousScheduler::step_with_schedule_overlap(
           options_.dp_size(),
           engine_->model_args().model_type(),
           ::xllm::ExecutionConfig::get_instance().enable_graph());
+  const bool batch_may_release_cache = std::any_of(
+      last_running_requests_.begin(),
+      last_running_requests_.end(),
+      [](const std::shared_ptr<Request>& request) {
+        return request != nullptr &&
+               (request->finished() || request->cancelled());
+      });
+  const bool can_dispatch_before_ownership_fence =
+      fence_glm_mtp_cache_ownership && !batch_may_release_cache;
   bool last_batch_processed = false;
   if (fence_glm_mtp_cache_ownership && !is_first_step_ &&
-      !last_batch_all_empty) {
-    // GLM eager MTP prelaunch mutates the current batch's cache after target
-    // validation. Resolve its post-prelaunch event before scheduling can
-    // finish, preempt, release, or reuse any cache resource from that batch.
+      !last_batch_all_empty && !can_dispatch_before_ownership_fence) {
     engine_->update_last_step_result(last_batch_);
     process_batch_output(true);
     last_batch_processed = true;
   }
-
   // get a new batch of requests
   std::vector<Batch> batch = schedule_request(timeout);
   const bool cur_batch_all_empty =
