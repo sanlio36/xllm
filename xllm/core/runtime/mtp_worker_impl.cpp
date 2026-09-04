@@ -28,6 +28,7 @@ limitations under the License.
 #include <exception>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 
 #include "common/metrics.h"
@@ -4530,6 +4531,42 @@ SampleOutput MTPWorkerImpl::validate(
                                 target_output.sample_output.next_tokens,
                                 num_speculative_tokens,
                                 pruning_masks);
+  }
+
+  // Stop-token truncation: once a target-confirmed token is a stop token
+  // (eos/stop_token_ids), every later column must be rejected. MTP acceptance
+  // only checks draft == target, so an EOS followed by matching bonus tokens
+  // otherwise survives as [EOS, bonus, -1, -1], which hides the stop from the
+  // scheduler-side stopping checker and makes the sequence loop past EOS.
+  {
+    const ModelArgs& model_args = context_.get_model_args();
+    const std::unordered_set<int32_t>& stop_tokens =
+        model_args.stop_token_ids();
+    if (!stop_tokens.empty() && sample_output.next_tokens.defined()) {
+      torch::Tensor tokens = sample_output.next_tokens;
+      CHECK_EQ(tokens.dim(), 2)
+          << "MTP validate tokens must be [batch, num_val_tokens] before "
+             "stop-token truncation";
+      const int64_t width = tokens.size(1);
+      const int64_t batch = tokens.size(0);
+      torch::Tensor is_stop =
+          torch::zeros({batch, width}, tokens.options().dtype(torch::kBool));
+      for (const int32_t stop_id : stop_tokens) {
+        is_stop = is_stop | (tokens == stop_id);
+      }
+      // Column of the first stop token per row; width marks "no stop".
+      const torch::Tensor col_idx = torch::arange(width, tokens.options())
+                                        .unsqueeze(0)
+                                        .expand({batch, width});
+      const torch::Tensor stop_pos =
+          torch::where(is_stop, col_idx, torch::full_like(col_idx, width));
+      const torch::Tensor first_stop_idx =
+          std::get<0>(stop_pos.min(/*dim=*/1)).unsqueeze(1);
+      // Reject every column strictly after the first stop token.
+      const torch::Tensor trunc_mask = col_idx > first_stop_idx;
+      sample_output.next_tokens =
+          torch::where(trunc_mask, torch::full_like(tokens, -1), tokens);
+    }
   }
 
   return sample_output;
