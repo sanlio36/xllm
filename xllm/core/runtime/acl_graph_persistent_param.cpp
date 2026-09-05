@@ -1183,6 +1183,15 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     std::copy(padded_q_seq_lens_vec.begin(),
               padded_q_seq_lens_vec.end(),
               persistent_host_q_seq_lens_.begin());
+    // ACL graph replay keeps the hostData address captured by ATB. Refresh
+    // that same buffer before replay instead of only updating the graph
+    // metadata copy returned to the caller.
+    std::copy(padded_kv_seq_lens_vec.begin(),
+              padded_kv_seq_lens_vec.end(),
+              capture_host_kv_seq_lens_.begin());
+    std::copy(padded_q_seq_lens_vec.begin(),
+              padded_q_seq_lens_vec.end(),
+              capture_host_q_seq_lens_.begin());
   }
 
   if (uses_paged_attention_tiling() && update_paged_attention_plan) {
@@ -1276,11 +1285,9 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                 capture_host_q_seq_lens_vec.begin() + padded_batch_size,
                 capture_host_q_seq_lens_.begin());
       const int32_t* graph_kv_seq_lens_data =
-          use_mla_capture_host_lens ? capture_host_kv_seq_lens_data()
-                                    : persistent_host_kv_seq_lens_data();
+          capture_host_kv_seq_lens_data();
       const int32_t* graph_q_seq_lens_data =
-          use_mla_capture_host_lens ? capture_host_q_seq_lens_data()
-                                    : persistent_host_q_seq_lens_data();
+          capture_host_q_seq_lens_data();
       const std::vector<int32_t>& graph_host_kv_seq_lens_vec =
           use_mla_capture_host_lens ? capture_host_kv_seq_lens_vec
                                     : persistent_host_kv_seq_lens_;
