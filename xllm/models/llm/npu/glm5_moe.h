@@ -328,6 +328,10 @@ class GlmMoeDsaForCausalLMImpl
     model_->update_expert_weight(layer_id + first_k_dense_replace_);
   }
 
+  bool supports_mla_graph_kv_bucketing() const {
+    return true;
+  }
+
  private:
   int32_t first_k_dense_replace_;
 };
