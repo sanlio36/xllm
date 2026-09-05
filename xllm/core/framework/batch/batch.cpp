@@ -553,6 +553,19 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
 
     if (!target.from_sample_slot) {
       if (seq->finished()) {
+#if defined(USE_NPU)
+        if (::xllm::ExecutionConfig::get_instance()
+                .debug_log_dp_mtp_overlap()) {
+          LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output_skip_finished "
+                    << "output_idx=" << output_idx
+                    << ", request_id=" << seq->request_id()
+                    << ", output_tokens="
+                    << (output_idx < raw_output.outputs.size()
+                            ? raw_output.outputs[output_idx].tokens.size()
+                            : 0)
+                    << ", replace_fake_token=" << replace_fake_token;
+        }
+#endif
         continue;
       }
       if (update_sequence_state(seq, replace_fake_token)) {
@@ -577,6 +590,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
       LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output output_idx="
                 << output_idx << ", tokens_count="
                 << raw_sample_output.tokens.size()
+                << ", request_id=" << seq->request_id()
                 << ", replace_fake_token=" << replace_fake_token
                 << ", from_sample_slot=" << target.from_sample_slot
                 << ", seq_finished_before=" << seq->finished();
@@ -585,6 +599,17 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
     for (size_t token_idx = 0; token_idx < raw_sample_output.tokens.size();
          ++token_idx) {
       const auto& raw_token = raw_sample_output.tokens[token_idx];
+#if defined(USE_NPU)
+      if (::xllm::ExecutionConfig::get_instance()
+              .debug_log_dp_mtp_overlap()) {
+        LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output_token "
+                  << "output_idx=" << output_idx
+                  << ", token_idx=" << token_idx
+                  << ", token_id=" << raw_token.id
+                  << ", request_id=" << seq->request_id()
+                  << ", replace_fake_token=" << replace_fake_token;
+      }
+#endif
       append_token_for_sequence(
           seq, make_token(raw_token), token_idx, replace_fake_token);
       if (seq->error_status().has_value()) {
@@ -605,7 +630,8 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
           LOG(INFO) << "[DP_MTP_TOKEN_ACCT] process_raw_output_break_finished "
                        "output_idx="
                     << output_idx << ", token_idx=" << token_idx
-                    << ", token_id=" << raw_token.id;
+                    << ", token_id=" << raw_token.id
+                    << ", request_id=" << seq->request_id();
         }
 #endif
         break;

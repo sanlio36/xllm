@@ -4925,6 +4925,35 @@ SampleOutput MTPWorkerImpl::validate(
       const torch::Tensor trunc_mask = col_idx > first_stop_idx;
       sample_output.next_tokens =
           torch::where(trunc_mask, torch::full_like(tokens, -1), tokens);
+#if defined(USE_NPU)
+      if (::xllm::ExecutionConfig::get_instance()
+              .debug_log_dp_mtp_overlap()) {
+        auto format_rows = [](const torch::Tensor& value) {
+          const torch::Tensor value_cpu =
+              value.device().is_cpu() ? value : value.to(torch::kCPU);
+          std::ostringstream rows;
+          for (int64_t row = 0; row < value_cpu.size(0); ++row) {
+            if (row > 0) {
+              rows << '|';
+            }
+            rows << '[';
+            for (int64_t col = 0; col < value_cpu.size(1); ++col) {
+              if (col > 0) {
+                rows << ',';
+              }
+              rows << value_cpu.select(0, row).select(0, col).item<int64_t>();
+            }
+            rows << ']';
+          }
+          return rows.str();
+        };
+        LOG(INFO) << "[DP_MTP_EOS_DEBUG] validate_stop_truncation batch="
+                  << batch << ", width=" << width
+                  << ", stop_token_count=" << stop_tokens.size()
+                  << ", before=" << format_rows(tokens)
+                  << ", after=" << format_rows(sample_output.next_tokens);
+      }
+#endif
     }
   }
 

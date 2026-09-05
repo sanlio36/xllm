@@ -492,6 +492,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
     LOG(INFO) << "[DP_MTP_TOKEN_ACCT] update_last_step_token_begin token_id="
               << token.id << ", token_offset=" << token_offset
+              << ", request_id=" << request_id_
               << ", cur_generated_token_idx=" << cur_generated_token_idx_
               << ", num_tokens=" << num_tokens_
               << ", num_prompt_tokens=" << num_prompt_tokens_
@@ -517,6 +518,16 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
     // last_batch_ being processed by update_last_step_result().
     // Composite KV managers can have capacity without exposing local blocks.
     if (kv_state_.current_max_tokens_capacity() == 0) {
+#if defined(USE_NPU)
+      if (::xllm::ExecutionConfig::get_instance()
+              .debug_log_dp_mtp_overlap()) {
+        LOG(INFO) << "[DP_MTP_TOKEN_ACCT] update_last_step_token_skip_no_capacity "
+                  << "token_id=" << token.id
+                  << ", token_offset=" << token_offset
+                  << ", request_id=" << request_id_
+                  << ", current_max_tokens_capacity=0";
+      }
+#endif
       return;
     }
     kv_state_.incr_kv_cache_tokens_num(1);
@@ -553,6 +564,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
     LOG(INFO) << "[DP_MTP_TOKEN_ACCT] update_last_step_token_end token_id="
               << token_id << ", token_offset=" << token_offset
+              << ", request_id=" << request_id_
               << ", cur_generated_token_idx=" << cur_generated_token_idx_
               << ", num_tokens=" << num_tokens_;
   }
@@ -1028,7 +1040,8 @@ bool Sequence::finished() const {
     }
     LOG(INFO) << "[DP_MTP_TOKEN_ACCT] finished_check valid_tokens_count="
               << valid_tokens.size() << ", first_tokens=[" << token_preview.str()
-              << "], cur_generated_token_idx=" << cur_generated_token_idx_
+              << "], request_id=" << request_id_
+              << ", cur_generated_token_idx=" << cur_generated_token_idx_
               << ", last_valid_token_id="
               << (valid_tokens.size() > 0 ? valid_tokens.back() : -1);
   }
@@ -1041,6 +1054,7 @@ bool Sequence::finished() const {
     LOG(INFO) << "[DP_MTP_TOKEN_ACCT] finished_check_result is_finished="
               << (finish_reason != FinishReason::NONE)
               << ", is_stop=" << (finish_reason == FinishReason::STOP)
+              << ", request_id=" << request_id_
               << ", matched_stop_token_count=" << matched_stop_token_count;
   }
 #endif

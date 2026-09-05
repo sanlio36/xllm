@@ -796,7 +796,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
       replay_inputs_prepared && params.graph.input_tokens_override.defined() &&
       !needs_graph_metadata;
   std::optional<ModelInputParams> graph_params;
+  const char* input_update_mode = "persistent_update";
   if (graph_paged_attention_tiling_data_.defined()) {
+    input_update_mode = "spec_verify_inputs";
     const auto current_addresses =
         spec_verify_input_addresses(tokens, positions, params);
     if (!spec_verify_input_addresses_at_capture_.has_value() ||
@@ -846,6 +848,7 @@ ModelOutput AclGraph::replay(CausalLM* model,
     }
 #endif
   } else if (can_use_prepared_inputs) {
+    input_update_mode = "prepared_tokens";
     persistent_param_.update_tokens(
         tokens, params, actual_num_tokens, num_tokens_);
   } else {
@@ -871,6 +874,44 @@ ModelOutput AclGraph::replay(CausalLM* model,
           graph_params.value());
     }
   }
+
+#if defined(USE_NPU)
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] replay_inputs"
+              << ", graph=" << this << ", bucket_tokens=" << num_tokens_
+              << ", persistent_param=" << &persistent_param_
+              << ", actual_tokens=" << actual_num_tokens
+              << ", update_mode=" << input_update_mode
+              << ", prepared_inputs=" << replay_inputs_prepared
+              << ", can_use_prepared_inputs=" << can_use_prepared_inputs
+              << ", needs_graph_metadata=" << needs_graph_metadata
+              << ", current_stream=" << stream
+              << ", graph_stream=" << graph_stream_
+              << ", source_tokens_addr="
+              << (tokens.numel() > 0 ? tokens.data_ptr() : nullptr)
+              << ", source_positions_addr="
+              << (positions.numel() > 0 ? positions.data_ptr() : nullptr)
+              << ", persistent_tokens_addr="
+              << (persistent_param_.persistent_tokens(num_tokens_).numel() > 0
+                      ? persistent_param_.persistent_tokens(num_tokens_)
+                            .data_ptr()
+                      : nullptr)
+              << ", persistent_positions_addr="
+              << (persistent_param_.persistent_positions(num_tokens_).numel() >
+                          0
+                      ? persistent_param_.persistent_positions(num_tokens_)
+                            .data_ptr()
+                      : nullptr)
+              << ", persistent_kv_seq_lens_addr="
+              << (persistent_param_.kv_seq_lens().numel() > 0
+                      ? persistent_param_.kv_seq_lens().data_ptr()
+                      : nullptr)
+              << ", persistent_block_tables_addr="
+              << (persistent_param_.persistent_block_tables().numel() > 0
+                      ? persistent_param_.persistent_block_tables().data_ptr()
+                      : nullptr);
+  }
+#endif
 
   // Persistent graph inputs may be updated on a different stream. Install a
   // device-side dependency before replay so the host remains asynchronous.
@@ -1194,6 +1235,27 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const uint64_t graph_key =
       get_graph_key(bucket_num_tokens, params_single, attention_plan_class);
+#if defined(USE_NPU)
+  const bool debug_graph_inputs =
+      ::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs();
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] select"
+              << ", slot=" << slot_idx
+              << ", graph_key=" << graph_key
+              << ", graph_num_tokens=" << graph_num_tokens
+              << ", bucket_tokens=" << bucket_num_tokens
+              << ", actual_tokens=" << n_tokens
+              << ", local_batch_size=" << local_batch_size
+              << ", global_batch_size=" << global_batch_size
+              << ", num_sequences=" << params_single.meta.num_sequences
+              << ", q_max_seq_len=" << params_single.meta.q_max_seq_len
+              << ", kv_max_seq_len=" << params_single.meta.kv_max_seq_len
+              << ", is_spec_verify=" << params_single.is_spec_verify
+              << ", dp_token_nums="
+              << params_single.parallel.dp_global_token_nums
+              << ", dp_is_decode=" << params_single.parallel.dp_is_decode;
+  }
+#endif
   std::shared_ptr<AclGraph> replay_graph;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
@@ -1202,6 +1264,16 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
       replay_graph = it->second;
     }
   }
+
+#if defined(USE_NPU)
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] selected"
+              << ", slot=" << slot_idx << ", graph_key=" << graph_key
+              << ", persistent_param=" << &active_persistent_param
+              << ", mode=" << (replay_graph == nullptr ? "capture" : "replay")
+              << ", graph=" << replay_graph.get();
+  }
+#endif
 
   if (replay_graph != nullptr) {
     // Replay the existing graph
@@ -1348,26 +1420,79 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
   const uint64_t graph_key =
       get_graph_key(bucket_num_tokens, params, attention_plan_class);
 
+#if defined(USE_NPU)
+  const bool debug_graph_inputs =
+      ::xllm::ExecutionConfig::get_instance().debug_log_mtp_forward_inputs();
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_begin"
+              << ", bucket_tokens=" << bucket_num_tokens
+              << ", graph_key=" << graph_key
+              << ", actual_tokens=" << tokens.size(0)
+              << ", num_sequences=" << params.meta.num_sequences;
+  }
+#endif
   std::shared_ptr<AclGraph> graph;
+  int32_t prepare_slot = -1;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
     if (last_started_replay_slot_ < 0) {
+#if defined(USE_NPU)
+      if (debug_graph_inputs) {
+        LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_skip reason=no_replay_slot";
+      }
+#endif
       return;
     }
-    const int32_t prepare_slot =
+    prepare_slot =
         (last_started_replay_slot_ + 1) % graph_slot_count_;
     auto& slot = graph_slots_[prepare_slot];
     if (slot.is_prepared) {
+#if defined(USE_NPU)
+      if (debug_graph_inputs) {
+        LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_skip"
+                  << ", reason=slot_already_prepared"
+                  << ", slot=" << prepare_slot;
+      }
+#endif
       return;
     }
     auto it = slot.graphs.find(graph_key);
     if (it == slot.graphs.end()) {
+#if defined(USE_NPU)
+      if (debug_graph_inputs) {
+        LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_skip"
+                  << ", reason=graph_not_found"
+                  << ", slot=" << prepare_slot
+                  << ", graph_key=" << graph_key;
+      }
+#endif
       return;
     }
     graph = it->second;
     slot.is_prepared = true;
+#if defined(USE_NPU)
+    if (debug_graph_inputs) {
+      LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_selected"
+                << ", slot=" << prepare_slot
+                << ", persistent_param=" << slot.persistent_param.get();
+    }
+#endif
   }
+#if defined(USE_NPU)
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_submit"
+              << ", slot=" << prepare_slot << ", graph_key=" << graph_key
+              << ", graph=" << graph.get();
+  }
+#endif
   graph->prepare_replay_inputs(tokens, positions, kv_caches, params);
+#if defined(USE_NPU)
+  if (debug_graph_inputs) {
+    LOG(INFO) << "[MTP_GRAPH_DEBUG] prepare_done"
+              << ", slot=" << prepare_slot << ", graph_key=" << graph_key
+              << ", graph=" << graph.get();
+  }
+#endif
 }
 
 bool AclGraphExecutorImpl::prepare_static_mtp_graph_tasks(
