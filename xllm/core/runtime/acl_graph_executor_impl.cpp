@@ -233,6 +233,34 @@ void hash_graph_key_value(uint64_t& hash, uint64_t value) {
   }
 }
 
+uint64_t specialize_dp_ep_graph_key(uint64_t graph_key,
+                                    const ModelInputParams& params) {
+  const auto& dp_token_nums = params.parallel.dp_global_token_nums;
+  const auto& raw_dp_token_nums =
+      params.parallel.raw_dp_global_token_nums;
+  if (dp_token_nums.size() <= 1 ||
+      !params.parallel.dp_ep_padding_data.attn_padding_idx().defined()) {
+    return graph_key;
+  }
+
+  // DP/EP padding tensor shapes depend on the complete global layout, not
+  // only on its maximum token count. Keep different layouts in different
+  // graph slots so a graph captured for one DpEpPadding descriptor is never
+  // replayed with another descriptor.
+  hash_graph_key_value(graph_key, 0x445045505f4c4159ull);
+  hash_graph_key_value(graph_key,
+                       static_cast<uint64_t>(dp_token_nums.size()));
+  for (int32_t token_count : dp_token_nums) {
+    hash_graph_key_value(graph_key, static_cast<uint64_t>(token_count));
+  }
+  hash_graph_key_value(graph_key,
+                       static_cast<uint64_t>(raw_dp_token_nums.size()));
+  for (int32_t token_count : raw_dp_token_nums) {
+    hash_graph_key_value(graph_key, static_cast<uint64_t>(token_count));
+  }
+  return graph_key;
+}
+
 uint64_t get_mla_graph_key(uint32_t bucket_num_tokens,
                            int32_t capture_kv_seq_len_bucket) {
   constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
@@ -1113,6 +1141,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
       COUNTER_INC(num_model_execution_total_eager);
       return forward_eager(model_, tokens, positions, kv_caches, params);
     }
+
   }
 
   // Only use acl graph in decode phase for performance optimization
@@ -1619,9 +1648,12 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
   if (model_->supports_mla_graph_kv_bucketing()) {
     const int32_t capture_kv_seq_len_bucket =
         get_mla_capture_kv_seq_len_bucket(params, options_);
-    return get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket);
+    return specialize_dp_ep_graph_key(
+        get_mla_graph_key(bucket_num_tokens, capture_kv_seq_len_bucket),
+        params);
   }
-  return static_cast<uint64_t>(bucket_num_tokens);
+  return specialize_dp_ep_graph_key(
+      static_cast<uint64_t>(bucket_num_tokens), params);
 }
 
 }  // namespace xllm::npu

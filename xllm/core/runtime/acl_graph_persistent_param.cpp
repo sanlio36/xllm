@@ -412,7 +412,7 @@ std::vector<int64_t> effective_dp_token_nums(
   std::vector<int64_t> result;
   result.reserve(dp_tokens.size());
   for (const int32_t token_num : dp_tokens) {
-    result.emplace_back(std::max<int64_t>(token_num, 1));
+    result.emplace_back(std::max<int64_t>(token_num, 0));
   }
   return result;
 }
