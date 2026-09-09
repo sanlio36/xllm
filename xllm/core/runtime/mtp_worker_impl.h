@@ -184,6 +184,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool positions_are_decoupled_from_kv_length() const;
   bool requires_probability_based_validation() const;
   bool uses_step_major_validate_layout() const;
+  torch::Tensor stop_token_ids_for(const torch::Tensor& tokens);
+  torch::Tensor stop_token_column_indices_for(const torch::Tensor& tokens,
+                                              int64_t width);
   void synchronize_embedded_eagle3_forward();
   std::optional<ForwardOutput> run_worker_no_sync(
       WorkerImpl& worker,
@@ -233,14 +236,23 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     StreamEventPtr ready_event;
   };
 
+  struct CombinedDraftSchedule {
+    bool use_combined_draft = false;
+    bool prelaunch_next_first_draft = false;
+  };
+
   struct PendingDraftContext {
+    struct PreparedDraft {
+      ForwardInput prepared_input;
+      ForwardOutput output;
+    };
+
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> dp_global_token_nums;
     std::vector<int32_t> raw_dp_global_token_nums;
     std::vector<uint64_t> dp_global_batch_generations;
-    std::optional<ForwardOutput> output;
-    ForwardInput prepared_input;
+    std::vector<PreparedDraft> drafts;
   };
 
   void stage_target_context_write(const ForwardInput& input,
@@ -257,7 +269,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void flush_pending_target_context();
   bool supports_combined_first_draft_execution() const;
   bool can_use_combined_first_draft() const;
-  bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
+  CombinedDraftSchedule combined_draft_schedule(
+      const ForwardInput& input) const;
+  void mark_dp_batch_validated_for_prelaunch(const ForwardInput& input);
   void prepare_next_first_draft_template(const ForwardInput& input,
                                          ForwardInput& combined_input);
   void enqueue_next_first_draft(const ForwardInput& input,
@@ -267,6 +281,16 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                 ForwardInput combined_input);
   void submit_pending_first_draft(const ForwardInput& batch_identity_input,
                                   ForwardInput draft_input);
+  void submit_pending_followup_drafts(
+      const ForwardInput& batch_identity_input,
+      const torch::Tensor& base_positions,
+      const torch::Tensor& base_kv_seq_lens,
+      int32_t num_drafts);
+  void submit_pending_empty_followup_drafts(const ForwardInput& input,
+                                            int32_t num_drafts);
+  void broadcast_and_process_draft_sample(SampleOutput& sample_output,
+                                           bool all_greedy_sample);
+  int32_t prelaunch_followup_draft_count(const ForwardInput& input) const;
   bool pending_draft_context_matches(const ForwardInput& input) const;
 
   void write_target_context_to_cache(const ForwardInput& input,
@@ -285,6 +309,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   PendingTargetContext pending_target_context_;
   std::vector<int32_t> device_context_ready_embedding_ids_;
   std::vector<std::string> device_context_ready_request_ids_;
+  // A new DP batch may prelaunch only after its generation has completed one
+  // target validation on every rank. This keeps request transitions collective
+  // symmetric, including ranks with no local sequences.
+  std::vector<uint64_t> validated_dp_batch_generations_;
   // A single persistent pinned destination is sufficient for accepted-token
   // D2H: the preceding pending target context is always flushed before the
   // next validation can submit another copy. The pending context holds a view
@@ -295,6 +323,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.
   PendingDraftContext pending_draft_context_;
+  // Stop-token membership and column positions are stable across validation
+  // steps for a given token dtype and speculative width.
+  torch::Tensor stop_token_ids_device_;
+  torch::Tensor stop_token_column_indices_device_;
   // adaptive_spec_controller_ now lives on SpeculativeWorkerImpl (base class).
 
   // Classified once when the corresponding models are loaded. Decode-path
