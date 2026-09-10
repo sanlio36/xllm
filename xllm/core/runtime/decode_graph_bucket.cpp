@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "runtime/decode_graph_bucket.h"
 
+#include <algorithm>
+
 namespace xllm::runtime {
 namespace {
 
@@ -59,6 +61,27 @@ std::vector<int32_t> get_decode_graph_dp_token_counts(
 int64_t get_decode_graph_dp_layout_token_count(int32_t dp_size,
                                                int32_t graph_token_count) {
   return static_cast<int64_t>(dp_size) * graph_token_count;
+}
+
+int64_t get_decode_graph_global_batch_size(
+    const std::vector<int32_t>& dp_token_nums,
+    int64_t num_decoding_tokens) {
+  if (dp_token_nums.empty()) {
+    return 0;
+  }
+  const int64_t max_tokens =
+      static_cast<int64_t>(*std::max_element(dp_token_nums.begin(),
+                                             dp_token_nums.end()));
+  return max_tokens / std::max<int64_t>(num_decoding_tokens, 1);
+}
+
+bool exceeds_decode_graph_batch_limit(
+    const std::vector<int32_t>& dp_token_nums,
+    int64_t num_decoding_tokens,
+    int32_t batch_size_limit) {
+  return get_decode_graph_global_batch_size(dp_token_nums,
+                                            num_decoding_tokens) >
+         std::max<int32_t>(batch_size_limit, 1);
 }
 
 }  // namespace xllm::runtime

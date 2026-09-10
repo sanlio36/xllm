@@ -1147,10 +1147,25 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   // enable_speculative_decode() left non-MTP DP decode shards at token count 0,
   // which fed an empty sparse-indices structure into LightningIndexer and
   // aborted tiling under concurrency.
+  //
+  // The padding decision must also agree with the executor's graph/eager
+  // fallback: AclGraphExecutorImpl::run() falls back to eager when the global
+  // decode batch exceeds acl_graph_decode_batch_size_limit, but it does so on
+  // the *un-padded* token count.  If we still padded to a graph bucket here,
+  // the eager forward would consume graph-bucketed dp_ep_padding indices and
+  // sample id 0 ("!") for every token.  Reuse the shared runtime predicate so
+  // the prepare path and the executor never disagree.
+  const bool decode_batch_within_graph_limit =
+      !runtime::exceeds_decode_graph_batch_limit(
+          token_sizes,
+          options_.num_decoding_tokens(),
+          ::xllm::ExecutionConfig::get_instance()
+              .acl_graph_decode_batch_size_limit());
   const bool graph_decode =
       input_params.meta.batch_forward_type.is_decode() &&
       ::xllm::ExecutionConfig::get_instance().enable_graph() &&
       !options_.is_draft_engine() &&
+      decode_batch_within_graph_limit &&
       token_sizes.size() > 1 &&
       input_params.parallel.dp_is_decode.size() == token_sizes.size() &&
       std::all_of(input_params.parallel.dp_is_decode.begin(),
