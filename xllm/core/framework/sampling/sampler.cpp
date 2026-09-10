@@ -28,6 +28,56 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+// Diagnoses greedy sampling that returned token id 0. Runs only when the
+// debug gate is on; the per-step argmax check reads only the tiny [num_rows]
+// token tensor, and full logits are synced to CPU only when a 0 is present.
+void debug_log_greedy_zero(const torch::Tensor& sample_logits,
+                           const torch::Tensor& next_tokens) {
+#if defined(USE_NPU)
+  if (!::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    return;
+  }
+  torch::Tensor tokens_cpu =
+      next_tokens.to(torch::kCPU, /*non_blocking=*/false);
+  const int64_t num_rows = tokens_cpu.numel();
+  bool has_zero = false;
+  for (int64_t i = 0; i < num_rows; ++i) {
+    if (tokens_cpu[i].item<int64_t>() == 0) {
+      has_zero = true;
+      break;
+    }
+  }
+  if (!has_zero) {
+    return;
+  }
+  torch::Tensor logits_cpu =
+      sample_logits.to(torch::kCPU, /*non_blocking=*/false);
+  LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] greedy sampled token 0"
+            << ", num_rows=" << num_rows
+            << ", vocab=" << sample_logits.size(-1)
+            << ", tokens=" << tokens_cpu;
+  for (int64_t i = 0; i < num_rows; ++i) {
+    if (tokens_cpu[i].item<int64_t>() == 0) {
+      const torch::Tensor row = logits_cpu[i];
+      const torch::Tensor finite = torch::isfinite(row);
+      LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] row=" << i
+                << ", finite_count=" << finite.sum().item<int64_t>()
+                << ", min=" << row.min().item<float>()
+                << ", max=" << row.max().item<float>()
+                << ", argmax=" << row.argmax().item<int64_t>()
+                << ", first16=" << row.slice(/*dim=*/0, 0, 16);
+    }
+  }
+#else
+  (void)sample_logits;
+  (void)next_tokens;
+#endif
+}
+
+}  // namespace
+
 SampleOutput Sampler::forward(torch::Tensor& logits,
                               const SamplingParameters& params,
                               const torch::Tensor& filter_mask) const {
@@ -93,41 +143,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&
       !use_sample_indices && !filter_mask.defined()) {
     output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
-#if defined(USE_NPU)
-    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
-      torch::Tensor tokens_cpu =
-          output.next_tokens.to(torch::kCPU, /*non_blocking=*/false);
-      const int64_t num_rows = tokens_cpu.numel();
-      bool has_zero = false;
-      for (int64_t i = 0; i < num_rows; ++i) {
-        if (tokens_cpu[i].item<int64_t>() == 0) {
-          has_zero = true;
-          break;
-        }
-      }
-      if (has_zero) {
-        torch::Tensor logits_cpu =
-            sample_logits.to(torch::kCPU, /*non_blocking=*/false);
-        LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] greedy sampled token 0"
-                  << ", num_rows=" << num_rows
-                  << ", vocab=" << sample_logits.size(-1)
-                  << ", tokens=" << tokens_cpu;
-        for (int64_t i = 0; i < num_rows; ++i) {
-          if (tokens_cpu[i].item<int64_t>() == 0) {
-            const torch::Tensor row = logits_cpu[i];
-            const torch::Tensor finite = torch::isfinite(row);
-            LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] row=" << i
-                      << ", finite_count=" << finite.sum().item<int64_t>()
-                      << ", min=" << row.min().item<float>()
-                      << ", max=" << row.max().item<float>()
-                      << ", argmax=" << row.argmax().item<int64_t>()
-                      << ", first16="
-                      << row.slice(/*dim=*/0, 0, 16);
-          }
-        }
-      }
-    }
-#endif
+    debug_log_greedy_zero(sample_logits, output.next_tokens);
     return output;
   }
 
@@ -135,6 +151,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       !use_sample_indices && !filter_mask.defined()) {
     torch::Tensor sample_indices =
         greedy_sample(sample_logits).to(torch::kLong);
+    debug_log_greedy_zero(sample_logits, sample_indices);
     torch::Tensor selected_logits =
         sample_logits.gather(/*dim=*/-1, sample_indices.view({-1, 1}))
             .to(torch::kFloat32);
@@ -177,6 +194,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   auto sample_indices = samples.to(torch::kLong);
   output.probs = probs.to(logits.dtype());
   output.next_tokens = sample_indices;
+  debug_log_greedy_zero(sample_logits, output.next_tokens);
 
   if (params.logprobs) {
     if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {
