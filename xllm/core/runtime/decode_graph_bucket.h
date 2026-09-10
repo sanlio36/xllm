@@ -34,9 +34,11 @@ struct DecodeGraphExecutionShape {
 int64_t get_decode_graph_token_bucket(int64_t num_tokens,
                                       bool enable_no_padding);
 
-// Returns the per-DP token rows used to build graph-mode DP metadata. Active
-// shards use the graph execution width, while empty shards retain their
-// single fake row; raw token counts remain separate for lm-head indices.
+// Returns the per-DP token rows used to build graph-mode DP metadata. Every
+// shard, including an empty shard, is widened to the graph execution width so
+// the graph replay/capture shape (and LightningIndexer seq-length inputs) stay
+// uniform across ranks; the separate raw token counts still drive lm-head
+// compaction.
 std::vector<int32_t> get_decode_graph_dp_token_counts(
     const std::vector<int32_t>& token_counts, int32_t graph_token_count);
 

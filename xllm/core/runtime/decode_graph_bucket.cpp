@@ -51,9 +51,15 @@ std::vector<int32_t> get_decode_graph_dp_token_counts(
   if (token_counts.empty()) {
     return {};
   }
+  // Every DP shard, including an empty shard, is padded to the graph bucket
+  // width. An empty shard previously stayed at a single fake row (1) while
+  // active shards widened to the bucket, which made the LightningIndexer
+  // inputs (actual_seq_lengths_query, actual_seq_lengths_key, block_table)
+  // disagree across ranks (1 vs bucket) and abort tiling with 561002 under
+  // single-rank-empty distributions such as 3 2 2 0.
   std::vector<int32_t> padded_counts = token_counts;
   for (int32_t& token_count : padded_counts) {
-    token_count = token_count > 0 ? graph_token_count : 1;
+    token_count = graph_token_count;
   }
   return padded_counts;
 }
