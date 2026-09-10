@@ -100,6 +100,34 @@ MtpTopkStatePtr select_followup_topk_state(
   return state->index_select_rows(current_row_indices);
 }
 
+struct CombinedDraftCurrentRowBase {
+  torch::Tensor positions;
+  torch::Tensor kv_seq_lens;
+};
+
+CombinedDraftCurrentRowBase select_combined_current_row_base(
+    const ForwardInput& combined_draft_input,
+    int64_t batch_size) {
+  CHECK_EQ(combined_draft_input.positions.numel(), batch_size * 2)
+      << "combined draft positions must contain [repair,current] rows";
+  CHECK_EQ(
+      combined_draft_input.input_params.attention.device.kv_seq_lens.numel(),
+      batch_size * 2)
+      << "combined draft KV lengths must contain [repair,current] rows";
+
+  // Combined draft rows interleave [repair, current] per sequence. Follow-up
+  // drafts continue from the current row, whose kv_seq_lens already embed the
+  // accepted length of the preceding target validation.
+  CombinedDraftCurrentRowBase base;
+  base.positions =
+      combined_draft_input.positions.view({batch_size, 2}).select(1, 1);
+  base.kv_seq_lens =
+      combined_draft_input.input_params.attention.device.kv_seq_lens
+          .view({batch_size, 2})
+          .select(1, 1);
+  return base;
+}
+
 void broadcast_tokens_in_group(torch::Tensor& tokens,
                                ProcessGroup* process_group,
                                int32_t root_rank = 0) {
@@ -1751,18 +1779,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
             ? pending_draft_context_.drafts.front().prepared_input
                                     : current_draft_input;
     const int64_t batch_size = input.input_params.meta.num_sequences;
-    CHECK_EQ(combined_draft_input.positions.numel(), batch_size * 2)
-        << "combined draft positions must contain [repair,current] rows";
-    CHECK_EQ(
-        combined_draft_input.input_params.attention.device.kv_seq_lens.numel(),
-        batch_size * 2)
-        << "combined draft KV lengths must contain [repair,current] rows";
-    accepted_base_positions =
-        combined_draft_input.positions.view({batch_size, 2}).select(1, 1);
-    accepted_base_kv_seq_lens =
-        combined_draft_input.input_params.attention.device.kv_seq_lens
-            .view({batch_size, 2})
-            .select(1, 1);
+    const CombinedDraftCurrentRowBase accepted_base =
+        select_combined_current_row_base(combined_draft_input, batch_size);
+    accepted_base_positions = accepted_base.positions;
+    accepted_base_kv_seq_lens = accepted_base.kv_seq_lens;
 
     for (int32_t draft_idx = 1; draft_idx < num_speculative_tokens;
          ++draft_idx) {
@@ -3052,10 +3072,7 @@ void MTPWorkerImpl::enqueue_next_first_draft(
   const int32_t followup_draft_count =
       prelaunch_followup_draft_count(input);
   if (followup_draft_count > 1) {
-    submit_pending_followup_drafts(input,
-                                   base_positions,
-                                   base_kv_seq_lens,
-                                   followup_draft_count);
+    submit_pending_followup_drafts(input, followup_draft_count);
   }
   if (rebuild_prelaunch_metadata) {
     prelaunch_metadata_embedding_ids_ =
@@ -3111,17 +3128,30 @@ void MTPWorkerImpl::submit_pending_first_draft(
 
 void MTPWorkerImpl::submit_pending_followup_drafts(
     const ForwardInput& batch_identity_input,
-    const torch::Tensor& base_positions,
-    const torch::Tensor& base_kv_seq_lens,
     int32_t num_drafts) {
   CHECK(!pending_draft_context_.drafts.empty());
   CHECK_EQ(pending_draft_context_.drafts.size(), 1U);
 
+  // Follow-up drafts must chain from the prelaunched first draft's
+  // accepted-state current row (kv = pre-verification base + accepted
+  // length), exactly like the in-loop later-draft path. Deriving from the
+  // pre-verification base instead would drop the accepted length and place
+  // follow-up KV rows inside the target-validated window: they would read
+  // rejected-draft KV and overwrite committed slots.
+  const CombinedDraftCurrentRowBase accepted_base =
+      select_combined_current_row_base(
+          pending_draft_context_.drafts.front().prepared_input,
+          static_cast<int64_t>(
+              batch_identity_input.input_params.meta.num_sequences));
+
   for (int32_t draft_idx = 1; draft_idx < num_drafts; ++draft_idx) {
     ForwardInput next_input;
+    // Keep host metadata on the fixed speculative horizon. The exact accepted
+    // length is device-resident; the device tensors below are corrected to the
+    // accepted window after the fixed-shape template is prepared.
     prepare_draft_inputs(batch_identity_input,
                          next_input,
-                         draft_idx,
+                         /*position_offset=*/options_.num_speculative_tokens(),
                          /*use_combined_draft=*/true);
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     wait_metadata_ready_event(next_input, *compute_stream_);
@@ -3129,8 +3159,8 @@ void MTPWorkerImpl::submit_pending_followup_drafts(
     mtp_async::prepare_later_draft_from_device_base(
         next_input,
         batch_identity_input,
-        base_positions,
-        base_kv_seq_lens,
+        accepted_base.positions,
+        accepted_base.kv_seq_lens,
         draft_idx,
         options_.block_size());
     const SampleOutput& previous_output =
