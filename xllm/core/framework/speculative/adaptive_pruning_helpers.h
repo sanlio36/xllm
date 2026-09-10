@@ -101,10 +101,10 @@ void sync_pruned_boundary_outputs(SampleOutput& sample_output,
 // with `next_token_pad_value`. Rewrites `target_output` in place; no-op when
 // its rows already equal batch_size * max_val_tokens (uniform width).
 //
-// next_token_pad_value differs by caller: DFlash uses -1 (a padded slot read
-// at a per-seq cut position must not surface a real token id — Qwen id 0 is
-// "!"); MTP passes 0 to preserve its established output. Both are masked to
-// -1 by apply_pruned_prefix_lengths at trailing positions downstream.
+// next_token_pad_value: both DFlash and MTP pad next_tokens with -1 (a padded
+// slot read at a per-seq cut position must not surface a real token id — Qwen
+// id 0 is "!"). Trailing positions are additionally masked to -1 by
+// apply_pruned_prefix_lengths downstream.
 void scatter_varlen_target_output_to_dense(
     ForwardOutput& target_output,
     const std::vector<int32_t>& per_seq_val_tokens,

@@ -1140,10 +1140,17 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
     }
   }
 
+  // DP decode graph padding applies to every decode step that runs under the
+  // ACL graph, not just speculative (MTP) decode.  Empty DP shards must be
+  // padded with a fake token so they still participate in HCCL collectives and
+  // so their graph inputs keep a valid shape; coupling this to
+  // enable_speculative_decode() left non-MTP DP decode shards at token count 0,
+  // which fed an empty sparse-indices structure into LightningIndexer and
+  // aborted tiling under concurrency.
   const bool graph_decode =
       input_params.meta.batch_forward_type.is_decode() &&
       ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-      options_.enable_speculative_decode() && !options_.is_draft_engine() &&
+      !options_.is_draft_engine() &&
       token_sizes.size() > 1 &&
       input_params.parallel.dp_is_decode.size() == token_sizes.size() &&
       std::all_of(input_params.parallel.dp_is_decode.begin(),
