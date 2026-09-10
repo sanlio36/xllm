@@ -17,9 +17,12 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <ostream>
+
+#include "core/framework/config/execution_config.h"
 
 namespace xllm {
 
@@ -46,24 +49,37 @@ PlatformStream get_stream_from_pool() { return c10::hip::getStreamFromPool(); }
 }  // namespace
 
 bool StreamEvent::synchronize() {
+  const bool debug_log_dp_mtp_overlap =
+      ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  const auto start = debug_log_dp_mtp_overlap
+                         ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point();
+  bool success = false;
 #if defined(USE_NPU)
   const aclError ret = aclrtSynchronizeEvent(npu_event_);
   if (ret != ACL_SUCCESS) {
     LOG(ERROR) << "Failed to synchronize NPU event: " << ret;
-    return false;
+  } else {
+    success = true;
   }
-  return true;
 #else
   try {
     c10_event_.synchronize();
-    return true;
+    success = true;
   } catch (const std::exception& e) {
     LOG(ERROR) << "Failed to synchronize event: " << e.what();
   } catch (...) {
     LOG(ERROR) << "Failed to synchronize event: unknown exception";
   }
-  return false;
 #endif
+  if (debug_log_dp_mtp_overlap) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+    LOG(INFO) << "[DP_MTP_HOST_SYNC] event_synchronize event=" << this
+              << ", success=" << success
+              << ", elapsed_us=" << elapsed.count();
+  }
+  return success;
 }
 
 Stream::Stream(const int32_t timeout)
@@ -73,12 +89,24 @@ Stream::Stream(PlatformStream stream, const int32_t timeout)
     : stream_(stream), timeout_(timeout) {}
 
 int Stream::synchronize() const {
+  const bool debug_log_dp_mtp_overlap =
+      ExecutionConfig::get_instance().debug_log_dp_mtp_overlap();
+  const auto start = debug_log_dp_mtp_overlap
+                         ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point();
+  int ret = 0;
 #if defined(USE_NPU)
-  return aclrtSynchronizeStreamWithTimeout(stream_.stream(), timeout_);
+  ret = aclrtSynchronizeStreamWithTimeout(stream_.stream(), timeout_);
 #else
   stream_.synchronize();
-  return 0;
 #endif
+  if (debug_log_dp_mtp_overlap) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+    LOG(INFO) << "[DP_MTP_HOST_SYNC] stream_synchronize stream=" << *this
+              << ", ret=" << ret << ", elapsed_us=" << elapsed.count();
+  }
+  return ret;
 }
 
 c10::StreamGuard Stream::set_stream_guard() const {
@@ -142,6 +170,9 @@ StreamEventPtr Stream::record_event() const {
 StreamEventPtr Stream::record_event_or_sync() const {
   StreamEventPtr event = record_event();
   if (event == nullptr) {
+    if (ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      LOG(INFO) << "[DP_MTP_HOST_SYNC] record_event_fallback stream=" << *this;
+    }
     synchronize();
   }
   return event;
@@ -158,7 +189,15 @@ bool Stream::wait_event(const StreamEventPtr& event) const {
   }
   LOG(ERROR) << "Failed to wait NPU stream event: " << ret
              << "; falling back to event synchronize.";
+  const auto start = std::chrono::steady_clock::now();
   ret = aclrtSynchronizeEvent(event->npu_event());
+  if (ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+    LOG(INFO) << "[DP_MTP_HOST_SYNC] wait_event_fallback stream=" << *this
+              << ", event=" << event.get() << ", elapsed_us="
+              << elapsed.count();
+  }
   if (ret == ACL_SUCCESS) {
     return true;
   }
@@ -177,7 +216,15 @@ bool Stream::wait_event(const StreamEventPtr& event) const {
   }
 
   try {
+    const auto start = std::chrono::steady_clock::now();
     event->c10_event().synchronize();
+    if (ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start);
+      LOG(INFO) << "[DP_MTP_HOST_SYNC] wait_event_fallback stream=" << *this
+                << ", event=" << event.get() << ", elapsed_us="
+                << elapsed.count();
+    }
     return true;
   } catch (const std::exception& e) {
     LOG(ERROR) << "Failed to synchronize stream event: " << e.what();
