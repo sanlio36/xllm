@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "common/global_flags.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "logits_utils.h"
@@ -92,6 +93,41 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&
       !use_sample_indices && !filter_mask.defined()) {
     output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
+#if defined(USE_NPU)
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+      torch::Tensor tokens_cpu =
+          output.next_tokens.to(torch::kCPU, /*non_blocking=*/false);
+      const int64_t num_rows = tokens_cpu.numel();
+      bool has_zero = false;
+      for (int64_t i = 0; i < num_rows; ++i) {
+        if (tokens_cpu[i].item<int64_t>() == 0) {
+          has_zero = true;
+          break;
+        }
+      }
+      if (has_zero) {
+        torch::Tensor logits_cpu =
+            sample_logits.to(torch::kCPU, /*non_blocking=*/false);
+        LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] greedy sampled token 0"
+                  << ", num_rows=" << num_rows
+                  << ", vocab=" << sample_logits.size(-1)
+                  << ", tokens=" << tokens_cpu;
+        for (int64_t i = 0; i < num_rows; ++i) {
+          if (tokens_cpu[i].item<int64_t>() == 0) {
+            const torch::Tensor row = logits_cpu[i];
+            const torch::Tensor finite = torch::isfinite(row);
+            LOG(INFO) << "[DP_SAMPLE_LOGITS_DEBUG] row=" << i
+                      << ", finite_count=" << finite.sum().item<int64_t>()
+                      << ", min=" << row.min().item<float>()
+                      << ", max=" << row.max().item<float>()
+                      << ", argmax=" << row.argmax().item<int64_t>()
+                      << ", first16="
+                      << row.slice(/*dim=*/0, 0, 16);
+          }
+        }
+      }
+    }
+#endif
     return output;
   }
 
