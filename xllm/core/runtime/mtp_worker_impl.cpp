@@ -2641,15 +2641,19 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
       (total_tokens != static_cast<int32_t>(padded_total));
   if (needs_padding) {
     // Slow path: per-seq variable-length, scatter into padded layout. Pad
-    // next_tokens with 0 (MTP's established padding); trailing pads are masked
-    // to -1 by apply_pruned_prefix_lengths downstream regardless.
+    // next_tokens with -1 (the reject marker), not 0: token id 0 is a real
+    // token ("!" in the tokenizer), and a padded slot must not surface a real
+    // token if any downstream consumer reads it before the reject masking
+    // clips trailing positions.  Using 0 leaked the padding as a stream of
+    // "!" tokens and desynced subsequent decode under non-uniform DP batches
+    // (e.g. dp_token_nums=5 4 4 3).
     padded_target_output_slow.emplace(target_output);
     adaptive_pruning::scatter_varlen_target_output_to_dense(
         *padded_target_output_slow,
         per_seq_val_tokens,
         batch_size,
         max_val_tokens,
-        /*next_token_pad_value=*/0);
+        /*next_token_pad_value=*/-1);
   }
   // Uniform fast path uses a scoped local ForwardOutput whose only diff is
   // logits viewed to [padded_total, vocab]; slow path uses the materialized
