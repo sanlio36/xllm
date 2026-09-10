@@ -285,8 +285,6 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   void submit_pending_first_draft(const ForwardInput& batch_identity_input,
                                   ForwardInput draft_input);
   void submit_pending_followup_drafts(const ForwardInput& batch_identity_input,
-                                      const torch::Tensor& base_positions,
-                                      const torch::Tensor& base_kv_seq_lens,
                                       int32_t num_drafts);
   void submit_pending_empty_followup_drafts(const ForwardInput& input,
                                             int32_t num_drafts);
