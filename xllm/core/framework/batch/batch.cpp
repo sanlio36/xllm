@@ -607,7 +607,10 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
                   << ", token_idx=" << token_idx
                   << ", token_id=" << raw_token.id
                   << ", request_id=" << seq->request_id()
-                  << ", replace_fake_token=" << replace_fake_token;
+                  << ", replace_fake_token=" << replace_fake_token
+                  << ", kv_cache_tokens_num=" << seq->kv_cache_tokens_num()
+                  << ", num_blocks="
+                  << seq->kv_state().num_blocks(BlockType::KV);
       }
 #endif
       append_token_for_sequence(

@@ -1251,7 +1251,12 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
             input_params.attention.device.new_cache_slots);
   }
 
-  if (num_speculative_tokens_ > 0 && !is_prefill) {
+  // LightningIndexer (DSA) consumes query seq lengths on every decode step,
+  // speculative or not. The original num_speculative_tokens_ > 0 gate left the
+  // query seq-len input (+17) at a [1] placeholder for non-MTP decode, so a
+  // LightningIndexer capture with num_sequences=2 saw query seq-len dim0=1
+  // against key seq-len dim0=2 and aborted tiling with 561002.
+  if (!is_prefill) {
     if ((!input_params.attention.device.block_tables.defined() ||
          input_params.attention.device.block_tables.storage().data() ==
              nullptr)) {

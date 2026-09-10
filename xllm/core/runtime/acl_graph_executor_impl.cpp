@@ -478,6 +478,28 @@ bool AclGraph::capture(CausalLM* model,
           {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
       capture_started = true;
       // Execute forward pass - NPUGraph mempool manages temporary tensors
+#if defined(USE_NPU)
+      if (::xllm::ExecutionConfig::get_instance().debug_log_dp_mtp_overlap()) {
+        const auto& gp = graph_params.value();
+        const auto numel_or_neg = [](const torch::Tensor& t) {
+          return t.defined() ? static_cast<int64_t>(t.numel()) : -1;
+        };
+        LOG(INFO) << "[DP_CAPTURE_SEQLEN_DEBUG] capture forward"
+                  << ", bucket=" << num_tokens_
+                  << ", num_sequences=" << gp.meta.num_sequences
+                  << ", actual_num_sequences=" << gp.meta.actual_num_sequences
+                  << ", q_seq_lens_numel="
+                  << numel_or_neg(gp.attention.device.q_seq_lens)
+                  << ", kv_seq_lens_numel="
+                  << numel_or_neg(gp.attention.device.kv_seq_lens)
+                  << ", block_tables_numel="
+                  << numel_or_neg(gp.attention.device.block_tables)
+                  << ", block_tables_size0="
+                  << (gp.attention.device.block_tables.defined()
+                          ? gp.attention.device.block_tables.size(0)
+                          : -1);
+      }
+#endif
       auto forward_result =
           model->forward({persistent_param_.persistent_tokens(num_tokens_)},
                          {persistent_param_.persistent_positions(num_tokens_)},
