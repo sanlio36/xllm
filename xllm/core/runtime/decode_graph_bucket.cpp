@@ -51,9 +51,15 @@ std::vector<int32_t> get_decode_graph_dp_token_counts(
   if (token_counts.empty()) {
     return {};
   }
+  // Every DP shard, including an empty shard, is laid out at the graph bucket
+  // width so the graph replay/capture shape is uniform across ranks.  An empty
+  // shard previously stayed at a single fake row (1) while active shards were
+  // widened to the bucket, which desynchronized the num_sequences/kv layout
+  // between empty and active ranks and corrupted decode under single-rank
+  // distributions such as 0 0 0 7.
   std::vector<int32_t> padded_counts = token_counts;
   for (int32_t& token_count : padded_counts) {
-    token_count = token_count > 0 ? graph_token_count : 1;
+    token_count = graph_token_count;
   }
   return padded_counts;
 }
