@@ -109,8 +109,25 @@ uint64_t specialize_dp_ep_graph_key(uint64_t graph_key,
       params.meta.batch_forward_type.is_decode() && dp_token_counts.size() > 1 &&
       params.parallel.dp_ep_padding_data.attn_padding_idx().defined() &&
       params.parallel.dp_ep_padding_data.attn_padding_idx().numel() > 0;
-  if (uses_dense_decode_layout ||
-      !has_non_uniform_positive_dp_token_counts(dp_token_counts) ||
+  const bool non_uniform_positive =
+      has_non_uniform_positive_dp_token_counts(dp_token_counts);
+  // Host metadata only: token-count vectors and computed buckets; no device
+  // reads, no syncs.
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+    LOG(INFO) << "[DP_GRAPH_DEBUG] specialize_dp_ep_graph_key"
+              << ", input_graph_key=" << graph_key
+              << ", batch_type="
+              << params.meta.batch_forward_type.to_string()
+              << ", dp_token_counts=" << dp_token_counts
+              << ", raw_dp_token_counts="
+              << params.parallel.raw_dp_global_token_nums
+              << ", uses_dense_decode_layout=" << uses_dense_decode_layout
+              << ", non_uniform_positive=" << non_uniform_positive
+              << ", attn_padding_idx_numel="
+              << params.parallel.dp_ep_padding_data.attn_padding_idx()
+                     .numel();
+  }
+  if (uses_dense_decode_layout || !non_uniform_positive ||
       !params.parallel.dp_ep_padding_data.attn_padding_idx().defined() ||
       params.parallel.dp_ep_padding_data.attn_padding_idx().numel() == 0) {
     return graph_key;
@@ -134,7 +151,14 @@ uint64_t specialize_dp_ep_graph_key(uint64_t graph_key,
           .enable_graph_mode_decode_no_padding());
   graph_key = mix_graph_key(graph_key,
                             static_cast<uint64_t>(raw_token_bucket));
-  return graph_namespace | graph_key;
+  const uint64_t specialized_key = graph_namespace | graph_key;
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+    LOG(INFO) << "[DP_GRAPH_DEBUG] specialize_dp_ep_graph_key specialized"
+              << ", raw_token_count=" << raw_token_count
+              << ", raw_token_bucket=" << raw_token_bucket
+              << ", specialized_graph_key=" << specialized_key;
+  }
+  return specialized_key;
 }
 
 constexpr uint64_t paged_attention_plan_bucket_unchecked(int64_t max_kv,
@@ -1213,6 +1237,28 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   const uint32_t local_batch_size = n_tokens / options_.num_decoding_tokens();
   const uint32_t global_batch_size =
       graph_num_tokens / options_.num_decoding_tokens();
+  // Host metadata only: token-count vectors and computed buckets; no device
+  // reads, no syncs, so the logged run keeps its exact timing.
+  if (params_single.parallel.dp_global_token_nums.size() > 1 &&
+      ::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+    LOG(INFO) << "[DP_GRAPH_DEBUG] decode_bucketing"
+              << ", n_tokens=" << n_tokens
+              << ", graph_num_tokens=" << graph_num_tokens
+              << ", bucket_num_tokens="
+              << get_bucket_num_tokens(graph_num_tokens)
+              << ", local_batch_size=" << local_batch_size
+              << ", global_batch_size=" << global_batch_size
+              << ", dp_token_nums="
+              << params_single.parallel.dp_global_token_nums
+              << ", raw_dp_token_nums="
+              << params_single.parallel.raw_dp_global_token_nums
+              << ", dp_is_decode="
+              << params_single.parallel.dp_is_decode
+              << ", is_spec_verify=" << params_single.is_spec_verify
+              << ", num_sequences="
+              << params_single.meta.num_sequences
+              << ", kv_max_seq_len=" << params_single.meta.kv_max_seq_len;
+  }
 
   // Large decode batches create too many/too large ACL graphs and may OOM.
   // Fall back to eager mode when batch size exceeds the safety threshold.

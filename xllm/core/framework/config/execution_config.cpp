@@ -78,6 +78,11 @@ DEFINE_bool(debug_log_mtp_cache_state,
             false,
             "Log MTP embedding-cache reads and target-context writes.");
 
+DEFINE_bool(debug_log_dp_graph,
+            false,
+            "Log DP decode graph padding, persistent metadata, and graph keys. "
+            "Host metadata only; never reads device tensor values.");
+
 DEFINE_bool(enable_shm,
             false,
             "Whether to enable shared memory for executing model.");
@@ -126,6 +131,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_mtp_forward_inputs);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_mtp_forward_lifecycle);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_mtp_cache_state);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(debug_log_dp_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(input_shm_size);
@@ -147,6 +153,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_mtp_forward_inputs);
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_mtp_forward_lifecycle);
   XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_mtp_cache_state);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(debug_log_dp_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_shm);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_contiguous_input_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(input_shm_size);

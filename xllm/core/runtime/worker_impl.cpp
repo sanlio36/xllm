@@ -1197,6 +1197,32 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
                             dtype_,
                             is_prefill);
   DpEpPaddingData data = dp_ep_padding.build();
+  // Host metadata only: reads vector values and tensor shapes, never device
+  // tensor contents, so enabling this log cannot introduce synchronization
+  // that would shift the failure being diagnosed.
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+    const auto numel_or = [](const torch::Tensor& tensor) {
+      return tensor.defined() ? tensor.numel() : -1;
+    };
+    LOG(INFO) << "[DP_GRAPH_DEBUG] prepare_dp_ep_padding"
+              << ", is_prefill=" << is_prefill
+              << ", draft_engine=" << options_.is_draft_engine()
+              << ", graph_decode=" << graph_decode
+              << ", use_graph_padding=" << use_graph_padding
+              << ", graph_token_size=" << graph_token_size
+              << ", token_sizes=" << token_sizes
+              << ", raw_token_sizes=" << raw_token_sizes
+              << ", dp_is_decode=" << input_params.parallel.dp_is_decode
+              << ", padded_token_sizes=" << *padded_token_sizes
+              << ", attn_padding_idx_numel="
+              << numel_or(data.attn_padding_idx())
+              << ", ffn_padding_idx_numel="
+              << numel_or(data.ffn_padding_idx())
+              << ", ffn_unpadding_idx_numel="
+              << numel_or(data.ffn_unpadding_idx())
+              << ", lm_head_skip_idx_numel="
+              << numel_or(data.lm_head_skip_padding_token_indices());
+  }
   input_params.parallel.dp_ep_padding_data = data;
   if (use_draft_decode_cache) {
     draft_dp_ep_padding_cache_.insert(token_sizes, raw_token_sizes, data);

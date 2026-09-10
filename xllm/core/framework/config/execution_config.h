@@ -52,6 +52,7 @@ class ExecutionConfig final {
          "debug_log_mtp_forward_inputs",
          "debug_log_mtp_forward_lifecycle",
          "debug_log_mtp_cache_state",
+         "debug_log_dp_graph",
          "enable_shm",
          "use_contiguous_input_buffer",
          "input_shm_size",
@@ -83,6 +84,8 @@ class ExecutionConfig final {
   PROPERTY(bool, debug_log_mtp_forward_lifecycle) = false;
 
   PROPERTY(bool, debug_log_mtp_cache_state) = false;
+
+  PROPERTY(bool, debug_log_dp_graph) = false;
 
   PROPERTY(bool, enable_shm) = false;
 

@@ -465,6 +465,21 @@ void GraphPersistentParam::update_persistent_dp_ep_padding(
         get_graph_lm_head_index_length(src_lm_head_indices,
                                        padded_tokens,
                                        dp_layout_size);
+    // Host metadata only: shapes and lengths; no device reads, no syncs.
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+      LOG(INFO) << "[DP_GRAPH_DEBUG] update_persistent_dp_ep_padding"
+                << ", padded_tokens=" << padded_tokens
+                << ", dp_layout_size=" << dp_layout_size
+                << ", src_lm_head_numel=" << src_lm_head_indices.numel()
+                << ", graph_lm_head_length=" << graph_length
+                << ", persistent_lm_head_capacity="
+                << persistent_lm_head_indices.size(0)
+                << ", src_attn_padding_numel="
+                << src.attn_padding_idx().numel()
+                << ", src_ffn_padding_numel=" << src.ffn_padding_idx().numel()
+                << ", src_ffn_unpadding_numel="
+                << src.ffn_unpadding_idx().numel();
+    }
     CHECK_LE(graph_length, persistent_lm_head_indices.size(0))
         << "lm-head index graph bucket exceeds persistent capacity";
     persistent_lm_head_indices.slice(/*dim=*/0,
@@ -546,13 +561,23 @@ void GraphPersistentParam::replace_capture_dp_ep_padding(
   const torch::Tensor& src_lm_head_indices =
       src.lm_head_skip_padding_token_indices();
   if (src_lm_head_indices.defined() && src_lm_head_indices.numel() > 0) {
+    const int64_t capture_lm_head_length =
+        get_graph_lm_head_index_length(src_lm_head_indices,
+                                       padded_tokens,
+                                       dp_layout_size);
+    // Host metadata only: shapes and lengths; no device reads, no syncs.
+    if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+      LOG(INFO) << "[DP_GRAPH_DEBUG] replace_capture_dp_ep_padding"
+                << ", padded_tokens=" << padded_tokens
+                << ", dp_layout_size=" << dp_layout_size
+                << ", src_lm_head_numel=" << src_lm_head_indices.numel()
+                << ", capture_lm_head_length=" << capture_lm_head_length;
+    }
     dst.lm_head_skip_padding_token_indices(
         persistent_dp_ep_padding_.lm_head_skip_padding_token_indices().slice(
             /*dim=*/0,
             /*start=*/0,
-            /*end=*/get_graph_lm_head_index_length(src_lm_head_indices,
-                                                    padded_tokens,
-                                                    dp_layout_size)));
+            /*end=*/capture_lm_head_length));
   }
   dst.gather_prenorm_idx(
       slice_like_source(persistent_dp_ep_padding_.gather_prenorm_idx(),
