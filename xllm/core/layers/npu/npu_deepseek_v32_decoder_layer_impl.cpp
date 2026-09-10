@@ -23,6 +23,8 @@ limitations under the License.
 #include <iostream>
 #include <numeric>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1344,13 +1346,16 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_index_cache());
 
-  const bool empty_eager_batch =
-      !input_params.enable_graph && input_params.meta.num_sequences == 0;
-  const bool empty_graph_batch =
-      input_params.enable_graph && input_params.meta.actual_num_sequences == 0;
-  const bool empty_batch = empty_eager_batch || empty_graph_batch;
+  // `actual_num_sequences` is zero while an ACL graph is being captured (the
+  // capture pass feeds placeholder sequences), so gating the cumulative
+  // q_cu_seq_lens on an "empty batch" test made the captured graph bind the
+  // per-sequence q_seq_lens while replay binds the cumulative form. For a TND
+  // DSA indexer that is a semantic mismatch: capture saw one query per row,
+  // replay passes running totals, and the indexer desynchronizes into a
+  // repeating output. Prefer the cumulative form whenever it is available,
+  // capture included.
   const bool use_q_cu_seq_lens =
-      !empty_batch && input_params.attention.device.q_cu_seq_lens.defined() &&
+      input_params.attention.device.q_cu_seq_lens.defined() &&
       input_params.attention.device.q_cu_seq_lens.numel() != 0;
   // `+31` feeds LightningIndexer's actual_seq_lengths_query. Whenever the
   // key / block_table inputs carry the full per-sequence width (they are

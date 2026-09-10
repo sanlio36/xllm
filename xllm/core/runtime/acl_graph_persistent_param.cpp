@@ -1009,6 +1009,26 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                /*end=*/padded_batch_size)
         .fill_(1);
   }
+  // Diagnose how a shrunk DP decode step lays out its real vs padding rows.
+  // Host metadata and host vectors only, so this never synchronizes the
+  // captured stream (a device read here aborts ACL graph capture with 107030).
+  if (::xllm::ExecutionConfig::get_instance().debug_log_dp_graph()) {
+    LOG(INFO) << "[DP_SEQLEN_LAYOUT_DEBUG] actual_num_tokens="
+              << actual_num_tokens
+              << ", padded_num_tokens=" << padded_num_tokens
+              << ", actual_seq_len_rows=" << actual_seq_len_rows
+              << ", padded_batch_size=" << padded_batch_size
+              << ", padding_rows=" << (padded_batch_size - actual_seq_len_rows)
+              << ", padding_q_len="
+              << (is_chunked_prefill ? q_max_seq_len : 1)
+              << ", is_decode=" << is_decode
+              << ", is_chunked_prefill=" << is_chunked_prefill
+              << ", is_empty_dp_decode_rank=" << is_empty_dp_decode_rank
+              << ", num_sequences=" << params.meta.num_sequences
+              << ", actual_num_sequences=" << params.meta.actual_num_sequences
+              << ", host_q_seq_lens=" << params.attention.host.q_seq_lens
+              << ", host_kv_seq_lens=" << params.attention.host.kv_seq_lens;
+  }
 
   if (persistent_new_cache_slots_default_.defined() &&
       persistent_new_cache_slots_default_.sizes() ==
