@@ -1347,10 +1347,26 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   const bool use_q_cu_seq_lens =
       !empty_batch && input_params.attention.device.q_cu_seq_lens.defined() &&
       input_params.attention.device.q_cu_seq_lens.numel() != 0;
+  // `+31` feeds LightningIndexer's actual_seq_lengths_query. The key and
+  // block_table inputs are bucketed persistent buffers, so they always span
+  // the full bucket width -- including an empty DP shard, where
+  // actual_num_sequences == 0. This input must share that same dim0 or the
+  // indexer aborts tiling with 561002 ("...query, key, block_table dim 0 are
+  // 1, 2, 2 respectively, they must be same"). An empty batch carries no real
+  // query, so falling back to the per-sequence q_seq_lens merely restores the
+  // matching width; keep the [1] placeholder only when no device tensor is
+  // available at all.
+  const bool has_device_q_seq_lens =
+      input_params.attention.device.q_seq_lens.defined() &&
+      input_params.attention.device.q_seq_lens.numel() != 0;
   if (use_q_cu_seq_lens) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.q_cu_seq_lens);
+  } else if (uses_dsa_attention && has_device_q_seq_lens) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.q_seq_lens);
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 31) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
